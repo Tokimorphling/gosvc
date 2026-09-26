@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"example.com/gosvc/internal/logx"
+	"example.com/gosvc/internal/slogx"
 )
 
 // Config is the root configuration object.
@@ -360,10 +360,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("http.maxBodyBytes must be positive")
 	}
 
-	if _, err := logx.ParseLevel(c.Log.Level); err != nil {
+	if _, err := slogx.ParseLevel(c.Log.Level); err != nil {
 		return fmt.Errorf("log.level: %w", err)
 	}
-	if _, err := logx.NormalizeFormat(c.Log.Format); err != nil {
+	if _, err := slogx.NormalizeFormat(c.Log.Format); err != nil {
 		return fmt.Errorf("log.format: %w", err)
 	}
 	switch strings.ToLower(strings.TrimSpace(c.Log.Output)) {

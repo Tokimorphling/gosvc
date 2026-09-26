@@ -1,8 +1,13 @@
-// Package logx provides the terminal/JSON/logfmt slog handlers ported from the
-// not-only-mining-pool project (which itself is a slog port of go-ethereum's
-// logger). It keeps the geth-style human readable output: aligned levels,
-// colored severity, caller column and padded key=value pairs.
-package logx
+// Package slogx is the presentation layer of the logging stack: slog handlers
+// and formatters (terminal/JSON/logfmt) ported from the not-only-mining-pool
+// project, which itself is a slog port of go-ethereum's logger. It keeps the
+// geth-style human readable output: aligned levels, colored severity, caller
+// column and padded key=value pairs.
+//
+// It depends only on the standard library and knows nothing about this
+// service's configuration; sink selection, rotation and level wiring live in
+// internal/logging. That makes the package safe to copy into other services.
+package slogx
 
 import (
 	"fmt"

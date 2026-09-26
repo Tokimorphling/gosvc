@@ -15,7 +15,7 @@ Kitex 服务间 RPC 示例。
 | 统一错误模型 | `internal/apierror` 定义与传输无关的错误类型，各协议一处映射（见下表） |
 | 认证 | API Key（constant-time 比较）与 HS256 JWT，HTTP 中间件 + gRPC 拦截器共用；health/reflection 免认证 |
 | 链路追踪 | OpenTelemetry OTLP/HTTP，Hertz 自研中间件 + `otelgrpc` StatsHandler，W3C TraceContext 传播 |
-| 日志 | `internal/logx`：移植自 not-only-mining-pool 的 geth 风格 slog handler（彩色/对齐/调用点）；支持 terminal / json / logfmt，stdout / 轮转文件 / 双写，运行期改级别 |
+| 日志 | `internal/slogx`：移植自 not-only-mining-pool 的 geth 风格 slog handler（彩色/对齐/调用点）；支持 terminal / json / logfmt，stdout / 轮转文件 / 双写，运行期改级别 |
 | 可观测性 | Prometheus 指标（HTTP / JSON-RPC / gRPC / Go runtime）、pprof、healthz / readyz / version、时间序列查询，独立 admin 端口 |
 | 时间序列存储 | Redis 分钟桶计数器 + 内存聚合批量写入（请求路径不碰 Redis），`/debug/ts` 查询 |
 | 配置 | 默认值 < JSON 文件 < 环境变量，带完整校验；`Duration` 支持 `"5s"` 与秒数 |
@@ -89,8 +89,8 @@ make bench
 ├── internal/
 │   ├── app/                   # 组件装配 + 生命周期
 │   ├── config/                # 配置加载、合并、校验
-│   ├── logging/               # slog 装配（多 sink、格式、级别）
-│   ├── logx/                  # geth 风格 slog handlers（移植自 pool 项目）
+│   ├── logging/               # 日志装配（读配置、多 sink、轮转、级别）
+│   ├── slogx/                 # geth 风格 slog handlers（零项目依赖，可独立复用）
 │   ├── auth/                  # API Key + JWT
 │   ├── telemetry/             # OpenTelemetry 初始化
 │   ├── reqid/                 # request id
@@ -159,7 +159,10 @@ RequestID → Tracing → AccessLog → Recovery → CORS → RateLimit → [Aut
 
 ## 日志
 
-`internal/logx` 是 not-only-mining-pool 日志库的移植（其本身是 go-ethereum `log` 包的 slog 版），
+日志分两层：`internal/slogx` 是**展示层**（slog handler 与格式化，只依赖标准库，可整包复制到其它服务），
+`internal/logging` 是**装配层**（读配置、选 sink、轮转、级别、request-scoped logger），业务代码只 import `logging`。
+
+`slogx` 是 not-only-mining-pool 日志库的移植（其本身是 go-ethereum `log` 包的 slog 版），
 输出形如：
 
 ```
@@ -191,7 +194,7 @@ INFO  2026-09-27T01:31:46.481Z middleware.go:47  - http request    service=gosvc
 - 所有请求日志带 `request_id`（HTTP 响应头回写 `X-Request-ID`，gRPC 通过 metadata 传播）；
 - Hertz 内部日志通过 `hlog.FullLogger` 适配器汇入同一 logger。
 
-> 说明：`internal/logx` 只移植了 handler/format 部分（未包含原项目的 glog verbosity 与
+> 说明：`internal/slogx` 只移植了 handler/format 部分（未包含原项目的 glog verbosity 与
 > `Crit=os.Exit` 行为），级别控制改由 `slog.LevelVar` + admin 接口提供。
 
 ## 认证
@@ -263,7 +266,7 @@ make kitex     # 重新生成 Kitex 示例代码
 
 - `internal/jsonrpc`：协议层单测（批量、通知、错误码、参数校验）；
 - `internal/auth`：API Key / JWT（含错误密钥、错误算法、过期）；
-- `internal/logx`：terminal 格式、级别过滤、格式/级别解析；
+- `internal/slogx`：terminal 格式、级别过滤、格式/级别解析；
 - `internal/workerpool`：执行、背压、关闭、panic 恢复；
 - `internal/store/redisx`：基于 miniredis 的桶读写与聚合刷新；
 - `test/e2e`：真实启动全部端口，覆盖 REST、JSON-RPC、TCP、gRPC、认证（HTTP+gRPC）、

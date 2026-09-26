@@ -1,6 +1,11 @@
-// Package logging builds the application's slog logger on top of the logx
-// handlers (terminal/JSON/logfmt) and optionally mirrors records to a rotating
-// file.
+// Package logging is the assembly layer of the logging stack: it reads
+// config.LogConfig, picks the console format (terminal/JSON/logfmt from
+// internal/slogx), chooses the sinks (stdout, rotating file, or both) and
+// returns a *slog.Logger carrying the service base attributes.
+//
+// The split keeps responsibilities clear: internal/slogx decides how one line
+// looks, internal/logging decides where lines go, at which level and with which
+// fixed fields. Application code only imports this package.
 //
 // Recommended production setup: JSON on stdout (collected by the platform) and,
 // when running on bare metal, an additional JSON file with rotation.
@@ -15,7 +20,7 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 
 	"example.com/gosvc/internal/config"
-	"example.com/gosvc/internal/logx"
+	"example.com/gosvc/internal/slogx"
 )
 
 // New builds the logger from config. env selects the default format when
@@ -26,7 +31,7 @@ func New(cfg config.LogConfig, service, env, serviceVersion string) (*slog.Logge
 		return nil, nil, err
 	}
 
-	format, err := logx.NormalizeFormat(cfg.Format)
+	format, err := slogx.NormalizeFormat(cfg.Format)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -83,7 +88,7 @@ func New(cfg config.LogConfig, service, env, serviceVersion string) (*slog.Logge
 
 // SetLevel applies a textual level ("debug", "info", "warn", "error", ...).
 func SetLevel(level *slog.LevelVar, s string) error {
-	parsed, err := logx.ParseLevel(s)
+	parsed, err := slogx.ParseLevel(s)
 	if err != nil {
 		return err
 	}
@@ -96,17 +101,17 @@ func LevelName(level *slog.LevelVar) string {
 	if level == nil {
 		return ""
 	}
-	return logx.LevelString(level.Level())
+	return slogx.LevelString(level.Level())
 }
 
 func newConsoleHandler(format string, cfg config.LogConfig, level *slog.LevelVar) (slog.Handler, error) {
 	switch format {
 	case "terminal":
-		return logx.NewTerminalHandlerWithLevel(os.Stdout, level, colorEnabled(cfg.Color)), nil
+		return slogx.NewTerminalHandlerWithLevel(os.Stdout, level, colorEnabled(cfg.Color)), nil
 	case "json":
-		return logx.JSONHandlerWithLevel(os.Stdout, level), nil
+		return slogx.JSONHandlerWithLevel(os.Stdout, level), nil
 	case "logfmt":
-		return logx.LogfmtHandlerWithLevel(os.Stdout, level), nil
+		return slogx.LogfmtHandlerWithLevel(os.Stdout, level), nil
 	default:
 		return nil, fmt.Errorf("unsupported log format %q", format)
 	}
