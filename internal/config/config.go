@@ -71,12 +71,21 @@ func (c AdminConfig) Addr() string { return net.JoinHostPort(c.Host, strconv.Ito
 
 // LogConfig configures the slog logger.
 type LogConfig struct {
-	Level     string        `json:"level"`     // trace | debug | info | warn | error
-	Format    string        `json:"format"`    // auto | terminal | json | logfmt
-	Output    string        `json:"output"`    // stdout | file | both
-	Color     string        `json:"color"`     // auto | always | never
-	AddSource bool          `json:"addSource"` // add source location (JSON sinks)
-	File      FileLogConfig `json:"file"`
+	Level     string            `json:"level"`     // trace | debug | info | warn | error
+	Format    string            `json:"format"`    // auto | terminal | json | logfmt
+	Output    string            `json:"output"`    // stdout | file | both
+	Color     string            `json:"color"`     // auto | always | never
+	AddSource bool              `json:"addSource"` // add source location (JSON sinks)
+	File      FileLogConfig     `json:"file"`
+	Sampling  SamplingLogConfig `json:"sampling"`
+}
+
+// SamplingLogConfig configures per-message log sampling for high QPS services.
+type SamplingLogConfig struct {
+	Enabled    bool     `json:"enabled"`
+	Initial    int      `json:"initial"`    // records always emitted per (level,message) per tick
+	Thereafter int      `json:"thereafter"` // then emit one out of every N
+	Tick       Duration `json:"tick"`       // sampling window
 }
 
 // FileLogConfig configures the rotating file sink.
@@ -225,6 +234,12 @@ func Default() *Config {
 				MaxBackups: 5,
 				MaxAgeDays: 7,
 				Compress:   true,
+			},
+			Sampling: SamplingLogConfig{
+				Enabled:    false,
+				Initial:    100,
+				Thereafter: 100,
+				Tick:       Duration(time.Second),
 			},
 		},
 		Limiter: LimiterConfig{RPS: 0, Burst: 0},
@@ -384,6 +399,17 @@ func (c *Config) Validate() error {
 	if c.Log.File.MaxSizeMB < 0 || c.Log.File.MaxBackups < 0 || c.Log.File.MaxAgeDays < 0 {
 		return fmt.Errorf("log.file.maxSizeMB, maxBackups and maxAgeDays must not be negative")
 	}
+	if c.Log.Sampling.Enabled {
+		if c.Log.Sampling.Initial < 0 {
+			return fmt.Errorf("log.sampling.initial must not be negative")
+		}
+		if c.Log.Sampling.Thereafter < 1 {
+			return fmt.Errorf("log.sampling.thereafter must be >= 1")
+		}
+		if c.Log.Sampling.Tick <= 0 {
+			return fmt.Errorf("log.sampling.tick must be positive")
+		}
+	}
 
 	if c.Limiter.RPS < 0 || c.Limiter.Burst < 0 {
 		return fmt.Errorf("limiter.rps and limiter.burst must not be negative")
@@ -437,4 +463,22 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// Redacted returns a shallow copy that is safe to expose over an API or to log:
+// secrets are replaced with "***".
+func (c *Config) Redacted() *Config {
+	clone := *c
+
+	clone.Auth.APIKeys = make([]string, len(c.Auth.APIKeys))
+	for i := range clone.Auth.APIKeys {
+		clone.Auth.APIKeys[i] = "***"
+	}
+	if clone.Auth.JWT.Secret != "" {
+		clone.Auth.JWT.Secret = "***"
+	}
+	if clone.Storage.Redis.Password != "" {
+		clone.Storage.Redis.Password = "***"
+	}
+	return &clone
 }

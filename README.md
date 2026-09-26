@@ -15,7 +15,8 @@ Kitex 服务间 RPC 示例。
 | 统一错误模型 | `internal/apierror` 定义与传输无关的错误类型，各协议一处映射（见下表） |
 | 认证 | API Key（constant-time 比较）与 HS256 JWT，HTTP 中间件 + gRPC 拦截器共用；health/reflection 免认证 |
 | 链路追踪 | OpenTelemetry OTLP/HTTP，Hertz 自研中间件 + `otelgrpc` StatsHandler，W3C TraceContext 传播 |
-| 日志 | `internal/slogx`：移植自 not-only-mining-pool 的 geth 风格 slog handler（彩色/对齐/调用点）；支持 terminal / json / logfmt，stdout / 轮转文件 / 双写，运行期改级别 |
+| 日志 | `internal/slogx`：移植自 not-only-mining-pool 的 geth 风格 slog handler（彩色/对齐/调用点）；支持 terminal / json / logfmt，stdout / 轮转文件 / 双写，运行期改级别；按 (级别,消息) 采样降噪 |
+| 配置热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 免重启生效，其余字段在重载日志中标记 `restartRequired`；`POST /debug/reload` 支持手动触发（ConfigMap 场景） |
 | 可观测性 | Prometheus 指标（HTTP / JSON-RPC / gRPC / Go runtime）、pprof、healthz / readyz / version、时间序列查询，独立 admin 端口 |
 | 时间序列存储 | Redis 分钟桶计数器 + 内存聚合批量写入（请求路径不碰 Redis），`/debug/ts` 查询 |
 | 配置 | 默认值 < JSON 文件 < 环境变量，带完整校验；`Duration` 支持 `"5s"` 与秒数 |
@@ -62,6 +63,9 @@ curl http://127.0.0.1:6060/healthz
 curl http://127.0.0.1:6060/metrics
 curl http://127.0.0.1:6060/debug/loglevel          # GET 当前级别
 curl -X PUT -d '{"level":"debug"}' http://127.0.0.1:6060/debug/loglevel
+curl http://127.0.0.1:6060/debug/logstats          # 采样计数（emitted/dropped）
+curl http://127.0.0.1:6060/debug/config            # 当前生效配置（密钥脱敏）
+curl -X POST http://127.0.0.1:6060/debug/reload    # 手动触发配置重载
 curl 'http://127.0.0.1:6060/debug/ts?metric=http.requests:/api/v1/hello&minutes=60'
 ```
 
@@ -97,7 +101,8 @@ make bench
 │   ├── apierror/              # 传输无关错误
 │   ├── health/                # readiness
 │   ├── observability/         # Prometheus 指标
-│   ├── ratelimit/             # 按 key 的 token bucket
+│   ├── ratelimit/             # 按 key 的 token bucket（支持运行期调参）
+│   ├── reload/                # 配置文件监听与热更新
 │   ├── workerpool/            # 有界 goroutine 池（背压）
 │   ├── store/                 # 存储接口
 │   │   └── redisx/            # Redis 分钟桶 + 聚合写入
@@ -185,12 +190,24 @@ INFO  2026-09-27T01:31:46.481Z middleware.go:47  - http request    service=gosvc
     "maxBackups": 5,
     "maxAgeDays": 7,
     "compress": true
+  },
+  "sampling": {
+    "enabled": false,
+    "initial": 100,
+    "thereafter": 100,
+    "tick": "1s"
   }
 }
 ```
 
 - `output: "both"` 时，**终端用彩色 terminal 格式，文件固定 JSON**（便于采集与检索），由 lumberjack 轮转；
 - 运行期改级别：`PUT /debug/loglevel {"level":"debug"}`（终端与文件 sink 同步生效）；
+- **高 QPS 降噪（采样）**：按 `(级别, 消息)` 计数，每个 `tick` 窗口内前 `initial` 条必出，之后每 `thereafter` 条抽 1 条；
+  `warn`/`error` 永不采样。计数看 `GET /debug/logstats`，例如：
+  ```json
+  {"enabled":true,"emitted":2,"dropped":6,"droppedByLevel":{"INFO":6}}
+  ```
+  它和 tracing 的 `sampleRatio` 互补：日志采样按消息去重、保留完整请求上下文，tracing 按请求采样；
 - 所有请求日志带 `request_id`（HTTP 响应头回写 `X-Request-ID`，gRPC 通过 metadata 传播）；
 - Hertz 内部日志通过 `hlog.FullLogger` 适配器汇入同一 logger。
 
@@ -254,6 +271,30 @@ grpcurl -plaintext -H 'x-api-key: key-1' -d '{"name":"x"}' 127.0.0.1:9090 greete
 - 为什么不用 ZSET 全量扫描？见 `internal/store/redisx/store.go` 的注释——这是从原挖矿池项目
   吸取的教训（大时间窗全量拉取会拖垮 Redis）。
 
+## 配置热更新
+
+启动时传入 `-c config.json` 即自动开启：fsnotify 监听文件所在目录（300ms 去抖），
+编辑器与 Kubernetes ConfigMap 的原子替换（rename）也能捕获。
+
+| 变更 | 行为 |
+|---|---|
+| `log.*`（级别、格式、sink、轮转、采样） | 热生效，通过 `slogx.SwapHandler` 替换 handler 链 |
+| `auth.*`（API Key / JWT） | 热生效，凭据原子替换（校验失败保留旧值） |
+| `limiter.*`（rps/burst） | 热生效，重建桶并清空旧计数 |
+| `service` / `http` / `grpc` / `tcp` / `admin` / `telemetry` / `storage` | 不热更，重载日志中以 `restartRequired` 列出 |
+
+```bash
+curl -X POST http://127.0.0.1:6060/debug/reload   # 手动触发（ConfigMap 挂载场景）
+curl http://127.0.0.1:6060/debug/config           # 当前生效配置（密钥脱敏为 ***）
+```
+
+重载走与启动完全相同的加载链路（默认值 < 文件 < 环境变量）并重新校验；
+校验失败时保留当前配置并记录错误，不会让服务处于半更新状态。日志形如：
+
+```
+INFO  2026-09-26T19:08:56.141Z app.go:278 - configuration reloaded  changed="[log auth]" restartRequired=[]
+```
+
 ## 测试与压测
 
 ```bash
@@ -265,12 +306,15 @@ make kitex     # 重新生成 Kitex 示例代码
 ```
 
 - `internal/jsonrpc`：协议层单测（批量、通知、错误码、参数校验）；
-- `internal/auth`：API Key / JWT（含错误密钥、错误算法、过期）；
-- `internal/slogx`：terminal 格式、级别过滤、格式/级别解析；
+- `internal/auth`：API Key / JWT（含错误密钥、错误算法、过期）与运行期 `Reload`；
+- `internal/slogx`：terminal 格式、级别过滤、格式/级别解析，以及采样（首 N/每 N、豁免 warn/error、
+  派生 logger 共享计数、窗口重置）与 `SwapHandler`；
+- `internal/ratelimit`：启停、限流与运行期 `SetRate`；
 - `internal/workerpool`：执行、背压、关闭、panic 恢复；
 - `internal/store/redisx`：基于 miniredis 的桶读写与聚合刷新；
 - `test/e2e`：真实启动全部端口，覆盖 REST、JSON-RPC、TCP、gRPC、认证（HTTP+gRPC）、
-  metrics、运行期日志级别、优雅关闭；
+  metrics、运行期日志级别、采样统计、**配置热更新**（改文件 → 认证/级别生效、密钥脱敏、手动 reload）、
+  优雅关闭；
 - `examples/kitex`：真实起 Kitex server，client 分别用 host-ports 与静态 resolver 调用。
 
 ## 部署
@@ -303,9 +347,9 @@ docker compose -f deploy/docker-compose.yml up --build
 - [x] 自定义 TCP 协议示例（netpoll EventLoop + 有界 worker pool）
 - [x] Redis 存储与时间序列指标
 - [x] geth 风格日志（terminal/JSON/logfmt + 轮转文件 + 运行期级别）
-- [ ] 配置热更新（fsnotify + atomic 快照）
+- [x] 配置热更新（fsnotify + 可热替换 handler）
+- [x] 日志采样（高 QPS 下 debug/info 降噪，warn/error 豁免）
 - [ ] Redis Cluster / Sentinel 客户端
-- [ ] 日志采样（高 QPS 下 debug 降噪）
 - [ ] 前端静态资源 embed 示例
 
 ## 重命名模块

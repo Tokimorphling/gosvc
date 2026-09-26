@@ -109,4 +109,42 @@ func TestBearerToken(t *testing.T) {
 	}
 }
 
+func TestReloadSwapsCredentials(t *testing.T) {
+	a, err := New(config.AuthConfig{Enabled: true, APIKeys: []string{"key-1"}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := a.Authenticate("", "key-1"); err != nil {
+		t.Fatalf("key-1 must work before reload: %v", err)
+	}
+
+	if err := a.Reload(config.AuthConfig{Enabled: true, APIKeys: []string{"key-2"}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	if _, err := a.Authenticate("", "key-1"); apierror.KindOf(err) != apierror.KindUnauthenticated {
+		t.Fatalf("key-1 must be rejected after reload, kind = %v", apierror.KindOf(err))
+	}
+	if _, err := a.Authenticate("", "key-2"); err != nil {
+		t.Fatalf("key-2 must work after reload: %v", err)
+	}
+
+	// Disabling accepts everyone again.
+	if err := a.Reload(config.AuthConfig{Enabled: false}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if identity, err := a.Authenticate("", ""); err != nil || identity.Method != MethodAnonymous {
+		t.Fatalf("identity = %+v, err = %v", identity, err)
+	}
+
+	// Invalid configurations must not change the active state.
+	if err := a.Reload(config.AuthConfig{Enabled: true}); err == nil {
+		t.Fatal("expected an error for enabled without credentials")
+	}
+	if identity, err := a.Authenticate("", ""); err != nil || identity.Method != MethodAnonymous {
+		t.Fatalf("failed reload must keep the previous state, identity = %+v, err = %v", identity, err)
+	}
+}
+
 var _ = errors.Is // keep errors imported for future assertions

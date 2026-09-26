@@ -6,8 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -36,7 +39,7 @@ func TestEndToEnd(t *testing.T) {
 	cfg.TCP.ReadTimeout = config.Duration(5 * time.Second)
 	cfg.TCP.ShutdownTimeout = config.Duration(2 * time.Second)
 
-	application, stop := startApp(t, cfg)
+	application, stop := startApp(t, cfg, "")
 	defer stop()
 
 	httpBase := "http://" + application.HTTPAddr()
@@ -253,7 +256,7 @@ func TestAuthEnforced(t *testing.T) {
 	cfg.Auth.Enabled = true
 	cfg.Auth.APIKeys = []string{"test-key"}
 
-	application, stop := startApp(t, cfg)
+	application, stop := startApp(t, cfg, "")
 	defer stop()
 
 	httpBase := "http://" + application.HTTPAddr()
@@ -344,17 +347,158 @@ func baseConfig() *config.Config {
 	return cfg
 }
 
-func startApp(t *testing.T, cfg *config.Config) (*app.App, func()) {
+// TestLogSampling verifies that repeated identical records are sampled and that
+// the counters are exposed on the admin endpoint.
+func TestLogSampling(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Log.Level = "info"
+	cfg.Log.Sampling.Enabled = true
+	cfg.Log.Sampling.Initial = 1
+	cfg.Log.Sampling.Thereafter = 1000
+	cfg.Log.Sampling.Tick = config.Duration(time.Hour)
+
+	application, stop := startApp(t, cfg, "")
+	defer stop()
+
+	httpBase := "http://" + application.HTTPAddr()
+	waitReady(t, httpBase+"/readyz")
+
+	for i := 0; i < 5; i++ {
+		getBody(t, httpBase+"/api/v1/hello?name=sample")
+	}
+
+	body := getBody(t, "http://"+application.AdminAddr()+"/debug/logstats")
+	var stats struct {
+		Enabled bool   `json:"enabled"`
+		Emitted uint64 `json:"emitted"`
+		Dropped uint64 `json:"dropped"`
+	}
+	if err := json.Unmarshal(body, &stats); err != nil {
+		t.Fatalf("unmarshal %s: %v", body, err)
+	}
+	if !stats.Enabled {
+		t.Fatalf("sampling must be enabled: %s", body)
+	}
+	if stats.Emitted == 0 {
+		t.Fatalf("expected emitted records: %s", body)
+	}
+	if stats.Dropped == 0 {
+		t.Fatalf("expected dropped records: %s", body)
+	}
+}
+
+// TestConfigHotReload rewrites the config file and verifies that auth and log
+// level are applied without restarting, that secrets are redacted and that the
+// manual reload endpoint works.
+func TestConfigHotReload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	const secret = "0123456789abcdef"
+	writeConfig := func(apiKey, level string) {
+		t.Helper()
+		content := `{
+			"service": {"name": "reload-test", "env": "dev"},
+			"http": {"host": "127.0.0.1", "port": 0},
+			"grpc": {"host": "127.0.0.1", "port": 0},
+			"admin": {"host": "127.0.0.1", "port": 0},
+			"log": {"level": "` + level + `", "format": "json"},
+			"auth": {"enabled": true, "apiKeys": ["` + apiKey + `"], "jwt": {"secret": "` + secret + `"}}
+		}`
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeConfig("key-1", "error")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	application, stop := startApp(t, cfg, path)
+	defer stop()
+
+	httpBase := "http://" + application.HTTPAddr()
+	adminBase := "http://" + application.AdminAddr()
+	waitReady(t, httpBase+"/readyz")
+
+	authed := func(key string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, httpBase+"/api/v1/info", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-API-Key", key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := authed("key-1"); code != http.StatusOK {
+		t.Fatalf("key-1 before reload: status = %d", code)
+	}
+	if code := authed("key-2"); code != http.StatusUnauthorized {
+		t.Fatalf("key-2 before reload: status = %d", code)
+	}
+
+	writeConfig("key-2", "info")
+
+	waitFor(t, 8*time.Second, func() bool { return authed("key-2") == http.StatusOK })
+	if code := authed("key-1"); code != http.StatusUnauthorized {
+		t.Fatalf("key-1 after reload: status = %d", code)
+	}
+
+	waitFor(t, 5*time.Second, func() bool {
+		return strings.Contains(string(getBody(t, adminBase+"/debug/loglevel")), "info")
+	})
+
+	body := getBody(t, adminBase+"/debug/config")
+	if strings.Contains(string(body), secret) {
+		t.Fatalf("secret leaked through /debug/config: %s", body)
+	}
+	if !strings.Contains(string(body), "***") {
+		t.Fatalf("expected redacted secrets: %s", body)
+	}
+
+	resp, err := http.Post(adminBase+"/debug/reload", "application/json", nil)
+	if err != nil {
+		t.Fatalf("manual reload: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("manual reload status = %d, body = %s", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("condition not met before timeout")
+}
+
+func startApp(t *testing.T, cfg *config.Config, configPath string) (*app.App, func()) {
 	t.Helper()
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("validate config: %v", err)
 	}
 
-	logger, level, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, version.Version)
+	logHandle, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, version.Version)
 	if err != nil {
 		t.Fatalf("build logger: %v", err)
 	}
-	application, err := app.New(cfg, logger, level)
+	slog.SetDefault(logHandle.Logger())
+
+	application, err := app.New(cfg, logHandle, configPath)
 	if err != nil {
 		t.Fatalf("build app: %v", err)
 	}

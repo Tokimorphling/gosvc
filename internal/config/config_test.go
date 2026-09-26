@@ -85,6 +85,14 @@ func TestValidateRejectsBadConfig(t *testing.T) {
 		"bad format":    func(c *Config) { c.Log.Format = "xml" },
 		"limiter burst": func(c *Config) { c.Limiter.RPS = 10; c.Limiter.Burst = 0 },
 		"zero body":     func(c *Config) { c.HTTP.MaxBodyBytes = 0 },
+		"sampling": func(c *Config) {
+			c.Log.Sampling.Enabled = true
+			c.Log.Sampling.Thereafter = 0
+		},
+		"sampling tick": func(c *Config) {
+			c.Log.Sampling.Enabled = true
+			c.Log.Sampling.Tick = 0
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -94,6 +102,28 @@ func TestValidateRejectsBadConfig(t *testing.T) {
 				t.Fatalf("expected a validation error for %s", name)
 			}
 		})
+	}
+}
+
+func TestRedacted(t *testing.T) {
+	cfg := Default()
+	cfg.Auth.Enabled = true
+	cfg.Auth.APIKeys = []string{"key-1", "key-2"}
+	cfg.Auth.JWT.Secret = "0123456789abcdef"
+	cfg.Storage.Redis.Password = "redis-secret"
+
+	redacted := cfg.Redacted()
+	if redacted.Auth.JWT.Secret != "***" || redacted.Storage.Redis.Password != "***" {
+		t.Fatalf("secrets not redacted: %+v", redacted.Auth.JWT.Secret)
+	}
+	for _, key := range redacted.Auth.APIKeys {
+		if key != "***" {
+			t.Fatalf("api key not redacted: %q", key)
+		}
+	}
+	// The original must stay untouched.
+	if cfg.Auth.JWT.Secret != "0123456789abcdef" || cfg.Auth.APIKeys[0] != "key-1" {
+		t.Fatal("Redacted modified the original config")
 	}
 }
 

@@ -39,13 +39,13 @@ func run(configPath string) error {
 		return err
 	}
 
-	logger, level, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, version.Version)
+	logHandle, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, version.Version)
 	if err != nil {
 		return err
 	}
-	slog.SetDefault(logger)
+	slog.SetDefault(logHandle.Logger())
 
-	application, err := app.New(cfg, logger, level)
+	application, err := app.New(cfg, logHandle, configPath)
 	if err != nil {
 		return err
 	}

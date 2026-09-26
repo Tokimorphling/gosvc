@@ -1,5 +1,5 @@
 // Package admin serves operations endpoints on a separate, usually private,
-// listener: metrics, pprof, health and version.
+// listener: metrics, pprof, health, log controls, config inspection and reload.
 package admin
 
 import (
@@ -26,12 +26,14 @@ import (
 
 // Options wires the admin server.
 type Options struct {
-	Config     *config.Config
-	Logger     *slog.Logger
-	Level      *slog.LevelVar
-	Metrics    *observability.Metrics
-	Ready      *health.Ready
-	TimeSeries store.TimeSeries
+	Config        *config.Config
+	Logger        *slog.Logger
+	Log           *logging.Handle
+	Metrics       *observability.Metrics
+	Ready         *health.Ready
+	TimeSeries    store.TimeSeries
+	Reload        func() error
+	CurrentConfig func() *config.Config
 }
 
 // Server is the operations HTTP server.
@@ -65,11 +67,38 @@ func New(opts Options) (*Server, error) {
 		writeJSON(w, http.StatusOK, map[string]string{"version": version.Full()})
 	})
 
-	// Runtime log level control: GET to read, PUT/POST {"level":"debug"} to set.
+	registerLogLevel(mux, opts)
+	registerLogStats(mux, opts)
+	registerConfigEndpoints(mux, opts)
+	registerTimeSeries(mux, opts)
+
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	return &Server{
+		httpServer: &http.Server{
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		},
+		listener: listener,
+		logger:   opts.Logger,
+	}, nil
+}
+
+// registerLogLevel exposes runtime log level control:
+// GET to read, PUT/POST {"level":"debug"} to set.
+func registerLogLevel(mux *http.ServeMux, opts Options) {
 	mux.HandleFunc("/debug/loglevel", func(w http.ResponseWriter, r *http.Request) {
+		if opts.Log == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "logging handle is not available"})
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
-			writeJSON(w, http.StatusOK, map[string]string{"level": logging.LevelName(opts.Level)})
+			writeJSON(w, http.StatusOK, map[string]string{"level": logging.LevelName(opts.Log.Level())})
 		case http.MethodPut, http.MethodPost:
 			var body struct {
 				Level string `json:"level"`
@@ -78,24 +107,83 @@ func New(opts Options) (*Server, error) {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 				return
 			}
-			if err := logging.SetLevel(opts.Level, body.Level); err != nil {
+			if err := logging.SetLevel(opts.Log.Level(), body.Level); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]string{"level": logging.LevelName(opts.Level)})
+			writeJSON(w, http.StatusOK, map[string]string{"level": logging.LevelName(opts.Log.Level())})
 		default:
 			w.Header().Set("Allow", "GET, PUT, POST")
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		}
 	})
+}
 
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+// registerLogStats exposes log sampling counters.
+func registerLogStats(mux *http.ServeMux, opts Options) {
+	mux.HandleFunc("/debug/logstats", func(w http.ResponseWriter, r *http.Request) {
+		if opts.Log == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"enabled": false})
+			return
+		}
+		stats := opts.Log.SamplingStats()
+		if stats == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled":         true,
+			"emitted":         stats.Emitted,
+			"dropped":         stats.Dropped,
+			"droppedByLevel":  stats.ByLevel,
+			"windowStartedAt": stats.WindowFrom,
+		})
+	})
+}
 
-	// Time-series query: GET /debug/ts?metric=http.requests:/api/v1/hello&minutes=60
+// registerConfigEndpoints exposes the redacted effective config and a manual
+// reload trigger (useful when the file is mounted from a ConfigMap).
+func registerConfigEndpoints(mux *http.ServeMux, opts Options) {
+	mux.HandleFunc("/debug/config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		cfg := opts.Config
+		if opts.CurrentConfig != nil {
+			if current := opts.CurrentConfig(); current != nil {
+				cfg = current
+			}
+		}
+		if cfg == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "config is not available"})
+			return
+		}
+		writeJSON(w, http.StatusOK, cfg.Redacted())
+	})
+
+	mux.HandleFunc("/debug/reload", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		if opts.Reload == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "hot reload is disabled"})
+			return
+		}
+		if err := opts.Reload(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "reloaded"})
+	})
+}
+
+// registerTimeSeries exposes minute-bucket queries:
+// GET /debug/ts?metric=http.requests:/api/v1/hello&minutes=60
+func registerTimeSeries(mux *http.ServeMux, opts Options) {
 	mux.HandleFunc("/debug/ts", func(w http.ResponseWriter, r *http.Request) {
 		if opts.TimeSeries == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "time-series store is disabled"})
@@ -133,15 +221,6 @@ func New(opts Options) (*Server, error) {
 			"buckets": buckets,
 		})
 	})
-
-	return &Server{
-		httpServer: &http.Server{
-			Handler:           mux,
-			ReadHeaderTimeout: 5 * time.Second,
-		},
-		listener: listener,
-		logger:   opts.Logger,
-	}, nil
 }
 
 // Addr returns the effective listen address.

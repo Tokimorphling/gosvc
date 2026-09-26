@@ -33,6 +33,12 @@
       "maxBackups": 5,
       "maxAgeDays": 7,
       "compress": true
+    },
+    "sampling": {
+      "enabled": false,
+      "initial": 100,
+      "thereafter": 100,
+      "tick": "1s"
     }
   },
   "limiter": {
