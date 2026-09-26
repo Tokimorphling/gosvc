@@ -8,35 +8,42 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app/server"
 	"github.com/cloudwego/hertz/pkg/common/hlog"
+	"go.opentelemetry.io/otel/trace"
 
+	"example.com/gosvc/internal/auth"
 	"example.com/gosvc/internal/config"
 	"example.com/gosvc/internal/health"
 	"example.com/gosvc/internal/jsonrpc"
 	"example.com/gosvc/internal/observability"
 	"example.com/gosvc/internal/ratelimit"
 	"example.com/gosvc/internal/service/greeter"
+	"example.com/gosvc/internal/store"
 )
 
 // Options wires the HTTP server.
 type Options struct {
-	Config  *config.Config
-	Service *greeter.Service
-	Logger  *slog.Logger
-	Level   *slog.LevelVar
-	Metrics *observability.Metrics
-	Limiter *ratelimit.Limiter
-	Ready   *health.Ready
+	Config        *config.Config
+	Service       *greeter.Service
+	Logger        *slog.Logger
+	Level         *slog.LevelVar
+	Metrics       *observability.Metrics
+	Limiter       *ratelimit.Limiter
+	Authenticator *auth.Authenticator
+	Tracer        trace.Tracer
+	Recorder      store.Recorder
+	Ready         *health.Ready
 }
 
 // Server serves REST and JSON-RPC over Hertz.
 type Server struct {
-	engine     *server.Hertz
-	listener   net.Listener
-	cfg        config.HTTPConfig
-	logger     *slog.Logger
-	service    *greeter.Service
-	dispatcher *jsonrpc.Dispatcher
-	ready      *health.Ready
+	engine        *server.Hertz
+	listener      net.Listener
+	cfg           config.HTTPConfig
+	logger        *slog.Logger
+	service       *greeter.Service
+	dispatcher    *jsonrpc.Dispatcher
+	authenticator *auth.Authenticator
+	ready         *health.Ready
 }
 
 // New binds the listener and wires routes and middleware. The listener is
@@ -58,13 +65,14 @@ func New(opts Options) (*Server, error) {
 	)
 
 	s := &Server{
-		engine:     engine,
-		listener:   listener,
-		cfg:        opts.Config.HTTP,
-		logger:     opts.Logger,
-		service:    opts.Service,
-		dispatcher: jsonrpc.NewDispatcher(),
-		ready:      opts.Ready,
+		engine:        engine,
+		listener:      listener,
+		cfg:           opts.Config.HTTP,
+		logger:        opts.Logger,
+		service:       opts.Service,
+		dispatcher:    jsonrpc.NewDispatcher(),
+		authenticator: opts.Authenticator,
+		ready:         opts.Ready,
 	}
 	if opts.Metrics != nil {
 		s.dispatcher.SetObserver(opts.Metrics.ObserveJSONRPC)
@@ -75,7 +83,8 @@ func New(opts Options) (*Server, error) {
 
 	engine.Use(
 		RequestID(),
-		AccessLog(opts.Metrics),
+		Tracing(opts.Tracer),
+		AccessLog(opts.Metrics, opts.Recorder),
 		Recovery(opts.Logger),
 		CORS(),
 		RateLimit(opts.Limiter),

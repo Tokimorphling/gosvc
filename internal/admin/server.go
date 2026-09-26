@@ -11,22 +11,27 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"example.com/gosvc/internal/config"
 	"example.com/gosvc/internal/health"
+	"example.com/gosvc/internal/logging"
 	"example.com/gosvc/internal/observability"
+	"example.com/gosvc/internal/store"
 	"example.com/gosvc/internal/version"
 )
 
 // Options wires the admin server.
 type Options struct {
-	Config  *config.Config
-	Logger  *slog.Logger
-	Metrics *observability.Metrics
-	Ready   *health.Ready
+	Config     *config.Config
+	Logger     *slog.Logger
+	Level      *slog.LevelVar
+	Metrics    *observability.Metrics
+	Ready      *health.Ready
+	TimeSeries store.TimeSeries
 }
 
 // Server is the operations HTTP server.
@@ -60,11 +65,74 @@ func New(opts Options) (*Server, error) {
 		writeJSON(w, http.StatusOK, map[string]string{"version": version.Full()})
 	})
 
+	// Runtime log level control: GET to read, PUT/POST {"level":"debug"} to set.
+	mux.HandleFunc("/debug/loglevel", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, map[string]string{"level": logging.LevelName(opts.Level)})
+		case http.MethodPut, http.MethodPost:
+			var body struct {
+				Level string `json:"level"`
+			}
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+				return
+			}
+			if err := logging.SetLevel(opts.Level, body.Level); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"level": logging.LevelName(opts.Level)})
+		default:
+			w.Header().Set("Allow", "GET, PUT, POST")
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		}
+	})
+
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	// Time-series query: GET /debug/ts?metric=http.requests:/api/v1/hello&minutes=60
+	mux.HandleFunc("/debug/ts", func(w http.ResponseWriter, r *http.Request) {
+		if opts.TimeSeries == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "time-series store is disabled"})
+			return
+		}
+		metric := r.URL.Query().Get("metric")
+		if metric == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "metric query parameter is required"})
+			return
+		}
+		minutes := 60
+		if raw := r.URL.Query().Get("minutes"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed <= 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "minutes must be a positive integer"})
+				return
+			}
+			if parsed > 2880 {
+				parsed = 2880
+			}
+			minutes = parsed
+		}
+
+		to := time.Now()
+		from := to.Add(-time.Duration(minutes) * time.Minute)
+		buckets, err := opts.TimeSeries.Range(r.Context(), metric, from, to)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"metric":  metric,
+			"from":    from.UTC(),
+			"to":      to.UTC(),
+			"buckets": buckets,
+		})
+	})
 
 	return &Server{
 		httpServer: &http.Server{

@@ -47,6 +47,10 @@ proto:
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
 		api/greeter/v1/greeter.proto
 
+## kitex: regenerate the Kitex example code (requires the kitex CLI)
+kitex:
+	kitex -module $(MODULE) -gen-path api/kitex api/kitex/echo.thrift
+
 ## bench: smoke-run the load generator against a local instance
 bench: build
 	./bin/bench -mode rest -http-addr 127.0.0.1:8080 -c 20 -d 5s

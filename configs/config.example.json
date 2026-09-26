@@ -23,11 +23,56 @@
   },
   "log": {
     "level": "info",
-    "format": "json",
-    "addSource": false
+    "format": "terminal",
+    "output": "stdout",
+    "color": "auto",
+    "addSource": false,
+    "file": {
+      "path": "logs/gosvc.log",
+      "maxSizeMB": 100,
+      "maxBackups": 5,
+      "maxAgeDays": 7,
+      "compress": true
+    }
   },
   "limiter": {
     "rps": 0,
     "burst": 0
+  },
+  "auth": {
+    "enabled": false,
+    "apiKeys": [],
+    "jwt": {
+      "secret": "",
+      "issuer": "gosvc",
+      "audience": ""
+    }
+  },
+  "telemetry": {
+    "enabled": false,
+    "otlpEndpoint": "127.0.0.1:4318",
+    "insecure": true,
+    "sampleRatio": 1.0
+  },
+  "tcp": {
+    "enabled": false,
+    "host": "0.0.0.0",
+    "port": 7070,
+    "workers": 4,
+    "queueSize": 1024,
+    "maxFrameBytes": 1048576,
+    "readTimeout": "60s",
+    "shutdownTimeout": "5s"
+  },
+  "storage": {
+    "redis": {
+      "enabled": false,
+      "addr": "127.0.0.1:6379",
+      "password": "",
+      "db": 0,
+      "prefix": "gosvc",
+      "bucketTtl": "25h",
+      "queueSize": 4096
+    }
   }
 }

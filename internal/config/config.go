@@ -8,19 +8,26 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"example.com/gosvc/internal/logx"
 )
 
 // Config is the root configuration object.
 type Config struct {
-	Service ServiceConfig `json:"service"`
-	HTTP    HTTPConfig    `json:"http"`
-	GRPC    GRPCConfig    `json:"grpc"`
-	Admin   AdminConfig   `json:"admin"`
-	Log     LogConfig     `json:"log"`
-	Limiter LimiterConfig `json:"limiter"`
+	Service   ServiceConfig   `json:"service"`
+	HTTP      HTTPConfig      `json:"http"`
+	GRPC      GRPCConfig      `json:"grpc"`
+	TCP       TCPConfig       `json:"tcp"`
+	Admin     AdminConfig     `json:"admin"`
+	Log       LogConfig       `json:"log"`
+	Limiter   LimiterConfig   `json:"limiter"`
+	Auth      AuthConfig      `json:"auth"`
+	Telemetry TelemetryConfig `json:"telemetry"`
+	Storage   StorageConfig   `json:"storage"`
 }
 
 // ServiceConfig holds service identity.
@@ -64,15 +71,82 @@ func (c AdminConfig) Addr() string { return net.JoinHostPort(c.Host, strconv.Ito
 
 // LogConfig configures the slog logger.
 type LogConfig struct {
-	Level     string `json:"level"`  // debug | info | warn | error
-	Format    string `json:"format"` // json | text
-	AddSource bool   `json:"addSource"`
+	Level     string        `json:"level"`     // trace | debug | info | warn | error
+	Format    string        `json:"format"`    // auto | terminal | json | logfmt
+	Output    string        `json:"output"`    // stdout | file | both
+	Color     string        `json:"color"`     // auto | always | never
+	AddSource bool          `json:"addSource"` // add source location (JSON sinks)
+	File      FileLogConfig `json:"file"`
+}
+
+// FileLogConfig configures the rotating file sink.
+type FileLogConfig struct {
+	Path       string `json:"path"`
+	MaxSizeMB  int    `json:"maxSizeMB"`
+	MaxBackups int    `json:"maxBackups"`
+	MaxAgeDays int    `json:"maxAgeDays"`
+	Compress   bool   `json:"compress"`
 }
 
 // LimiterConfig configures the per-client token bucket limiter.
 type LimiterConfig struct {
 	RPS   float64 `json:"rps"`   // 0 disables rate limiting
 	Burst int     `json:"burst"` // required when RPS > 0
+}
+
+// TCPConfig configures the optional netpoll based line-delimited JSON-RPC
+// server. It is meant for internal, high-connection-count traffic: terminate
+// TLS at a gateway in front of it.
+type TCPConfig struct {
+	Enabled         bool     `json:"enabled"`
+	Host            string   `json:"host"`
+	Port            int      `json:"port"`
+	Workers         int      `json:"workers"`       // bounded worker pool size
+	QueueSize       int      `json:"queueSize"`     // bounded queue size
+	MaxFrameBytes   int      `json:"maxFrameBytes"` // maximum request line size
+	ReadTimeout     Duration `json:"readTimeout"`
+	ShutdownTimeout Duration `json:"shutdownTimeout"`
+}
+
+// Addr returns the host:port listen address.
+func (c TCPConfig) Addr() string { return net.JoinHostPort(c.Host, strconv.Itoa(c.Port)) }
+
+// AuthConfig configures API key and JWT authentication.
+type AuthConfig struct {
+	Enabled bool      `json:"enabled"`
+	APIKeys []string  `json:"apiKeys"`
+	JWT     JWTConfig `json:"jwt"`
+}
+
+// JWTConfig configures HS256 JWT verification.
+type JWTConfig struct {
+	Secret   string `json:"secret"`
+	Issuer   string `json:"issuer"`
+	Audience string `json:"audience"`
+}
+
+// TelemetryConfig configures OpenTelemetry tracing (OTLP/HTTP).
+type TelemetryConfig struct {
+	Enabled      bool    `json:"enabled"`
+	OTLPEndpoint string  `json:"otlpEndpoint"` // host:port
+	Insecure     bool    `json:"insecure"`
+	SampleRatio  float64 `json:"sampleRatio"` // 0..1
+}
+
+// StorageConfig configures optional persistence.
+type StorageConfig struct {
+	Redis RedisConfig `json:"redis"`
+}
+
+// RedisConfig configures the Redis backed time-series store.
+type RedisConfig struct {
+	Enabled   bool     `json:"enabled"`
+	Addr      string   `json:"addr"`
+	Password  string   `json:"password"`
+	DB        int      `json:"db"`
+	Prefix    string   `json:"prefix"`
+	BucketTTL Duration `json:"bucketTtl"`
+	QueueSize int      `json:"queueSize"`
 }
 
 // Duration is a time.Duration that unmarshals from either a Go duration string
@@ -130,9 +204,46 @@ func Default() *Config {
 			Port:            9090,
 			ShutdownTimeout: Duration(10 * time.Second),
 		},
-		Admin:   AdminConfig{Host: "127.0.0.1", Port: 6060},
-		Log:     LogConfig{Level: "info", Format: "json"},
+		Admin: AdminConfig{Host: "127.0.0.1", Port: 6060},
+		TCP: TCPConfig{
+			Enabled:         false,
+			Host:            "0.0.0.0",
+			Port:            7070,
+			Workers:         runtime.NumCPU(),
+			QueueSize:       1024,
+			MaxFrameBytes:   1 << 20,
+			ReadTimeout:     Duration(60 * time.Second),
+			ShutdownTimeout: Duration(5 * time.Second),
+		},
+		Log: LogConfig{
+			Level:  "info",
+			Format: "auto",
+			Output: "stdout",
+			Color:  "auto",
+			File: FileLogConfig{
+				MaxSizeMB:  100,
+				MaxBackups: 5,
+				MaxAgeDays: 7,
+				Compress:   true,
+			},
+		},
 		Limiter: LimiterConfig{RPS: 0, Burst: 0},
+		Auth:    AuthConfig{Enabled: false},
+		Telemetry: TelemetryConfig{
+			Enabled:      false,
+			OTLPEndpoint: "127.0.0.1:4318",
+			Insecure:     true,
+			SampleRatio:  1.0,
+		},
+		Storage: StorageConfig{
+			Redis: RedisConfig{
+				Enabled:   false,
+				Addr:      "127.0.0.1:6379",
+				Prefix:    "gosvc",
+				BucketTTL: Duration(25 * time.Hour),
+				QueueSize: 4096,
+			},
+		},
 	}
 }
 
@@ -172,6 +283,23 @@ func (c *Config) applyEnv() error {
 	}
 	if v := os.Getenv("GOSVC_LOG_FORMAT"); v != "" {
 		c.Log.Format = v
+	}
+	if v := os.Getenv("GOSVC_AUTH_API_KEYS"); v != "" {
+		c.Auth.Enabled = true
+		c.Auth.APIKeys = nil
+		for _, key := range strings.Split(v, ",") {
+			if key = strings.TrimSpace(key); key != "" {
+				c.Auth.APIKeys = append(c.Auth.APIKeys, key)
+			}
+		}
+	}
+	if v := os.Getenv("GOSVC_OTLP_ENDPOINT"); v != "" {
+		c.Telemetry.Enabled = true
+		c.Telemetry.OTLPEndpoint = v
+	}
+	if v := os.Getenv("GOSVC_REDIS_ADDR"); v != "" {
+		c.Storage.Redis.Enabled = true
+		c.Storage.Redis.Addr = v
 	}
 	for _, item := range []struct {
 		env  string
@@ -214,6 +342,7 @@ func (c *Config) Validate() error {
 	for name, port := range map[string]int{
 		"http.port":  c.HTTP.Port,
 		"grpc.port":  c.GRPC.Port,
+		"tcp.port":   c.TCP.Port,
 		"admin.port": c.Admin.Port,
 	} {
 		if port < 0 || port > 65535 {
@@ -231,15 +360,29 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("http.maxBodyBytes must be positive")
 	}
 
-	switch strings.ToLower(c.Log.Level) {
-	case "debug", "info", "warn", "error":
-	default:
-		return fmt.Errorf("log.level must be one of debug|info|warn|error, got %q", c.Log.Level)
+	if _, err := logx.ParseLevel(c.Log.Level); err != nil {
+		return fmt.Errorf("log.level: %w", err)
 	}
-	switch strings.ToLower(c.Log.Format) {
-	case "json", "text":
+	if _, err := logx.NormalizeFormat(c.Log.Format); err != nil {
+		return fmt.Errorf("log.format: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Log.Output)) {
+	case "", "stdout", "file", "both":
 	default:
-		return fmt.Errorf("log.format must be one of json|text, got %q", c.Log.Format)
+		return fmt.Errorf("log.output must be one of stdout|file|both, got %q", c.Log.Output)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Log.Color)) {
+	case "", "auto", "always", "never":
+	default:
+		return fmt.Errorf("log.color must be one of auto|always|never, got %q", c.Log.Color)
+	}
+	if strings.EqualFold(c.Log.Output, "file") || strings.EqualFold(c.Log.Output, "both") {
+		if strings.TrimSpace(c.Log.File.Path) == "" {
+			return fmt.Errorf("log.file.path must be set when log.output is %q", c.Log.Output)
+		}
+	}
+	if c.Log.File.MaxSizeMB < 0 || c.Log.File.MaxBackups < 0 || c.Log.File.MaxAgeDays < 0 {
+		return fmt.Errorf("log.file.maxSizeMB, maxBackups and maxAgeDays must not be negative")
 	}
 
 	if c.Limiter.RPS < 0 || c.Limiter.Burst < 0 {
@@ -247,6 +390,51 @@ func (c *Config) Validate() error {
 	}
 	if c.Limiter.RPS > 0 && c.Limiter.Burst == 0 {
 		return fmt.Errorf("limiter.burst must be > 0 when limiter.rps is enabled")
+	}
+
+	if c.Auth.Enabled {
+		if len(c.Auth.APIKeys) == 0 && strings.TrimSpace(c.Auth.JWT.Secret) == "" {
+			return fmt.Errorf("auth.enabled requires auth.apiKeys or auth.jwt.secret")
+		}
+		if secret := strings.TrimSpace(c.Auth.JWT.Secret); secret != "" && len(secret) < 16 {
+			return fmt.Errorf("auth.jwt.secret must be at least 16 characters")
+		}
+	}
+
+	if c.Telemetry.Enabled {
+		if strings.TrimSpace(c.Telemetry.OTLPEndpoint) == "" {
+			return fmt.Errorf("telemetry.otlpEndpoint must be set when telemetry is enabled")
+		}
+		if c.Telemetry.SampleRatio < 0 || c.Telemetry.SampleRatio > 1 {
+			return fmt.Errorf("telemetry.sampleRatio must be within [0,1]")
+		}
+	}
+
+	if c.TCP.Enabled {
+		if c.TCP.Workers <= 0 {
+			return fmt.Errorf("tcp.workers must be > 0")
+		}
+		if c.TCP.QueueSize <= 0 {
+			return fmt.Errorf("tcp.queueSize must be > 0")
+		}
+		if c.TCP.MaxFrameBytes <= 0 {
+			return fmt.Errorf("tcp.maxFrameBytes must be > 0")
+		}
+		if c.TCP.ReadTimeout <= 0 || c.TCP.ShutdownTimeout <= 0 {
+			return fmt.Errorf("tcp read/shutdown timeouts must be positive")
+		}
+	}
+
+	if c.Storage.Redis.Enabled {
+		if strings.TrimSpace(c.Storage.Redis.Addr) == "" {
+			return fmt.Errorf("storage.redis.addr must be set when redis is enabled")
+		}
+		if c.Storage.Redis.BucketTTL <= 0 {
+			return fmt.Errorf("storage.redis.bucketTtl must be positive")
+		}
+		if c.Storage.Redis.QueueSize <= 0 {
+			return fmt.Errorf("storage.redis.queueSize must be > 0")
+		}
 	}
 	return nil
 }

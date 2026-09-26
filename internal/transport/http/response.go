@@ -51,6 +51,8 @@ func statusFromKind(kind apierror.Kind) int {
 	switch kind {
 	case apierror.KindInvalidArgument:
 		return 400
+	case apierror.KindUnauthenticated:
+		return 401
 	case apierror.KindNotFound:
 		return 404
 	case apierror.KindConflict:

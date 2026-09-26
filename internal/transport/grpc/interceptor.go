@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	ggrpc "google.golang.org/grpc"
@@ -12,10 +13,12 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
+	"example.com/gosvc/internal/auth"
 	"example.com/gosvc/internal/logging"
 	"example.com/gosvc/internal/observability"
 	"example.com/gosvc/internal/ratelimit"
 	"example.com/gosvc/internal/reqid"
+	"example.com/gosvc/internal/store"
 )
 
 const requestIDKey = "x-request-id"
@@ -53,7 +56,27 @@ func requestIDInterceptor() ggrpc.UnaryServerInterceptor {
 	}
 }
 
-func loggingInterceptor() ggrpc.UnaryServerInterceptor {
+func authInterceptor(authenticator *auth.Authenticator) ggrpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *ggrpc.UnaryServerInfo, handler ggrpc.UnaryHandler) (any, error) {
+		if !authenticator.Enabled() || isPublicMethod(info.FullMethod) {
+			return handler(ctx, req)
+		}
+
+		identity, err := authenticator.Authenticate(credentialsFromMetadata(ctx))
+		if err != nil {
+			return nil, toStatus(err)
+		}
+
+		ctx = auth.WithIdentity(ctx, identity)
+		ctx = logging.WithLogger(ctx, logging.FromContext(ctx).With(
+			"subject", identity.Subject,
+			"auth_method", string(identity.Method),
+		))
+		return handler(ctx, req)
+	}
+}
+
+func loggingInterceptor(recorder store.Recorder) ggrpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *ggrpc.UnaryServerInfo, handler ggrpc.UnaryHandler) (any, error) {
 		start := time.Now()
 		resp, err := handler(ctx, req)
@@ -63,6 +86,9 @@ func loggingInterceptor() ggrpc.UnaryServerInterceptor {
 			"latency_ms", float64(time.Since(start).Microseconds())/1000.0,
 			"peer", peerAddr(ctx),
 		)
+		if recorder != nil {
+			_ = recorder.Incr(ctx, "grpc.requests:"+info.FullMethod, 1)
+		}
 		return resp, err
 	}
 }
@@ -85,6 +111,26 @@ func rateLimitInterceptor(limiter *ratelimit.Limiter) ggrpc.UnaryServerIntercept
 		}
 		return handler(ctx, req)
 	}
+}
+
+func credentialsFromMetadata(ctx context.Context) (bearer, apiKey string) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return "", ""
+	}
+	if values := md.Get("authorization"); len(values) > 0 {
+		bearer = auth.BearerToken(values[0])
+	}
+	if values := md.Get("x-api-key"); len(values) > 0 {
+		apiKey = values[0]
+	}
+	return bearer, apiKey
+}
+
+// isPublicMethod keeps health checks and reflection usable without credentials.
+func isPublicMethod(method string) bool {
+	return strings.HasPrefix(method, "/grpc.health.v1.Health/") ||
+		strings.HasPrefix(method, "/grpc.reflection.")
 }
 
 func peerAddr(ctx context.Context) string {

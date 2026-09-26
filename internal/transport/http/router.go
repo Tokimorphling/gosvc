@@ -10,7 +10,6 @@ import (
 	"github.com/cloudwego/hertz/pkg/app/server"
 
 	"example.com/gosvc/internal/apierror"
-	"example.com/gosvc/internal/jsonrpc"
 	"example.com/gosvc/internal/service/greeter"
 	"example.com/gosvc/internal/version"
 )
@@ -19,14 +18,15 @@ func (s *Server) registerRoutes(h *server.Hertz) {
 	h.GET("/healthz", s.handleHealthz)
 	h.GET("/readyz", s.handleReadyz)
 
-	// RESTful API.
-	h.GET("/api/v1/hello", s.handleHelloGET)
-	h.POST("/api/v1/hello", s.handleHelloPOST)
-	h.GET("/api/v1/greetings/:id", s.handleGetGreeting)
-	h.GET("/api/v1/info", s.handleInfo)
+	// RESTful API, protected by the shared authenticator.
+	api := h.Group("/api/v1", Auth(s.authenticator))
+	api.GET("/hello", s.handleHelloGET)
+	api.POST("/hello", s.handleHelloPOST)
+	api.GET("/greetings/:id", s.handleGetGreeting)
+	api.GET("/info", s.handleInfo)
 
 	// JSON-RPC 2.0 endpoint.
-	h.POST("/rpc", s.handleJSONRPC)
+	h.POST("/rpc", Auth(s.authenticator), s.handleJSONRPC)
 
 	h.NoRoute(func(ctx context.Context, c *app.RequestContext) {
 		WriteError(ctx, c, apierror.Newf(apierror.KindNotFound, "route %s %s not found", string(c.Method()), string(c.Path())))
@@ -34,28 +34,7 @@ func (s *Server) registerRoutes(h *server.Hertz) {
 }
 
 func (s *Server) registerJSONRPCMethods() {
-	s.dispatcher.Register("greeter.sayHello", func(ctx context.Context, params json.RawMessage) (any, error) {
-		var req greeter.HelloRequest
-		if err := jsonrpc.DecodeParams(params, &req); err != nil {
-			return nil, err
-		}
-		return s.service.SayHello(ctx, req, "jsonrpc")
-	})
-
-	s.dispatcher.Register("greeter.getGreeting", func(ctx context.Context, params json.RawMessage) (any, error) {
-		var req struct {
-			ID int64 `json:"id"`
-		}
-		if err := jsonrpc.DecodeParams(params, &req); err != nil {
-			return nil, err
-		}
-		return s.service.GetGreeting(ctx, req.ID)
-	})
-
-	s.dispatcher.Register("greeter.info", func(ctx context.Context, _ json.RawMessage) (any, error) {
-		return s.service.Info(ctx)
-	})
-
+	greeter.RegisterJSONRPC(s.dispatcher, s.service)
 	s.dispatcher.Register("system.methods", func(_ context.Context, _ json.RawMessage) (any, error) {
 		return s.dispatcher.Methods(), nil
 	})

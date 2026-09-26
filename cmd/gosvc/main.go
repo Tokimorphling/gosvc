@@ -15,6 +15,7 @@ import (
 	"example.com/gosvc/internal/app"
 	"example.com/gosvc/internal/config"
 	"example.com/gosvc/internal/logging"
+	"example.com/gosvc/internal/version"
 )
 
 func main() {
@@ -38,7 +39,7 @@ func run(configPath string) error {
 		return err
 	}
 
-	logger, level, err := logging.New(cfg.Log)
+	logger, level, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, version.Version)
 	if err != nil {
 		return err
 	}

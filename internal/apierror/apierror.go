@@ -16,6 +16,7 @@ type Kind string
 const (
 	KindUnknown          Kind = "unknown"
 	KindInvalidArgument  Kind = "invalid_argument"
+	KindUnauthenticated  Kind = "unauthenticated"
 	KindNotFound         Kind = "not_found"
 	KindConflict         Kind = "conflict"
 	KindPermissionDenied Kind = "permission_denied"

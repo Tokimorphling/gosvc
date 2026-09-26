@@ -20,6 +20,8 @@ func toStatus(err error) error {
 	switch apierror.KindOf(err) {
 	case apierror.KindInvalidArgument:
 		return status.Error(codes.InvalidArgument, apierror.ClientMessage(err))
+	case apierror.KindUnauthenticated:
+		return status.Error(codes.Unauthenticated, apierror.ClientMessage(err))
 	case apierror.KindNotFound:
 		return status.Error(codes.NotFound, apierror.ClientMessage(err))
 	case apierror.KindConflict:

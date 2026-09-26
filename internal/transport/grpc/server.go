@@ -8,27 +8,34 @@ import (
 	"net"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/trace"
 	ggrpc "google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
 	greeterv1 "example.com/gosvc/api/greeter/v1"
+	"example.com/gosvc/internal/auth"
 	"example.com/gosvc/internal/config"
 	apphealth "example.com/gosvc/internal/health"
 	"example.com/gosvc/internal/observability"
 	"example.com/gosvc/internal/ratelimit"
 	"example.com/gosvc/internal/service/greeter"
+	"example.com/gosvc/internal/store"
 )
 
 // Options wires the gRPC server.
 type Options struct {
-	Config  *config.Config
-	Service *greeter.Service
-	Logger  *slog.Logger
-	Metrics *observability.Metrics
-	Limiter *ratelimit.Limiter
-	Ready   *apphealth.Ready
+	Config        *config.Config
+	Service       *greeter.Service
+	Logger        *slog.Logger
+	Metrics       *observability.Metrics
+	Limiter       *ratelimit.Limiter
+	Authenticator *auth.Authenticator
+	Tracer        trace.Tracer
+	Recorder      store.Recorder
+	Ready         *apphealth.Ready
 }
 
 // Server serves the Greeter service plus gRPC health and reflection.
@@ -48,14 +55,21 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("listen grpc: %w", err)
 	}
 
-	server := ggrpc.NewServer(ggrpc.ChainUnaryInterceptor(
-		recoveryInterceptor(opts.Logger),
-		requestIDInterceptor(),
-		loggingInterceptor(),
-		metricsInterceptor(opts.Metrics),
-		rateLimitInterceptor(opts.Limiter),
-	))
+	serverOptions := []ggrpc.ServerOption{
+		ggrpc.ChainUnaryInterceptor(
+			recoveryInterceptor(opts.Logger),
+			requestIDInterceptor(),
+			authInterceptor(opts.Authenticator),
+			loggingInterceptor(opts.Recorder),
+			metricsInterceptor(opts.Metrics),
+			rateLimitInterceptor(opts.Limiter),
+		),
+	}
+	if opts.Tracer != nil {
+		serverOptions = append(serverOptions, ggrpc.StatsHandler(otelgrpc.NewServerHandler()))
+	}
 
+	server := ggrpc.NewServer(serverOptions...)
 	greeterv1.RegisterGreeterServer(server, newGreeterServer(opts.Service, opts.Logger))
 
 	healthServer := health.NewServer()
