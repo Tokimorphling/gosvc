@@ -1,0 +1,19 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+issues:
+  exclude-rules:
+    # Generated protobuf code is not ours to lint.
+    - path: ^api/
+      linters:
+        - errcheck
+        - staticcheck
+        - unused

@@ -1,0 +1,8 @@
+/bin/
+/dist/
+*.out
+coverage.*
+.DS_Store
+.idea/
+.vscode/
+configs/config.json

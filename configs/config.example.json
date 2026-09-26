@@ -1,0 +1,33 @@
+{
+  "service": {
+    "name": "gosvc",
+    "env": "dev"
+  },
+  "http": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "readTimeout": "10s",
+    "writeTimeout": "10s",
+    "idleTimeout": "60s",
+    "shutdownTimeout": "10s",
+    "maxBodyBytes": 1048576
+  },
+  "grpc": {
+    "host": "0.0.0.0",
+    "port": 9090,
+    "shutdownTimeout": "10s"
+  },
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 6060
+  },
+  "log": {
+    "level": "info",
+    "format": "json",
+    "addSource": false
+  },
+  "limiter": {
+    "rps": 0,
+    "burst": 0
+  }
+}

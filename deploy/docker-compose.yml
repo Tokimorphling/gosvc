@@ -1,0 +1,17 @@
+services:
+  gosvc:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: gosvc:local
+    ports:
+      - "8080:8080"   # REST + JSON-RPC
+      - "9090:9090"   # gRPC
+      - "6060:6060"   # admin: /metrics, /debug/pprof, /healthz, /readyz
+    healthcheck:
+      test: ["CMD", "/app/gosvc", "-healthcheck", "http://127.0.0.1:6060/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    restart: unless-stopped
