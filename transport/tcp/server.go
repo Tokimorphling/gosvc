@@ -6,8 +6,17 @@
 //     block the event loop and the queue provides explicit backpressure;
 //   - netpoll requires serialized writes per connection, so every connection
 //     carries a write mutex in its context;
+//   - frames are length-limited BEFORE they are buffered: Until accumulates
+//     the whole line in memory, so a length check after the fact would let a
+//     hostile client grow the read buffer without bound;
+//   - connections that arrive while the service is not ready, or exceed the
+//     rate limit, are answered once and closed: netpoll is level-triggered
+//     and re-fires OnRequest while input is pending, so leaving unread data
+//     behind would spin the event loop and amplify writes;
 //   - TLS is intentionally not handled here: terminate it at a gateway and use
-//     this listener for internal traffic.
+//     this listener for internal traffic. The TCP transport also does not
+//     authenticate callers (unlike HTTP and gRPC); treat it as a trusted
+//     internal hop or front it with an authenticating proxy.
 package tcp
 
 import (
@@ -16,29 +25,27 @@ import (
 	"log/slog"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/cloudwego/netpoll"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"example.com/gosvc/config"
-	"example.com/gosvc/health"
-	"example.com/gosvc/internal/workerpool"
-	"example.com/gosvc/jsonrpc"
-	"example.com/gosvc/logging"
-	"example.com/gosvc/observability"
-	"example.com/gosvc/ratelimit"
-	"example.com/gosvc/store"
+	"github.com/Tokimorphling/gosvc/config"
+	"github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/internal/workerpool"
+	"github.com/Tokimorphling/gosvc/jsonrpc"
+	"github.com/Tokimorphling/gosvc/logging"
+	"github.com/Tokimorphling/gosvc/observability"
+	"github.com/Tokimorphling/gosvc/ratelimit"
+	"github.com/Tokimorphling/gosvc/store"
 )
-
-const requestTimeout = 5 * time.Second
 
 var (
 	busyFrame     = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32004,"message":"server busy"}}`)
 	notReadyFrame = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32004,"message":"service not ready"}}`)
 	tooLargeFrame = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"frame too large"}}`)
+	internalFrame = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal error"}}`)
 )
 
 // Options wires the TCP server.
@@ -123,9 +130,14 @@ func (s *Server) Dispatcher() *jsonrpc.Dispatcher { return s.dispatcher }
 // Addr returns the effective listen address.
 func (s *Server) Addr() string { return s.listener.Addr().String() }
 
-// Serve blocks until ctx is cancelled or the event loop fails.
+// Serve blocks until ctx is cancelled or the event loop fails. When ctx is
+// cancelled it waits for the event loop to stop and for queued requests to
+// drain before returning, so callers (gosvc.App.Run) do not exit the process
+// while in-flight requests are still running.
 func (s *Server) Serve(ctx context.Context) error {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.D())
 		defer cancel()
@@ -139,24 +151,42 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("tcp serve: %w", err)
 	}
+	// eventLoop.Serve returns when the loop stops; the shutdown goroutine is
+	// still draining the worker pool, so join it.
+	<-done
 	return nil
 }
 
 // handleRequest runs on the netpoll event loop: it must only read and dispatch.
 func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connection) error {
 	if s.ready != nil && !s.ready.IsReady() {
+		// Answer once, then close: leaving the input unread would spin the
+		// event loop (netpoll is level-triggered) and flood the client with
+		// busy frames. The client reconnects when the service is ready.
 		s.write(ctx, connection, notReadyFrame)
+		_ = connection.Close()
 		return nil
 	}
-	if s.limiter != nil && !s.limiter.Allow(connection.RemoteAddr().String()) {
+	if s.limiter != nil && !s.limiter.Allow(clientKey(connection)) {
 		s.write(ctx, connection, busyFrame)
+		_ = connection.Close()
+		return nil
+	}
+
+	// Bound the line before it is buffered. Until accumulates the entire line
+	// in memory, so MaxFrameBytes must be enforced on the amount currently
+	// buffered, not only on the completed line. The line includes the
+	// trailing newline, so a frame of exactly MaxFrameBytes still passes.
+	if connection.Reader().Len() > s.cfg.MaxFrameBytes {
+		s.write(ctx, connection, tooLargeFrame)
+		_ = connection.Close()
 		return nil
 	}
 
 	line, err := connection.Reader().Until('\n')
 	if err != nil {
-		// Read timeout or closed connection: netpoll will call OnRequest again
-		// when more data arrives. Partial frames without a newline are dropped.
+		// No newline yet (or the connection died): the partial frame stays
+		// buffered and OnRequest fires again when more data arrives.
 		return nil
 	}
 
@@ -177,14 +207,23 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 	return nil
 }
 
+// clientKey returns the remote address without the ephemeral port so the rate
+// limiter buckets per client, not per connection.
+func clientKey(connection netpoll.Connection) string {
+	if host, _, err := net.SplitHostPort(connection.RemoteAddr().String()); err == nil {
+		return host
+	}
+	return connection.RemoteAddr().String()
+}
+
 // process runs on a worker goroutine and may block on business logic.
 func (s *Server) process(connection netpoll.Connection, parent context.Context, body []byte) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), requestTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), s.cfg.HandlerTimeout.D())
 	defer cancel()
 	ctx = logging.WithRequestID(ctx, logging.NewRequestID())
 
+	var span trace.Span
 	if s.tracer != nil {
-		var span trace.Span
 		ctx, span = s.tracer.Start(ctx, "tcp.request",
 			trace.WithSpanKind(trace.SpanKindServer),
 			trace.WithAttributes(
@@ -192,15 +231,30 @@ func (s *Server) process(connection netpoll.Connection, parent context.Context, 
 				attribute.String("rpc.system", "jsonrpc"),
 				attribute.String("server.address", connection.RemoteAddr().String()),
 			))
-		defer span.End()
 		ctx = logging.WithTrace(ctx)
+	}
+	if span != nil {
+		// Registered before the recover below so it runs after it: the span
+		// status is set before the span ends.
+		defer span.End()
+	}
 
-		defer func() {
-			if recover() != nil {
+	defer func() {
+		if r := recover(); r != nil {
+			// A panicking handler must not leave the client waiting for a
+			// response until its own timeout; answer with an internal error
+			// frame (the request id is lost at this point) and keep the span
+			// and logs informative. The worker pool survives either way.
+			s.logger.Error("tcp handler panic",
+				"panic", r,
+				"remote", connection.RemoteAddr().String(),
+			)
+			if span != nil {
 				span.SetStatus(codes.Error, "panic")
 			}
-		}()
-	}
+			s.write(ctx, connection, internalFrame)
+		}
+	}()
 
 	response, ok := s.dispatcher.Serve(ctx, body)
 	if s.recorder != nil {

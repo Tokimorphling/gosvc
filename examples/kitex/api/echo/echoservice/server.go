@@ -2,7 +2,7 @@
 package echoservice
 
 import (
-	echo "example.com/gosvc/examples/kitex/api/echo"
+	echo "github.com/Tokimorphling/gosvc/examples/kitex/api/echo"
 	server "github.com/cloudwego/kitex/server"
 )
 

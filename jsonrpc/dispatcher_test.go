@@ -3,9 +3,12 @@ package jsonrpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
-	"example.com/gosvc/apierror"
+	"github.com/Tokimorphling/gosvc/apierror"
 )
 
 type testResponse struct {
@@ -168,5 +171,66 @@ func TestDecodeParamsRejectsPositional(t *testing.T) {
 	raw, _ := d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"echo","params":["x"]}`))
 	if resp := decodeResponse(t, raw); resp.Error == nil || resp.Error.Code != CodeInvalidParams {
 		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestBatchIsCapped(t *testing.T) {
+	d := newTestDispatcher()
+
+	request := func(id int) string {
+		return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"echo","params":{"name":"x"}}`, id)
+	}
+
+	// The default cap rejects a batch that is one item larger.
+	over := make([]string, 0, defaultMaxBatch+1)
+	for i := 0; i < defaultMaxBatch+1; i++ {
+		over = append(over, request(i))
+	}
+	raw, _ := d.Serve(context.Background(), []byte("["+strings.Join(over, ",")+"]"))
+	if resp := decodeResponse(t, raw); resp.Error == nil || resp.Error.Code != CodeInvalidRequest {
+		t.Fatalf("oversized batch must be rejected: %+v", resp)
+	}
+
+	// A batch at the cap still works.
+	at := make([]string, 0, defaultMaxBatch)
+	for i := 0; i < defaultMaxBatch; i++ {
+		at = append(at, request(i))
+	}
+	raw, _ = d.Serve(context.Background(), []byte("["+strings.Join(at, ",")+"]"))
+	var responses []testResponse
+	if err := json.Unmarshal(raw, &responses); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses) != defaultMaxBatch {
+		t.Fatalf("got %d responses, want %d", len(responses), defaultMaxBatch)
+	}
+
+	// The cap is adjustable.
+	d.SetMaxBatch(2)
+	raw, _ = d.Serve(context.Background(), []byte("["+request(1)+","+request(2)+","+request(3)+"]"))
+	if resp := decodeResponse(t, raw); resp.Error == nil || resp.Error.Code != CodeInvalidRequest {
+		t.Fatalf("custom cap must reject the batch: %+v", resp)
+	}
+	raw, _ = d.Serve(context.Background(), []byte("["+request(1)+","+request(2)+"]"))
+	if err := json.Unmarshal(raw, &responses); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses) != 2 {
+		t.Fatalf("got %d responses, want 2", len(responses))
+	}
+}
+
+func TestTryRegisterReportsDuplicates(t *testing.T) {
+	d := NewDispatcher()
+	handler := func(context.Context, json.RawMessage) (any, error) { return nil, nil }
+
+	if err := d.TryRegister("once", handler); err != nil {
+		t.Fatalf("first registration must succeed: %v", err)
+	}
+	if err := d.TryRegister("once", handler); !errors.Is(err, ErrDuplicateMethod) {
+		t.Fatalf("duplicate must be reported, got %v", err)
+	}
+	if len(d.Methods()) != 1 {
+		t.Fatalf("the duplicate must not overwrite: %v", d.Methods())
 	}
 }

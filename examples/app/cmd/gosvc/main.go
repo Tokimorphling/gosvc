@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"example.com/gosvc/examples/app"
-	"example.com/gosvc/logging"
+	"github.com/Tokimorphling/gosvc/examples/app"
+	"github.com/Tokimorphling/gosvc/logging"
 )
 
 const (

@@ -24,7 +24,7 @@ import (
 	ggrpc "google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	greeterv1 "example.com/gosvc/examples/app/api/greeter/v1"
+	greeterv1 "github.com/Tokimorphling/gosvc/examples/app/api/greeter/v1"
 )
 
 type workerResult struct {

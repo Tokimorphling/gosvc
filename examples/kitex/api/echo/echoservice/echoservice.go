@@ -5,7 +5,7 @@ package echoservice
 import (
 	"context"
 	"errors"
-	echo "example.com/gosvc/examples/kitex/api/echo"
+	echo "github.com/Tokimorphling/gosvc/examples/kitex/api/echo"
 	client "github.com/cloudwego/kitex/client"
 	kitex "github.com/cloudwego/kitex/pkg/serviceinfo"
 )

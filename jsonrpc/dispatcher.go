@@ -4,14 +4,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/bytedance/sonic"
 
-	"example.com/gosvc/apierror"
+	"github.com/Tokimorphling/gosvc/apierror"
 )
+
+// defaultMaxBatch caps how many requests one batch payload may carry. JSON-RPC
+// allows servers to reject oversized batches, and without a cap a single
+// request body could occupy a worker for an unbounded number of invocations.
+const defaultMaxBatch = 128
+
+// ErrDuplicateMethod is returned by TryRegister when the method name is
+// already bound.
+var ErrDuplicateMethod = errors.New("jsonrpc: duplicate method")
 
 // Observer is called once per handled method for metrics and tracing.
 type Observer func(method string, code int, d time.Duration)
@@ -21,22 +32,36 @@ type Dispatcher struct {
 	mu       sync.RWMutex
 	methods  map[string]HandlerFunc
 	observer Observer
+	maxBatch int
 }
 
 // NewDispatcher creates an empty dispatcher.
 func NewDispatcher() *Dispatcher {
-	return &Dispatcher{methods: make(map[string]HandlerFunc)}
+	return &Dispatcher{
+		methods:  make(map[string]HandlerFunc),
+		maxBatch: defaultMaxBatch,
+	}
 }
 
 // Register binds a method name to a handler. It panics on duplicates to catch
-// wiring mistakes at startup.
+// wiring mistakes at startup. Use TryRegister when registering at runtime,
+// where a duplicate must not take the process down.
 func (d *Dispatcher) Register(method string, handler HandlerFunc) {
+	if err := d.TryRegister(method, handler); err != nil {
+		panic(err)
+	}
+}
+
+// TryRegister binds a method name to a handler and reports whether the name
+// was still free, making it safe to call at runtime.
+func (d *Dispatcher) TryRegister(method string, handler HandlerFunc) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if _, exists := d.methods[method]; exists {
-		panic("jsonrpc: duplicate method " + method)
+		return fmt.Errorf("%w: %s", ErrDuplicateMethod, method)
 	}
 	d.methods[method] = handler
+	return nil
 }
 
 // RegisterTyped binds a typed handler: Req is decoded from the JSON-RPC params
@@ -55,8 +80,25 @@ func (d *Dispatcher) RegisterTyped[Req, Resp any](method string, handler func(ct
 	})
 }
 
-// SetObserver installs a metrics observer. Call it before serving traffic.
-func (d *Dispatcher) SetObserver(observer Observer) { d.observer = observer }
+// SetObserver installs a metrics observer. It is safe to call while requests
+// are being served.
+func (d *Dispatcher) SetObserver(observer Observer) {
+	d.mu.Lock()
+	d.observer = observer
+	d.mu.Unlock()
+}
+
+// SetMaxBatch caps the number of requests accepted in one batch payload.
+// Values <= 0 restore the default. The cap rejects the whole batch with an
+// InvalidRequest error, as the JSON-RPC specification permits.
+func (d *Dispatcher) SetMaxBatch(n int) {
+	if n <= 0 {
+		n = defaultMaxBatch
+	}
+	d.mu.Lock()
+	d.maxBatch = n
+	d.mu.Unlock()
+}
 
 // Methods returns the registered method names in sorted order.
 func (d *Dispatcher) Methods() []string {
@@ -73,8 +115,8 @@ func (d *Dispatcher) Methods() []string {
 // Handle processes a single request and returns its response.
 func (d *Dispatcher) Handle(ctx context.Context, req *Request) *Response {
 	start := time.Now()
-	resp := d.handle(ctx, req)
-	if d.observer != nil {
+	resp, observer := d.handle(ctx, req)
+	if observer != nil {
 		method := ""
 		if req != nil {
 			method = req.Method
@@ -83,36 +125,42 @@ func (d *Dispatcher) Handle(ctx context.Context, req *Request) *Response {
 		if resp != nil && resp.Error != nil {
 			code = resp.Error.Code
 		}
-		d.observer(method, code, time.Since(start))
+		observer(method, code, time.Since(start))
 	}
 	return resp
 }
 
-func (d *Dispatcher) handle(ctx context.Context, req *Request) *Response {
-	if req == nil {
-		return errorResponse(nil, CodeInvalidRequest, "invalid request")
-	}
-	if req.JSONRPC != "2.0" {
-		return errorResponse(req.ID, CodeInvalidRequest, `jsonrpc must be "2.0"`)
-	}
-	if req.Method == "" {
-		return errorResponse(req.ID, CodeInvalidRequest, "method must not be empty")
-	}
-
+func (d *Dispatcher) handle(ctx context.Context, req *Request) (*Response, Observer) {
+	// Read the observer and handler under one lock so SetObserver can be
+	// called at any time without racing Handle.
 	d.mu.RLock()
-	handler := d.methods[req.Method]
+	observer := d.observer
+	var handler HandlerFunc
+	if req != nil {
+		handler = d.methods[req.Method]
+	}
 	d.mu.RUnlock()
 
+	if req == nil {
+		return errorResponse(nil, CodeInvalidRequest, "invalid request"), observer
+	}
+	if req.JSONRPC != "2.0" {
+		return errorResponse(req.ID, CodeInvalidRequest, `jsonrpc must be "2.0"`), observer
+	}
+	if req.Method == "" {
+		return errorResponse(req.ID, CodeInvalidRequest, "method must not be empty"), observer
+	}
+
 	if handler == nil {
-		return errorResponse(req.ID, CodeMethodNotFound, "method not found: "+req.Method)
+		return errorResponse(req.ID, CodeMethodNotFound, "method not found: "+req.Method), observer
 	}
 
 	result, err := handler(ctx, req.Params)
 	if err != nil {
 		code, message := codeOf(err)
-		return errorResponse(req.ID, code, message)
+		return errorResponse(req.ID, code, message), observer
 	}
-	return &Response{JSONRPC: "2.0", ID: normalizeID(req.ID), Result: result}
+	return &Response{JSONRPC: "2.0", ID: normalizeID(req.ID), Result: result}, observer
 }
 
 // Serve handles one request body, which may be a single request or a batch.
@@ -146,6 +194,14 @@ func (d *Dispatcher) serveBatch(ctx context.Context, body []byte) ([]byte, bool)
 	}
 	if len(reqs) == 0 {
 		return d.marshal(errorResponse(nil, CodeInvalidRequest, "empty batch")), true
+	}
+
+	d.mu.RLock()
+	maxBatch := d.maxBatch
+	d.mu.RUnlock()
+	if len(reqs) > maxBatch {
+		return d.marshal(errorResponse(nil, CodeInvalidRequest,
+			fmt.Sprintf("batch too large: %d requests exceed the limit of %d", len(reqs), maxBatch))), true
 	}
 
 	responses := make([]*Response, 0, len(reqs))

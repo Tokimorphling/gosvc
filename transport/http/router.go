@@ -6,7 +6,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 
-	"example.com/gosvc/apierror"
+	"github.com/Tokimorphling/gosvc/apierror"
 )
 
 // registerRoutes wires the endpoints owned by the runtime. Application routes

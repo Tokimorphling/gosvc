@@ -8,7 +8,7 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 
-	"example.com/gosvc/store"
+	"github.com/Tokimorphling/gosvc/store"
 )
 
 const defaultFlushInterval = 5 * time.Second
@@ -110,6 +110,10 @@ func (r *Recorder) Wait() {
 	<-r.done
 }
 
+// flush writes the aggregated batch into Redis. Buckets are keyed by the flush
+// time, not by each sample's arrival time, so a sample can land at most one
+// flush interval away from its true minute; with the default 5s interval the
+// attribution error stays within that bound.
 func (r *Recorder) flush(ctx context.Context) {
 	r.mu.Lock()
 	if len(r.aggregated) == 0 {

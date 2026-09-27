@@ -8,6 +8,13 @@ import (
 	"time"
 )
 
+const (
+	// samplerShards must stay a power of two; counters are sharded so
+	// concurrent records contend on different locks.
+	samplerShards = 16
+	samplerMask   = samplerShards - 1
+)
+
 // SamplingOptions configures a SamplingHandler.
 type SamplingOptions struct {
 	// Initial is how many records per (level, message) are always emitted in
@@ -30,6 +37,13 @@ type SamplingStats struct {
 	WindowFrom time.Time         `json:"windowStartedAt"`
 }
 
+type samplerShard struct {
+	mu       sync.Mutex
+	window   time.Time
+	counters map[string]int
+	dropped  map[string]uint64
+}
+
 // SamplingHandler reduces log volume under high QPS: within each tick window it
 // emits the first Initial records for a given (level, message) pair and then
 // only one out of every Thereafter records. Records at ExemptLevel or above are
@@ -37,14 +51,11 @@ type SamplingStats struct {
 //
 // It is the presentation-layer counterpart of the tracing sample ratio: keep
 // levels cheap for repeated request logs while never losing warnings/errors.
+// Counters are sharded by (level, message) hash to keep the hot path scalable.
 type SamplingHandler struct {
-	inner slog.Handler
-	opts  SamplingOptions
-
-	mu       sync.Mutex
-	window   time.Time
-	counters map[string]int
-	dropped  map[string]uint64
+	inner  slog.Handler
+	opts   SamplingOptions
+	shards [samplerShards]samplerShard
 
 	emitted  atomic.Uint64
 	droppedN atomic.Uint64
@@ -64,13 +75,16 @@ func NewSamplingHandler(inner slog.Handler, opts SamplingOptions) *SamplingHandl
 	if opts.ExemptLevel == 0 {
 		opts.ExemptLevel = slog.LevelWarn
 	}
-	return &SamplingHandler{
-		inner:    inner,
-		opts:     opts,
-		window:   time.Now(),
-		counters: make(map[string]int),
-		dropped:  make(map[string]uint64),
+	h := &SamplingHandler{inner: inner, opts: opts}
+	now := time.Now()
+	for i := range h.shards {
+		h.shards[i] = samplerShard{
+			window:   now,
+			counters: make(map[string]int),
+			dropped:  make(map[string]uint64),
+		}
 	}
+	return h
 }
 
 // Enabled implements slog.Handler.
@@ -103,39 +117,55 @@ func (h *SamplingHandler) WithGroup(name string) slog.Handler {
 
 // Stats returns a snapshot of the sampler counters.
 func (h *SamplingHandler) Stats() SamplingStats {
-	h.mu.Lock()
-	byLevel := make(map[string]uint64, len(h.dropped))
-	for level, count := range h.dropped {
-		byLevel[level] = count
+	stats := SamplingStats{
+		Emitted: h.emitted.Load(),
+		Dropped: h.droppedN.Load(),
+		ByLevel: make(map[string]uint64),
 	}
-	window := h.window
-	h.mu.Unlock()
+	for i := range h.shards {
+		s := &h.shards[i]
+		s.mu.Lock()
+		for level, count := range s.dropped {
+			stats.ByLevel[level] += count
+		}
+		if s.window.Before(stats.WindowFrom) || stats.WindowFrom.IsZero() {
+			stats.WindowFrom = s.window
+		}
+		s.mu.Unlock()
+	}
+	return stats
+}
 
-	return SamplingStats{
-		Emitted:    h.emitted.Load(),
-		Dropped:    h.droppedN.Load(),
-		ByLevel:    byLevel,
-		WindowFrom: window,
+// shardFor picks the shard for a (level, message) pair without allocating.
+func (h *SamplingHandler) shardFor(level slog.Level, message string) *samplerShard {
+	const prime = 16777619
+	hash := uint32(level) // seed with the level bits (wraps negative levels)
+	for i := 0; i < len(message); i++ {
+		hash ^= uint32(message[i])
+		hash *= prime
 	}
+	return &h.shards[hash&samplerMask]
 }
 
 // shouldEmit counts the record and decides whether it survives sampling.
 func (h *SamplingHandler) shouldEmit(r slog.Record) bool {
-	now := time.Now()
-	key := r.Level.String() + "|" + r.Message
+	level := r.Level.String()
+	s := h.shardFor(r.Level, r.Message)
 
-	h.mu.Lock()
-	if now.Sub(h.window) >= h.opts.Tick {
-		h.window = now
-		h.counters = make(map[string]int)
+	s.mu.Lock()
+	now := time.Now()
+	if now.Sub(s.window) >= h.opts.Tick {
+		s.window = now
+		s.counters = make(map[string]int)
 	}
-	n := h.counters[key] + 1
-	h.counters[key] = n
+	key := level + "|" + r.Message
+	n := s.counters[key] + 1
+	s.counters[key] = n
 	emit := n <= h.opts.Initial || (n-h.opts.Initial)%h.opts.Thereafter == 0
 	if !emit {
-		h.dropped[r.Level.String()]++
+		s.dropped[level]++
 	}
-	h.mu.Unlock()
+	s.mu.Unlock()
 
 	if !emit {
 		h.droppedN.Add(1)

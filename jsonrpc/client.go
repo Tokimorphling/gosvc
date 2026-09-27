@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +17,8 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+
+	"github.com/Tokimorphling/gosvc/apierror"
 )
 
 const defaultTimeout = 5 * time.Second
@@ -227,8 +230,33 @@ func (t *HTTPTransport) RoundTrip(ctx context.Context, request []byte) ([]byte, 
 	case http.StatusNoContent:
 		return nil, fmt.Errorf("jsonrpc: server returned no content for a request that expects a response")
 	default:
+		// The gosvc error mapping answers non-200 statuses with
+		// {"error":{"code":"<kind>","message":...}}; surface it as an
+		// *apierror.Error so callers can branch on the kind (for example
+		// unauthenticated) instead of string matching.
+		if kind, message := decodeErrorBody(body); kind != "" {
+			return nil, &apierror.Error{Kind: apierror.Kind(kind), Message: message, Op: fmt.Sprintf("http %d", resp.StatusCode)}
+		}
 		return nil, fmt.Errorf("jsonrpc: http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+}
+
+// decodeErrorBody extracts the transport error mapping from an HTTP error
+// body. It returns "" when the body does not look like a mapped error.
+func decodeErrorBody(body []byte) (kind, message string) {
+	var mapped struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := sonic.Unmarshal(body, &mapped); err != nil {
+		return "", ""
+	}
+	if mapped.Error.Code == "" || mapped.Error.Message == "" {
+		return "", ""
+	}
+	return mapped.Error.Code, mapped.Error.Message
 }
 
 // Send implements Transport.
@@ -263,94 +291,203 @@ func (t *HTTPTransport) do(ctx context.Context, request []byte) (*http.Response,
 	return client.Do(req)
 }
 
-// TCPTransport keeps one persistent connection and serializes requests on it.
+// TCPTransport speaks the line-delimited protocol over one persistent
+// connection with pipelining: multiple calls may be in flight concurrently and
+// responses are matched to requests by their JSON-RPC id, so a slow request
+// does not serialize the ones behind it.
 type TCPTransport struct {
 	Addr    string
 	Timeout time.Duration
 
-	mu     sync.Mutex
-	conn   net.Conn
-	reader *bufio.Reader
+	mu      sync.Mutex
+	conn    net.Conn
+	pending map[string]chan tcpResult
+	closed  bool
 }
 
-// RoundTrip implements Transport.
-func (t *TCPTransport) RoundTrip(ctx context.Context, request []byte) ([]byte, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+type tcpResult struct {
+	body []byte
+	err  error
+}
 
+// errTransportClosed is returned by calls made after Close.
+var errTransportClosed = errors.New("jsonrpc: transport closed")
+
+// RoundTrip implements Transport. The request body must carry a JSON-RPC id;
+// it is used to route the response back to this call.
+func (t *TCPTransport) RoundTrip(ctx context.Context, request []byte) ([]byte, error) {
+	var head struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := sonic.Unmarshal(request, &head); err != nil || len(head.ID) == 0 {
+		return nil, fmt.Errorf("jsonrpc: tcp transport requires a request id")
+	}
+
+	// Bound the call when the context carries no deadline, matching the
+	// deadline-based behaviour of the previous serial transport.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t.timeoutOrDefault())
+		defer cancel()
+	}
+
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil, errTransportClosed
+	}
 	if err := t.ensureLocked(ctx); err != nil {
+		t.mu.Unlock()
 		return nil, err
 	}
-	t.setDeadlineLocked(ctx)
+	key := string(head.ID)
+	result := make(chan tcpResult, 1)
+	t.pending[key] = result
+	err := t.writeLocked(ctx, request)
+	t.mu.Unlock()
 
-	if err := writeFrame(t.conn, request); err != nil {
-		t.resetLocked()
-		return nil, fmt.Errorf("jsonrpc: tcp write: %w", err)
-	}
-	line, err := t.reader.ReadBytes('\n')
 	if err != nil {
-		t.resetLocked()
-		return nil, fmt.Errorf("jsonrpc: tcp read: %w", err)
+		t.mu.Lock()
+		delete(t.pending, key)
+		t.mu.Unlock()
+		return nil, err
 	}
-	return bytes.TrimSpace(line), nil
+
+	select {
+	case res := <-result:
+		return res.body, res.err
+	case <-ctx.Done():
+		// The response may still arrive later; dropping the pending entry
+		// makes the read loop discard it instead of leaking a channel.
+		t.mu.Lock()
+		delete(t.pending, key)
+		t.mu.Unlock()
+		return nil, ctx.Err()
+	}
 }
 
 // Send implements Transport.
 func (t *TCPTransport) Send(ctx context.Context, request []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
+	if t.closed {
+		return errTransportClosed
+	}
 	if err := t.ensureLocked(ctx); err != nil {
 		return err
 	}
-	t.setDeadlineLocked(ctx)
-
-	if err := writeFrame(t.conn, request); err != nil {
-		t.resetLocked()
-		return fmt.Errorf("jsonrpc: tcp write: %w", err)
-	}
-	return nil
+	return t.writeLocked(ctx, request)
 }
 
-// Close implements Transport.
+// Close implements Transport. Pending calls fail with errTransportClosed.
 func (t *TCPTransport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.closeLocked()
+	if t.closed {
+		return nil
+	}
+	t.closed = true
+	err := t.closeLocked()
+	t.failAllLocked(errTransportClosed)
+	return err
 }
 
+// ensureLocked dials when no connection is held and starts the read loop. It
+// requires t.mu.
 func (t *TCPTransport) ensureLocked(ctx context.Context) error {
 	if t.conn != nil {
 		return nil
 	}
-	var dialer net.Dialer
+	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", t.Addr)
 	if err != nil {
 		return fmt.Errorf("jsonrpc: tcp dial %s: %w", t.Addr, err)
 	}
 	t.conn = conn
-	t.reader = bufio.NewReader(conn)
+	if t.pending == nil {
+		t.pending = make(map[string]chan tcpResult)
+	}
+	go t.readLoop(conn, bufio.NewReader(conn))
 	return nil
 }
 
-func (t *TCPTransport) setDeadlineLocked(ctx context.Context) {
-	timeout := t.Timeout
-	if timeout <= 0 {
-		timeout = defaultTimeout
-	}
-	deadline := time.Now().Add(timeout)
+// writeLocked writes one frame. It requires t.mu, which serialises concurrent
+// writes. A write error tears the connection down and fails every pending
+// call; the next RoundTrip dials again.
+func (t *TCPTransport) writeLocked(ctx context.Context, request []byte) error {
+	deadline := time.Now().Add(t.timeoutOrDefault())
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
-	_ = t.conn.SetDeadline(deadline)
+	_ = t.conn.SetWriteDeadline(deadline)
+	if err := writeFrame(t.conn, request); err != nil {
+		t.resetLocked()
+		t.failAllLocked(fmt.Errorf("jsonrpc: tcp write: %w", err))
+		return fmt.Errorf("jsonrpc: tcp write: %w", err)
+	}
+	return nil
 }
 
+// readLoop consumes responses on one connection until it breaks, matching
+// each response to its pending call by id. reader is bound to conn and never
+// touched through the transport, so tearing the connection down concurrently
+// is safe.
+func (t *TCPTransport) readLoop(conn net.Conn, reader *bufio.Reader) {
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			t.mu.Lock()
+			// Only tear down when this is still the live connection: the
+			// transport may already have reset and dialled again.
+			if t.conn == conn {
+				t.resetLocked()
+				t.failAllLocked(fmt.Errorf("jsonrpc: tcp read: %w", err))
+			}
+			t.mu.Unlock()
+			return
+		}
+		var head struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if sonic.Unmarshal(line, &head) != nil || len(head.ID) == 0 {
+			continue // not routable (for example a parse error with id null)
+		}
+		key := string(head.ID)
+		t.mu.Lock()
+		result, ok := t.pending[key]
+		if ok {
+			delete(t.pending, key)
+		}
+		t.mu.Unlock()
+		if ok {
+			result <- tcpResult{body: bytes.TrimSpace(line)}
+		}
+	}
+}
+
+// failAllLocked delivers err to every pending call. It requires t.mu; the
+// result channels are buffered so the send never blocks.
+func (t *TCPTransport) failAllLocked(err error) {
+	for key, result := range t.pending {
+		result <- tcpResult{err: err}
+		delete(t.pending, key)
+	}
+}
+
+func (t *TCPTransport) timeoutOrDefault() time.Duration {
+	if t.Timeout > 0 {
+		return t.Timeout
+	}
+	return defaultTimeout
+}
+
+// resetLocked drops the connection without failing pending calls. It
+// requires t.mu.
 func (t *TCPTransport) resetLocked() {
 	if t.conn != nil {
 		_ = t.conn.Close()
 	}
 	t.conn = nil
-	t.reader = nil
 }
 
 func (t *TCPTransport) closeLocked() error {
@@ -359,7 +496,6 @@ func (t *TCPTransport) closeLocked() error {
 	}
 	err := t.conn.Close()
 	t.conn = nil
-	t.reader = nil
 	return err
 }
 

@@ -16,6 +16,12 @@ idleTimeout = "60s"
 shutdownTimeout = "10s"
 maxBodyBytes = 1048576
 
+# CORS for browser clients. allowOrigins = ["*"] mirrors a public API; list
+# specific origins to restrict, or disable entirely.
+[http.cors]
+enabled = true
+allowOrigins = ["*"]
+
 [grpc]
 host = "0.0.0.0"
 port = 9090
@@ -29,11 +35,16 @@ workers = 4
 queueSize = 1024
 maxFrameBytes = 1048576
 readTimeout = "60s"
+handlerTimeout = "5s"     # per-request business handler budget
 shutdownTimeout = "5s"
 
 [admin]
 host = "127.0.0.1"
 port = 6060
+# Optional bearer token for every admin request ("Authorization: Bearer <token>").
+# Leave empty only on a loopback or otherwise private listener.
+# token = "change-me"
+# or via environment: GOSVC_ADMIN_TOKEN
 
 [log]
 level = "info"

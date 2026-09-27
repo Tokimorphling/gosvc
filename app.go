@@ -45,24 +45,24 @@ import (
 	"golang.org/x/sync/errgroup"
 	ggrpc "google.golang.org/grpc"
 
-	"example.com/gosvc/auth"
-	"example.com/gosvc/config"
-	"example.com/gosvc/health"
-	"example.com/gosvc/internal/admin"
-	"example.com/gosvc/internal/reload"
-	"example.com/gosvc/internal/telemetry"
-	"example.com/gosvc/internal/version"
-	"example.com/gosvc/jsonrpc"
-	"example.com/gosvc/logging"
-	"example.com/gosvc/observability"
-	"example.com/gosvc/ratelimit"
-	"example.com/gosvc/state"
-	"example.com/gosvc/store"
-	"example.com/gosvc/store/postgres"
-	"example.com/gosvc/store/redis"
-	grpctransport "example.com/gosvc/transport/grpc"
-	httptransport "example.com/gosvc/transport/http"
-	tcptransport "example.com/gosvc/transport/tcp"
+	"github.com/Tokimorphling/gosvc/auth"
+	"github.com/Tokimorphling/gosvc/config"
+	"github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/internal/admin"
+	"github.com/Tokimorphling/gosvc/internal/reload"
+	"github.com/Tokimorphling/gosvc/internal/telemetry"
+	"github.com/Tokimorphling/gosvc/internal/version"
+	"github.com/Tokimorphling/gosvc/jsonrpc"
+	"github.com/Tokimorphling/gosvc/logging"
+	"github.com/Tokimorphling/gosvc/observability"
+	"github.com/Tokimorphling/gosvc/ratelimit"
+	"github.com/Tokimorphling/gosvc/state"
+	"github.com/Tokimorphling/gosvc/store"
+	"github.com/Tokimorphling/gosvc/store/postgres"
+	"github.com/Tokimorphling/gosvc/store/redis"
+	grpctransport "github.com/Tokimorphling/gosvc/transport/grpc"
+	httptransport "github.com/Tokimorphling/gosvc/transport/http"
+	tcptransport "github.com/Tokimorphling/gosvc/transport/tcp"
 )
 
 // ErrStarted is returned when handlers are registered after Run has been called.
@@ -137,6 +137,7 @@ type App struct {
 	recorders *store.Holder
 
 	mu        sync.Mutex
+	reloadMu  sync.Mutex
 	started   bool
 	httpRegs  []func(*server.Hertz)
 	grpcRegs  []func(*ggrpc.Server)
@@ -222,7 +223,6 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 	httpServer, err := httptransport.New(httptransport.Options{
 		Config:        cfg,
 		Logger:        logger,
-		Level:         logHandle.Level(),
 		Metrics:       a.metrics,
 		Limiter:       a.limiter,
 		Authenticator: authenticator,
@@ -521,8 +521,13 @@ func (a *App) AdminAddr() string { return a.admin.Addr() }
 func (a *App) current() *config.Config { return a.cfg.Load() }
 
 // applyConfig applies a reloaded configuration. Log, auth and limiter are hot
-// reloadable; everything else is reported as requiring a restart.
+// reloadable; everything else is reported as requiring a restart. The reload
+// is serialised so the config watcher and the admin POST /debug/reload
+// endpoint cannot interleave two reloads.
 func (a *App) applyConfig(next *config.Config) {
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+
 	prev := a.current()
 	logger := a.log.Logger()
 	if prev == nil {
@@ -556,6 +561,10 @@ func (a *App) applyConfig(next *config.Config) {
 	if !reflect.DeepEqual(prev.Storage, next.Storage) {
 		if err := a.reloadStorage(next.Storage); err != nil {
 			logger.Error("failed to rebuild storage, keeping the current connections", "error", err)
+			// Keep the previous storage section in the effective config so
+			// Config() and /debug/config describe the connections actually in
+			// use. The next reload attempts the change again.
+			next.Storage = prev.Storage
 		} else {
 			changed = append(changed, "storage")
 		}
@@ -580,7 +589,8 @@ func restartRequiredFields(prev, next *config.Config) []string {
 	if prev.Service != next.Service {
 		fields = append(fields, "service")
 	}
-	if prev.HTTP != next.HTTP {
+	// HTTP contains a slice (CORS origins), so it is compared with DeepEqual.
+	if !reflect.DeepEqual(prev.HTTP, next.HTTP) {
 		fields = append(fields, "http")
 	}
 	if prev.GRPC != next.GRPC {

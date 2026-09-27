@@ -1,4 +1,4 @@
-module example.com/gosvc
+module github.com/Tokimorphling/gosvc
 
 go 1.27.0
 

@@ -15,8 +15,8 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 
-	"example.com/gosvc/config"
-	"example.com/gosvc/store"
+	"github.com/Tokimorphling/gosvc/config"
+	"github.com/Tokimorphling/gosvc/store"
 )
 
 const (

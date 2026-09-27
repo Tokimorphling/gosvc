@@ -10,7 +10,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"example.com/gosvc/config"
+	"github.com/Tokimorphling/gosvc/config"
 )
 
 const defaultDebounce = 300 * time.Millisecond

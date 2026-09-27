@@ -8,7 +8,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"example.com/gosvc/config"
+	"github.com/Tokimorphling/gosvc/config"
 )
 
 func TestNewRejectsInvalidDSN(t *testing.T) {

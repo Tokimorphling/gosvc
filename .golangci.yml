@@ -1,3 +1,5 @@
+version: "2"
+
 run:
   timeout: 5m
 
@@ -8,12 +10,21 @@ linters:
     - ineffassign
     - staticcheck
     - unused
-
-issues:
-  exclude-rules:
-    # Generated protobuf code is not ours to lint.
-    - path: ^api/
-      linters:
-        - errcheck
-        - staticcheck
-        - unused
+  exclusions:
+    # comments/std-error-handling/common-false-positives are the presets
+    # golangci-lint ships for idiomatic Go.
+    presets:
+      - comments
+      - std-error-handling
+      - common-false-positives
+    rules:
+      # Deferred Close in cleanup paths is idiomatic Go; golangci-lint v1
+      # excluded it by default, keep that behaviour explicitly.
+      - linters: [errcheck]
+        text: "^Error return value of `.+\\.Close` is not checked"
+      # Generated protobuf / Kitex code is not ours to lint.
+      - path: examples/.+/api/
+        linters:
+          - errcheck
+          - staticcheck
+          - unused

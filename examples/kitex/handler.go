@@ -11,7 +11,7 @@ import (
 	"context"
 	"fmt"
 
-	"example.com/gosvc/examples/kitex/api/echo"
+	"github.com/Tokimorphling/gosvc/examples/kitex/api/echo"
 )
 
 // EchoServiceImpl implements the generated echo.EchoService interface.

@@ -15,7 +15,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"example.com/gosvc/slogx"
+	"github.com/Tokimorphling/gosvc/slogx"
 )
 
 // Config is the runtime configuration. Applications embed it and add their own
@@ -39,15 +39,24 @@ type ServiceConfig struct {
 	Env  string `json:"env" toml:"env"` // dev | staging | prod
 }
 
+// CORSConfig configures the CORS middleware. When Enabled is false no CORS
+// headers are emitted; otherwise AllowOrigins controls which request origins
+// receive them, ["*"] mirroring a public API.
+type CORSConfig struct {
+	Enabled      bool     `json:"enabled" toml:"enabled"`
+	AllowOrigins []string `json:"allowOrigins" toml:"allowOrigins"`
+}
+
 // HTTPConfig configures the REST/JSON-RPC server.
 type HTTPConfig struct {
-	Host            string   `json:"host" toml:"host"`
-	Port            int      `json:"port" toml:"port"`
-	ReadTimeout     Duration `json:"readTimeout" toml:"readTimeout"`
-	WriteTimeout    Duration `json:"writeTimeout" toml:"writeTimeout"`
-	IdleTimeout     Duration `json:"idleTimeout" toml:"idleTimeout"`
-	ShutdownTimeout Duration `json:"shutdownTimeout" toml:"shutdownTimeout"`
-	MaxBodyBytes    int      `json:"maxBodyBytes" toml:"maxBodyBytes"`
+	Host            string     `json:"host" toml:"host"`
+	Port            int        `json:"port" toml:"port"`
+	ReadTimeout     Duration   `json:"readTimeout" toml:"readTimeout"`
+	WriteTimeout    Duration   `json:"writeTimeout" toml:"writeTimeout"`
+	IdleTimeout     Duration   `json:"idleTimeout" toml:"idleTimeout"`
+	ShutdownTimeout Duration   `json:"shutdownTimeout" toml:"shutdownTimeout"`
+	MaxBodyBytes    int        `json:"maxBodyBytes" toml:"maxBodyBytes"`
+	CORS            CORSConfig `json:"cors" toml:"cors"`
 }
 
 // Addr returns the host:port listen address.
@@ -74,16 +83,20 @@ type TCPConfig struct {
 	QueueSize       int      `json:"queueSize" toml:"queueSize"` // bounded queue size
 	MaxFrameBytes   int      `json:"maxFrameBytes" toml:"maxFrameBytes"`
 	ReadTimeout     Duration `json:"readTimeout" toml:"readTimeout"`
+	HandlerTimeout  Duration `json:"handlerTimeout" toml:"handlerTimeout"` // per-request business handler budget
 	ShutdownTimeout Duration `json:"shutdownTimeout" toml:"shutdownTimeout"`
 }
 
 // Addr returns the host:port listen address.
 func (c TCPConfig) Addr() string { return net.JoinHostPort(c.Host, strconv.Itoa(c.Port)) }
 
-// AdminConfig configures the operations server (metrics, pprof, health).
+// AdminConfig configures the operations server (metrics, pprof, health). The
+// optional Token, when set, requires "Authorization: Bearer <token>" on every
+// admin request; it is static (changes require a restart).
 type AdminConfig struct {
-	Host string `json:"host" toml:"host"`
-	Port int    `json:"port" toml:"port"`
+	Host  string `json:"host" toml:"host"`
+	Port  int    `json:"port" toml:"port"`
+	Token string `json:"token" toml:"token"`
 }
 
 // Addr returns the host:port listen address.
@@ -238,6 +251,7 @@ func Default() *Config {
 			IdleTimeout:     Duration(60 * time.Second),
 			ShutdownTimeout: Duration(10 * time.Second),
 			MaxBodyBytes:    1 << 20, // 1 MiB
+			CORS:            CORSConfig{Enabled: true, AllowOrigins: []string{"*"}},
 		},
 		GRPC: GRPCConfig{
 			Host:            "0.0.0.0",
@@ -252,6 +266,7 @@ func Default() *Config {
 			QueueSize:       1024,
 			MaxFrameBytes:   1 << 20,
 			ReadTimeout:     Duration(60 * time.Second),
+			HandlerTimeout:  Duration(5 * time.Second),
 			ShutdownTimeout: Duration(5 * time.Second),
 		},
 		Admin: AdminConfig{Host: "127.0.0.1", Port: 6060},
@@ -432,6 +447,9 @@ func (c *Config) ApplyEnv(prefix string) error {
 		c.Storage.Postgres.Enabled = true
 		c.Storage.Postgres.DSN = v
 	}
+	if v := os.Getenv(env("ADMIN_TOKEN")); v != "" {
+		c.Admin.Token = v
+	}
 	for _, item := range []struct {
 		suffix string
 		host   *string
@@ -489,6 +507,9 @@ func (c *Config) Validate() error {
 	}
 	if c.HTTP.MaxBodyBytes <= 0 {
 		return fmt.Errorf("http.maxBodyBytes must be positive")
+	}
+	if c.HTTP.CORS.Enabled && len(c.HTTP.CORS.AllowOrigins) == 0 {
+		c.HTTP.CORS.AllowOrigins = []string{"*"}
 	}
 
 	if _, err := slogx.ParseLevel(c.Log.Level); err != nil {
@@ -570,6 +591,9 @@ func (c *Config) Validate() error {
 		}
 		if c.TCP.ReadTimeout <= 0 || c.TCP.ShutdownTimeout <= 0 {
 			return fmt.Errorf("tcp read/shutdown timeouts must be positive")
+		}
+		if c.TCP.HandlerTimeout <= 0 {
+			return fmt.Errorf("tcp.handlerTimeout must be positive")
 		}
 	}
 
@@ -684,6 +708,9 @@ func (c *Config) Redacted() *Config {
 	}
 	if clone.Storage.Postgres.DSN != "" {
 		clone.Storage.Postgres.DSN = "***"
+	}
+	if clone.Admin.Token != "" {
+		clone.Admin.Token = "***"
 	}
 	return &clone
 }

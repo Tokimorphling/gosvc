@@ -1,7 +1,7 @@
 package jsonrpc
 
 import (
-	"example.com/gosvc/apierror"
+	"github.com/Tokimorphling/gosvc/apierror"
 )
 
 // Standard JSON-RPC 2.0 error codes.

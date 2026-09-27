@@ -9,7 +9,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 
-	"example.com/gosvc/config"
+	"github.com/Tokimorphling/gosvc/config"
 )
 
 func newTestStore(t *testing.T) (*Store, *miniredis.Miniredis) {

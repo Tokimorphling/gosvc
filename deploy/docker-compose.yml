@@ -7,7 +7,10 @@ services:
     ports:
       - "8080:8080"   # REST + JSON-RPC
       - "9090:9090"   # gRPC
-      - "6060:6060"   # admin: /metrics, /debug/pprof, /healthz, /readyz
+      # The admin port stays loopback-only: it exposes pprof, the config dump
+      # and the reload trigger, none of which belong on a public interface.
+      # Access it on the host with curl 127.0.0.1:6060/metrics.
+      - "127.0.0.1:6060:6060"
     healthcheck:
       test: ["CMD", "/app/gosvc", "-healthcheck", "http://127.0.0.1:6060/healthz"]
       interval: 10s

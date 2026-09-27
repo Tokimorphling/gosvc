@@ -16,8 +16,8 @@ import (
 	"github.com/cloudwego/kitex/client"
 	"github.com/cloudwego/kitex/server"
 
-	kitexexample "example.com/gosvc/examples/kitex"
-	"example.com/gosvc/examples/kitex/api/echo/echoservice"
+	kitexexample "github.com/Tokimorphling/gosvc/examples/kitex"
+	"github.com/Tokimorphling/gosvc/examples/kitex/api/echo/echoservice"
 )
 
 func main() {

@@ -13,7 +13,7 @@
 go install github.com/cloudwego/kitex/tool/cmd/kitex@latest
 
 # 修改 IDL 后重新生成（等价于 make kitex）
-kitex -module example.com/gosvc -gen-path api/kitex api/kitex/echo.thrift
+kitex -module github.com/Tokimorphling/gosvc -gen-path api/kitex api/kitex/echo.thrift
 ```
 
 ## 运行

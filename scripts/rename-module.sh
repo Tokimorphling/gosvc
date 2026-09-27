@@ -7,7 +7,7 @@
 # and regenerate the protobuf code (make proto).
 set -euo pipefail
 
-old="example.com/gosvc"
+old="github.com/Tokimorphling/gosvc"
 new="${1:?usage: rename-module.sh <new-module-path>}"
 
 if [[ "$new" == "$old" ]]; then

@@ -25,12 +25,12 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"example.com/gosvc"
-	"example.com/gosvc/config"
-	greeterv1 "example.com/gosvc/examples/app/api/greeter/v1"
-	"example.com/gosvc/examples/app/greeter"
-	"example.com/gosvc/jsonrpc"
-	"example.com/gosvc/logging"
+	"github.com/Tokimorphling/gosvc"
+	"github.com/Tokimorphling/gosvc/config"
+	greeterv1 "github.com/Tokimorphling/gosvc/examples/app/api/greeter/v1"
+	"github.com/Tokimorphling/gosvc/examples/app/greeter"
+	"github.com/Tokimorphling/gosvc/jsonrpc"
+	"github.com/Tokimorphling/gosvc/logging"
 )
 
 // TestEndToEnd boots the whole application on ephemeral ports and exercises
@@ -364,6 +364,98 @@ func TestAuthEnforced(t *testing.T) {
 	})
 }
 
+// TestAuthPublicRoutePattern verifies that WithPublicPaths accepts route
+// patterns: whitelisting "/api/v1/greetings/:id" unauthenticated every id,
+// while other routes keep requiring credentials.
+func TestAuthPublicRoutePattern(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Auth.Enabled = true
+	cfg.Auth.APIKeys = []string{"test-key"}
+
+	application, stop := startApp(t, cfg, "", "/api/v1/greetings/:id")
+	defer stop()
+
+	httpBase := "http://" + application.HTTPAddr()
+	waitReady(t, httpBase+"/readyz")
+
+	resp, err := http.Get(httpBase + "/api/v1/greetings/3")
+	if err != nil {
+		t.Fatalf("GET greeting without credentials: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("whitelisted route pattern must stay public, status = %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(readBody(t, resp)), "你好") {
+		t.Fatalf("unexpected body: %s", readBody(t, resp))
+	}
+
+	unauthed, err := http.Get(httpBase + "/api/v1/hello?name=x")
+	if err != nil {
+		t.Fatalf("GET hello: %v", err)
+	}
+	defer unauthed.Body.Close()
+	if unauthed.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("routes outside the whitelist must still require auth, status = %d", unauthed.StatusCode)
+	}
+}
+
+// TestAdminToken verifies that a configured admin token gates every admin
+// endpoint and stays redacted in the config dump.
+func TestAdminToken(t *testing.T) {
+	const token = "test-admin-token-1234"
+
+	cfg := baseConfig()
+	cfg.Admin.Token = token
+
+	application, stop := startApp(t, cfg, "")
+	defer stop()
+
+	adminBase := "http://" + application.AdminAddr()
+	waitReady(t, "http://"+application.HTTPAddr()+"/readyz")
+
+	resp, err := http.Get(adminBase + "/metrics")
+	if err != nil {
+		t.Fatalf("GET metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("metrics without token must be rejected, status = %d", resp.StatusCode)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, adminBase+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	authed, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET metrics with token: %v", err)
+	}
+	defer authed.Body.Close()
+	if authed.StatusCode != http.StatusOK {
+		t.Fatalf("metrics with token must pass, status = %d", authed.StatusCode)
+	}
+
+	cfgReq, err := http.NewRequest(http.MethodGet, adminBase+"/debug/config", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgReq.Header.Set("Authorization", "Bearer "+token)
+	cfgResp, err := http.DefaultClient.Do(cfgReq)
+	if err != nil {
+		t.Fatalf("GET config with token: %v", err)
+	}
+	defer cfgResp.Body.Close()
+	dump := string(readBody(t, cfgResp))
+	if strings.Contains(dump, token) {
+		t.Fatalf("admin token must be redacted in the config dump: %s", dump)
+	}
+	if !strings.Contains(dump, "***") {
+		t.Fatalf("expected a redacted secret marker: %s", dump)
+	}
+}
+
 // TestLogSampling verifies that repeated identical records are sampled and that
 // the counters are exposed on the admin endpoint.
 func TestLogSampling(t *testing.T) {
@@ -632,7 +724,7 @@ func TestStorageHotReload(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
 
-	writeConfig := func(redisAddr, postgresDSN string) {
+	writeConfig := func(level, redisAddr, postgresDSN string) {
 		t.Helper()
 		content := `
 [service]
@@ -652,7 +744,7 @@ host = "127.0.0.1"
 port = 0
 
 [log]
-level = "error"
+level = "` + level + `"
 format = "json"
 `
 		if redisAddr != "" {
@@ -679,7 +771,7 @@ pingTimeout = "300ms"
 		}
 	}
 
-	writeConfig(mini.Addr(), "")
+	writeConfig("error", mini.Addr(), "")
 	cfg, err := Load(path, "GOSVC")
 	if err != nil {
 		t.Fatalf("load config: %v", err)
@@ -689,6 +781,7 @@ pingTimeout = "300ms"
 	defer stop()
 
 	httpBase := "http://" + application.HTTPAddr()
+	adminBase := "http://" + application.AdminAddr()
 	waitReady(t, httpBase+"/readyz")
 
 	if application.Store() == nil {
@@ -699,17 +792,35 @@ pingTimeout = "300ms"
 	}
 
 	// Disabling Redis closes the store and clears the recorder.
-	writeConfig("", "")
+	writeConfig("error", "", "")
 	waitFor(t, 8*time.Second, func() bool {
 		return application.Store() == nil && application.Recorder() == nil
 	})
 
-	// A failing rebuild (unreachable postgres) keeps the current state and the
-	// service keeps serving.
-	writeConfig("", "postgres://user:pass@127.0.0.1:1/app")
-	waitFor(t, 8*time.Second, func() bool { return application.Config().Storage.Postgres.Enabled })
+	// A failing rebuild (unreachable postgres) keeps the current state: no
+	// broken pool is installed, the effective config keeps the previous
+	// storage section, and the service keeps serving. The manual reload
+	// endpoint is synchronous, so by the time it returns the rebuild has been
+	// attempted; the log level flipped by the same file proves the reload
+	// itself ran and was not aborted by the storage failure.
+	writeConfig("warn", "", "postgres://user:pass@127.0.0.1:1/app")
+	resp, err := http.Post(adminBase+"/debug/reload", "application/json", nil)
+	if err != nil {
+		t.Fatalf("manual reload: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("manual reload status = %d, body = %s", resp.StatusCode, readBody(t, resp))
+	}
+	resp.Body.Close()
+
 	if application.Postgres() != nil {
 		t.Fatal("failed rebuild must not install a broken pool")
+	}
+	if application.Config().Storage.Postgres.Enabled {
+		t.Fatal("failed rebuild must keep the previous storage section in the effective config")
+	}
+	if !strings.Contains(string(getBody(t, adminBase+"/debug/loglevel")), "warn") {
+		t.Fatalf("the same reload must apply hot-reloadable sections: %s", getBody(t, adminBase+"/debug/loglevel"))
 	}
 	getBody(t, httpBase+"/healthz")
 }
@@ -725,7 +836,7 @@ func baseConfig() *Config {
 	return cfg
 }
 
-func startApp(t *testing.T, cfg *Config, configPath string) (*gosvc.App, func()) {
+func startApp(t *testing.T, cfg *Config, configPath string, publicPaths ...string) (*gosvc.App, func()) {
 	t.Helper()
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("validate config: %v", err)
@@ -738,11 +849,12 @@ func startApp(t *testing.T, cfg *Config, configPath string) (*gosvc.App, func())
 	slog.SetDefault(logHandle.Logger())
 
 	application, err := Build(Options{
-		Config:     cfg,
-		Log:        logHandle,
-		ConfigPath: configPath,
-		EnvPrefix:  "GOSVC",
-		Version:    Version,
+		Config:      cfg,
+		Log:         logHandle,
+		ConfigPath:  configPath,
+		EnvPrefix:   "GOSVC",
+		Version:     Version,
+		PublicPaths: publicPaths,
 	})
 	if err != nil {
 		t.Fatalf("build app: %v", err)
@@ -755,6 +867,13 @@ func startApp(t *testing.T, cfg *Config, configPath string) (*gosvc.App, func())
 	stop := func() {
 		t.Helper()
 		cancel()
+		// Close idle keep-alive connections held by the shared default
+		// transport so the graceful drain does not wait for them until the
+		// shutdown timeout. This mirrors a load balancer dropping its pooled
+		// connections when the endpoint leaves rotation.
+		if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
 		select {
 		case err := <-errCh:
 			if err != nil {

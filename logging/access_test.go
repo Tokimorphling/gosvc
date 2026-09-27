@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/gosvc/config"
+	"github.com/Tokimorphling/gosvc/config"
 )
 
 func TestAccessLoggerSeparateSink(t *testing.T) {

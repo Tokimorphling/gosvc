@@ -10,8 +10,8 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver
 
-	"example.com/gosvc/config"
-	"example.com/gosvc/health"
+	"github.com/Tokimorphling/gosvc/config"
+	"github.com/Tokimorphling/gosvc/health"
 )
 
 // DB wraps a database/sql pool with the runtime settings.
@@ -50,7 +50,7 @@ func (db *DB) Ping(ctx context.Context) error {
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, db.pingTimeout)
 	defer cancel()
-	return db.DB.PingContext(pingCtx)
+	return db.PingContext(pingCtx)
 }
 
 // HealthCheck adapts Ping to the health package.

@@ -370,7 +370,7 @@ const file_examples_app_api_greeter_v1_greeter_proto_rawDesc = "" +
 	"\aGreeter\x12E\n" +
 	"\bSayHello\x12\x1b.greeter.v1.SayHelloRequest\x1a\x1c.greeter.v1.SayHelloResponse\x12N\n" +
 	"\vGetGreeting\x12\x1e.greeter.v1.GetGreetingRequest\x1a\x1f.greeter.v1.GetGreetingResponse\x129\n" +
-	"\x04Info\x12\x17.greeter.v1.InfoRequest\x1a\x18.greeter.v1.InfoResponseB9Z7example.com/gosvc/examples/app/api/greeter/v1;greeterv1b\x06proto3"
+	"\x04Info\x12\x17.greeter.v1.InfoRequest\x1a\x18.greeter.v1.InfoResponseBFZDgithub.com/Tokimorphling/gosvc/examples/app/api/greeter/v1;greeterv1b\x06proto3"
 
 var (
 	file_examples_app_api_greeter_v1_greeter_proto_rawDescOnce sync.Once

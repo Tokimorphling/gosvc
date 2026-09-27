@@ -4,7 +4,7 @@
 HTTP / JSON-RPC / gRPC / TCP 四种传输和优雅退出都装好，业务代码只写自己的 handler 与领域逻辑。
 
 ```bash
-go get github.com/you/gosvc        # 或先把本仓库改名为你的模块（见文末）
+go get github.com/Tokimorphling/gosvc        # 或先把本仓库改名为你的模块（见文末）
 ```
 
 ```go
@@ -12,16 +12,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/cloudwego/hertz/pkg/app/server"
 	ggrpc "google.golang.org/grpc"
 
-	"github.com/you/gosvc"
-	"github.com/you/gosvc/jsonrpc"
-	"github.com/you/gosvc/logging"
+	"github.com/Tokimorphling/gosvc"
+	"github.com/Tokimorphling/gosvc/jsonrpc"
+	"github.com/Tokimorphling/gosvc/logging"
 )
 
 // 1. 配置：嵌入运行时配置，加自己的段
@@ -77,19 +79,26 @@ func main() {
 
 	// 4. 注册业务 handler（三种协议共享同一个领域服务）
 	svc := NewOrderService(cfg.Database.DSN)
-	app.RegisterHTTP(func(h *server.Hertz) {
+	must := func(err error) {
+		if err != nil {
+			slog.Error("register", "error", err)
+			os.Exit(1)
+		}
+	}
+	must(app.RegisterHTTP(func(h *server.Hertz) {
 		h.GET("/api/v1/orders/:id", handleGetOrder(svc))
-	})
-	app.RegisterJSONRPC(func(d *jsonrpc.Dispatcher) {
+	}))
+	must(app.RegisterJSONRPC(func(d *jsonrpc.Dispatcher) {
 		d.RegisterTyped("orders.get", func(ctx context.Context, req GetOrderRequest) (*Order, error) {
 			return svc.Get(ctx, req.ID)
 		})
-	})
-	app.RegisterGRPC(func(s *ggrpc.Server) {
+	}))
+	must(app.RegisterGRPC(func(s *ggrpc.Server) {
 		orderv1.RegisterOrderServiceServer(s, newOrderServer(svc))
-	})
+	}))
 
-	// 5. 运行：信号、优雅退出、热更新、指标全部由运行时处理
+	// 5. 运行：信号、优雅退出、热更新、指标全部由运行时处理。
+	// Run 返回时所有传输的优雅退出（drain 在途请求）已经真正完成。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := app.Run(ctx); err != nil {
@@ -105,17 +114,18 @@ func main() {
 |---|---|
 | 四协议同栈 | REST + JSON-RPC 2.0（HTTP 端口）、gRPC、行分隔 JSON-RPC over TCP（netpoll），JSON-RPC 方法注册一次两种传输都可用 |
 | 类型安全 | `Dispatcher.RegisterTyped[Req, Resp]` 与 `Client.Call[Req, Resp]` 让方法两端都带类型；`config.Source.Load[T]` 编译期校验配置类型 |
-| 统一错误模型 | `apierror.Kind` 一处定义，各协议自动映射（HTTP 状态码 / JSON-RPC code / gRPC code），内部错误不泄漏 |
-| 认证 | API Key（constant-time）+ HS256 JWT，HTTP 中间件与 gRPC 拦截器共用；health/reflection 默认放行 |
+| 统一错误模型 | `apierror.Kind` 一处定义，各协议自动映射（HTTP 状态码 / JSON-RPC code / gRPC code），内部错误不泄漏；客户端把传输层错误映射回 `apierror` |
+| 认证 | API Key（constant-time）+ HS256 JWT，HTTP 中间件与 gRPC 拦截器（unary + streaming）共用；health/reflection 默认放行；TCP 传输不鉴权（见设计取舍） |
 | 链路追踪 | OpenTelemetry OTLP/HTTP，W3C TraceContext 传播，Hertz 中间件 + `otelgrpc` StatsHandler |
 | 日志-链路关联 | 请求日志自动带 `trace_id` / `span_id`（HTTP、gRPC、TCP 一致），与导出的 span 对应 |
-| 日志 | 两层：`slogx`（geth 风格 handler，零依赖）+ `logging`（多 sink、轮转、采样、运行期级别） |
-| 可观测性 | Prometheus 指标、pprof、healthz/readyz（含依赖探针）、日志统计、配置查看、时间序列查询，独立 admin 端口 |
+| 日志 | 两层：`slogx`（geth 风格 handler，零依赖）+ `logging`（多 sink、轮转、采样、运行期级别；重载关闭旧文件 sink） |
+| 可观测性 | Prometheus 指标、pprof、healthz/readyz（含依赖探针）、日志统计、配置查看、时间序列查询，独立 admin 端口（可选 bearer token） |
 | 存储连接器 | Redis（单机 / Cluster / Sentinel，分钟桶 + 内存聚合批量写）与 PostgreSQL（pgx 连接池、池指标、就绪探针） |
 | 访问日志独立 sink | `log.access.*`：请求日志走自己的级别/格式/输出/文件，自动带 `request_id`/`trace_id`/`log_type=access` |
 | 无锁状态 | `state.Snapshot[T]` 提供读无锁、写替换的共享状态 |
-| 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 热生效，`storage.*` **重建连接**（新连接就绪后切换，失败保留旧连接），其余字段提示 `restartRequired` |
-| 有界并发 | `workerpool`（显式 `ErrFull`/`ErrClosed`）+ netpoll 事件循环 + 每连接写串行化，慢业务不阻塞 IO |
+| 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 热生效，`storage.*` **重建连接**（新连接就绪后切换，失败保留旧连接且有效配置回滚），其余字段提示 `restartRequired` |
+| 有界并发 | `workerpool`（显式 `ErrFull`/`ErrClosed`）+ netpoll 事件循环 + 每连接写串行化，慢业务不阻塞 IO；TCP 帧长在缓冲前强制（防恶意大帧） |
+| 真正的优雅退出 | 四个传输的 `Serve` 都会 join 自己的 drain：`Run` 返回时，在途请求已处理完（受各 `shutdownTimeout` 约束），不会随进程退出被掐断 |
 | 压测器 | `examples/app/cmd/bench` 支持 rest / jsonrpc / grpc |
 
 ## 目录结构
@@ -164,12 +174,12 @@ examples/
 app, err := gosvc.New(&cfg.Config, opts...)   // 绑定端口、建好各组件（未开始服务）
 
 // 注册（必须在 Run 之前；Run 之后再注册返回 gosvc.ErrStarted）
-app.RegisterHTTP(func(h *server.Hertz))
-app.RegisterGRPC(func(s *grpc.Server))
-app.RegisterJSONRPC(func(d *jsonrpc.Dispatcher))
-app.RegisterAdmin(func(mux *http.ServeMux))
+err = app.RegisterHTTP(func(h *server.Hertz))    // 每个 Register* 都返回 error
+err = app.RegisterGRPC(func(s *grpc.Server))
+err = app.RegisterJSONRPC(func(d *jsonrpc.Dispatcher))
+err = app.RegisterAdmin(func(mux *http.ServeMux))
 
-app.Run(ctx)            // 阻塞直到 ctx 取消或某个 server 失败，随后优雅退出
+app.Run(ctx)            // 阻塞直到 ctx 取消或某个 server 失败；返回前等待所有传输的 drain 完成
 
 // 运行时访问器（handler 里常用）
 app.Logger()            // *slog.Logger
@@ -205,12 +215,19 @@ func (c *Config) Validate() error { /* 应用校验 */ }
 ```go
 // 服务端：类型从 handler 推断
 d.RegisterTyped("orders.get", svc.Get)   // func(context.Context, GetOrderRequest) (*Order, error)
+// 运行期动态注册用 TryRegister：重复返回 ErrDuplicateMethod 而不是 panic
+d.TryRegister("orders.get", handler)
 
 // 客户端：HTTP 或 TCP，同一套类型
 client := jsonrpc.NewHTTPClient("http://127.0.0.1:8080", jsonrpc.WithHeader("X-API-Key", key))
 defer client.Close()
 order, err := client.Call[GetOrderRequest, *Order](ctx, "orders.get", GetOrderRequest{ID: 1})
 ```
+
+- 批量请求默认最多 **128** 个/次（`Dispatcher.SetMaxBatch(n)` 调整，超出整批拒绝 `-32600`）；
+- `NewTCPClient` 单连接支持 **pipeline**：并发 `Call` 在同一连接上多路复用，按 JSON-RPC id 匹配响应，慢请求不会阻塞后续请求；
+- HTTP 客户端把运行时错误映射（401/429 + `{"error":{"code":"..."}}`）还原成 `*apierror.Error`，调用方按 `apierror.KindOf` 分支即可；
+- 服务端 handler panic 不会丢连接：worker 存活，客户端收到 `internal error` 帧。
 
 ### 错误映射
 
@@ -275,6 +292,11 @@ idleTimeout = "60s"
 shutdownTimeout = "10s"
 maxBodyBytes = 1048576
 
+# CORS（浏览器客户端用）。allowOrigins = ["*"] 面向公共 API；也可列具体源。
+[http.cors]
+enabled = true
+allowOrigins = ["*"]
+
 [grpc]
 host = "0.0.0.0"
 port = 9090
@@ -288,11 +310,15 @@ workers = 4
 queueSize = 1024
 maxFrameBytes = 1048576
 readTimeout = "60s"
+handlerTimeout = "5s"     # 单个请求的业务处理预算
 shutdownTimeout = "5s"
 
 [admin]
 host = "127.0.0.1"
 port = 6060
+# 可选：设置后所有 admin 请求都要求 "Authorization: Bearer <token>"。
+# 仅在 loopback / 内网监听时才可以留空。修改需重启。
+# token = "change-me"
 
 [log]
 level = "info"
@@ -439,6 +465,7 @@ app.Health().AddCheck("redis", func(ctx context.Context) error { return redisCli
 `storage.*` 变化时运行时会**新建连接 → 切换 → 优雅关闭旧连接**（recorder 先 flush 再关闭）：
 
 - 新连接建立失败（例如 DSN 写错、数据库不可达）时保留旧连接，日志记录 error，服务不中断；
+- **有效配置同步回滚**：`app.Config()` 与 `/debug/config` 始终描述真实在用的连接，不会展示一个从未装上的池；下次重载会再次尝试该变更；
 - 通过 `app.Store()` / `app.Postgres()` / `app.Recorder()` 读到的始终是当前生效的连接；
 - 池指标通过 provider 采集，切换后无需重新注册。
 
@@ -455,12 +482,17 @@ app.Health().AddCheck("redis", func(ctx context.Context) error { return redisCli
 | `POST /debug/reload` | 手动触发配置重载（ConfigMap 场景） |
 | `GET /debug/ts?metric=...&minutes=60` | Redis 分钟桶查询 |
 
+pprof、配置查看和 reload 都是高权限操作：**设置 `[admin].token` 后所有 admin 请求都要求
+`Authorization: Bearer <token>`**（constant-time 比较，`GOSVC_ADMIN_TOKEN` 环境变量亦可），
+token 在 `/debug/config` 中脱敏。不设 token 时请保持 admin 只绑 loopback / 内网；
+`deploy/docker-compose.yml` 也把 6060 映射限制在 `127.0.0.1`。
+
 ## 示例应用
 
 ```bash
 make run          # 启动 examples/app（四协议 + 可观测性）
 make bench        # rest 压测
-go test ./...     # 单元 + 端到端（含热更新、采样、认证）
+go test ./...     # 单元 + 端到端（含热更新、采样、认证、admin token）
 go run ./examples/kitex/cmd -mode server   # Kitex 示例
 ```
 
@@ -474,15 +506,32 @@ make docker
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-distroless + 非 root；admin 端口默认只绑 `127.0.0.1`；TCP 传输不做 TLS，请在网关终止。
+distroless + 非 root；admin 端口默认只绑 `127.0.0.1`（compose 同样只映射到宿主机 loopback）；
+TCP 传输不做 TLS，请在网关终止。
 
 ## 设计取舍
 
 - **框架类型出现在 API 里**（`*server.Hertz`、`*grpc.Server`）：换取零额外抽象和完整的框架能力；
   想换框架时只需替换 transport 包；
-- **一个共享 Dispatcher**：HTTP `/rpc` 与 TCP 方法只注册一次，指标也只记一份；
+- **一个共享 Dispatcher**：HTTP `/rpc` 与 TCP 方法只注册一次，指标也只记一份；批量默认上限 128
+  防止单个请求无限占用 worker；
 - **认证默认全局开启**（healthz/readyz 白名单）：避免应用忘记给业务路由加鉴权；
-- **热更新只覆盖库拥有的字段**：应用自己的段通过 `WithOnReload` 处理；
+  `WithPublicPaths` 既接受字面路径也接受路由模式（`/api/v1/orders/:id`）；
+- **gRPC 同时链 unary 与 stream 拦截器**：recovery / request id / trace / auth / logging / metrics /
+  rate limit 对 streaming RPC 同样生效；
+- **限流 key 用直连对端 IP**（HTTP `RemoteAddr`、gRPC `peer`、TCP 去端口），而不是可被
+  `X-Forwarded-For` 伪造的 `ClientIP`：直连暴露时无法通过换头绕过；部署在可信代理后面意味着
+  共享一个桶（fail-closed），需要按真实客户端限流就在代理层做；
+- **TCP 传输不做认证**：定位是内网高性能通道（网关终止 TLS/做认证）；对外请走 HTTP/gRPC；
+- **TCP 帧长在缓冲前强制**：`maxFrameBytes` 对已缓冲字节数生效，恶意大帧在消耗内存前就被断开；
+  not-ready / 限流路径回一帧后立即断连，避免 level-triggered 事件循环自旋；
+- **优雅退出 join 到底**：每个传输的 `Serve` 等自己的 drain 结束才返回，`Run` 返回即可安全退出进程；
+- **进程级全局只碰一次**：Hertz 的 `hlog` 与 OpenTelemetry 的全局 TracerProvider 都是进程级的，
+  库在首次构造时安装并动态跟随 `slog.SetDefault`；因此一个进程只应跑一个 `gosvc.App`（测试除外）；
+- **热更新只覆盖库拥有的字段**：应用自己的段通过 `WithOnReload` 处理；storage 重建失败时有效配置回滚，
+  两处 reload（fsnotify + 手动端点）串行执行；
+- **客户端提供的 `X-Request-ID` 原样使用**：用于日志关联（输出已转义防注入），但意味着调用方可以
+  伪造关联 id；不需要时用 `logging.NewRequestID()` 自行生成；
 - **配置加载用泛型方法**：编译期保证 `*T` 可配置，避免运行时类型断言。
 
 ## Roadmap
@@ -499,6 +548,6 @@ distroless + 非 root；admin 端口默认只绑 `127.0.0.1`；TCP 传输不做 
 ## 重命名模块
 
 ```bash
-scripts/rename-module.sh github.com/you/gosvc
+scripts/rename-module.sh github.com/Tokimorphling/gosvc
 make proto kitex     # 重新生成示例的 protobuf / Kitex 代码
 ```

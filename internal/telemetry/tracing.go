@@ -13,7 +13,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 
-	"example.com/gosvc/config"
+	"github.com/Tokimorphling/gosvc/config"
 )
 
 // Provider owns the tracer provider and its shutdown hook. The zero value is a

@@ -8,67 +8,75 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/common/hlog"
 
-	"example.com/gosvc/logging"
+	"github.com/Tokimorphling/gosvc/logging"
 )
 
 // hlogAdapter routes Hertz internal logs into the application's slog logger so
-// every line shares the same format, level and output.
+// every line shares the same format, level and output. It is installed once per
+// process (Hertz only knows one global logger) and resolves the logger
+// dynamically: request contexts use their request-scoped logger, everything
+// else follows slog.Default(), which the application owns.
 type hlogAdapter struct {
-	base  *slog.Logger
 	level *slog.LevelVar
 }
 
-func newHlogAdapter(base *slog.Logger, level *slog.LevelVar) hlog.FullLogger {
-	if base == nil {
-		base = slog.Default()
-	}
-	if level == nil {
-		level = new(slog.LevelVar)
-	}
-	return &hlogAdapter{base: base, level: level}
+func newHlogAdapter() hlog.FullLogger {
+	return &hlogAdapter{level: new(slog.LevelVar)}
 }
 
 func (a *hlogAdapter) logger(ctx context.Context) *slog.Logger {
-	if ctx != nil {
-		return logging.FromContext(ctx)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return a.base
+	return logging.FromContext(ctx)
 }
 
 // Logger interface.
 
-func (a *hlogAdapter) Trace(v ...any) { a.logger(nil).Debug(fmt.Sprint(v...), "component", "hertz") }
-func (a *hlogAdapter) Debug(v ...any) { a.logger(nil).Debug(fmt.Sprint(v...), "component", "hertz") }
-func (a *hlogAdapter) Info(v ...any)  { a.logger(nil).Info(fmt.Sprint(v...), "component", "hertz") }
-func (a *hlogAdapter) Notice(v ...any) {
-	a.logger(nil).Info(fmt.Sprint(v...), "component", "hertz")
+func (a *hlogAdapter) Trace(v ...any) {
+	a.logger(context.Background()).Debug(fmt.Sprint(v...), "component", "hertz")
 }
-func (a *hlogAdapter) Warn(v ...any)  { a.logger(nil).Warn(fmt.Sprint(v...), "component", "hertz") }
-func (a *hlogAdapter) Error(v ...any) { a.logger(nil).Error(fmt.Sprint(v...), "component", "hertz") }
-func (a *hlogAdapter) Fatal(v ...any) { a.logger(nil).Error(fmt.Sprint(v...), "component", "hertz") }
+func (a *hlogAdapter) Debug(v ...any) {
+	a.logger(context.Background()).Debug(fmt.Sprint(v...), "component", "hertz")
+}
+func (a *hlogAdapter) Info(v ...any) {
+	a.logger(context.Background()).Info(fmt.Sprint(v...), "component", "hertz")
+}
+func (a *hlogAdapter) Notice(v ...any) {
+	a.logger(context.Background()).Info(fmt.Sprint(v...), "component", "hertz")
+}
+func (a *hlogAdapter) Warn(v ...any) {
+	a.logger(context.Background()).Warn(fmt.Sprint(v...), "component", "hertz")
+}
+func (a *hlogAdapter) Error(v ...any) {
+	a.logger(context.Background()).Error(fmt.Sprint(v...), "component", "hertz")
+}
+func (a *hlogAdapter) Fatal(v ...any) {
+	a.logger(context.Background()).Error(fmt.Sprint(v...), "component", "hertz")
+}
 
 // FormatLogger interface.
 
 func (a *hlogAdapter) Tracef(format string, v ...any) {
-	a.logger(nil).Debug(fmt.Sprintf(format, v...), "component", "hertz")
+	a.logger(context.Background()).Debug(fmt.Sprintf(format, v...), "component", "hertz")
 }
 func (a *hlogAdapter) Debugf(format string, v ...any) {
-	a.logger(nil).Debug(fmt.Sprintf(format, v...), "component", "hertz")
+	a.logger(context.Background()).Debug(fmt.Sprintf(format, v...), "component", "hertz")
 }
 func (a *hlogAdapter) Infof(format string, v ...any) {
-	a.logger(nil).Info(fmt.Sprintf(format, v...), "component", "hertz")
+	a.logger(context.Background()).Info(fmt.Sprintf(format, v...), "component", "hertz")
 }
 func (a *hlogAdapter) Noticef(format string, v ...any) {
-	a.logger(nil).Info(fmt.Sprintf(format, v...), "component", "hertz")
+	a.logger(context.Background()).Info(fmt.Sprintf(format, v...), "component", "hertz")
 }
 func (a *hlogAdapter) Warnf(format string, v ...any) {
-	a.logger(nil).Warn(fmt.Sprintf(format, v...), "component", "hertz")
+	a.logger(context.Background()).Warn(fmt.Sprintf(format, v...), "component", "hertz")
 }
 func (a *hlogAdapter) Errorf(format string, v ...any) {
-	a.logger(nil).Error(fmt.Sprintf(format, v...), "component", "hertz")
+	a.logger(context.Background()).Error(fmt.Sprintf(format, v...), "component", "hertz")
 }
 func (a *hlogAdapter) Fatalf(format string, v ...any) {
-	a.logger(nil).Error(fmt.Sprintf(format, v...), "component", "hertz")
+	a.logger(context.Background()).Error(fmt.Sprintf(format, v...), "component", "hertz")
 }
 
 // CtxLogger interface.

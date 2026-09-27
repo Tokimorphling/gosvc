@@ -8,8 +8,8 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/cloudwego/hertz/pkg/app"
 
-	"example.com/gosvc/apierror"
-	"example.com/gosvc/logging"
+	"github.com/Tokimorphling/gosvc/apierror"
+	"github.com/Tokimorphling/gosvc/logging"
 )
 
 type errorBody struct {

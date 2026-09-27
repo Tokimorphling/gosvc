@@ -1,16 +1,26 @@
 // Package ratelimit implements a per-key token bucket limiter with runtime
 // reconfiguration.
+//
+// Buckets live in shards selected by a hash of the key so concurrent requests
+// from different clients contend on different locks instead of one global
+// mutex.
 package ratelimit
 
 import (
 	"context"
+	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
 )
 
-const visitorTTL = 10 * time.Minute
+const (
+	visitorTTL = 10 * time.Minute
+	shardCount = 16 // power of two; must stay in sync with the shard mask below
+	shardMask  = shardCount - 1
+)
 
 // Limiter keeps one token bucket per key (for example a client IP).
 //
@@ -18,11 +28,19 @@ const visitorTTL = 10 * time.Minute
 // everything. SetRate swaps the parameters at runtime (config reload) and drops
 // the existing buckets so the new rate applies immediately.
 type Limiter struct {
+	shards [shardCount]shard
+
+	// limit and burst are accessed atomically so SetRate can run while
+	// requests are in flight.
+	limitBits atomic.Uint64 // float64 bits of rate.Limit
+	burst     atomic.Int64
+
+	ttl time.Duration
+}
+
+type shard struct {
 	mu       sync.Mutex
 	visitors map[string]*visitor
-	limit    rate.Limit
-	burst    int
-	ttl      time.Duration
 }
 
 type visitor struct {
@@ -37,8 +55,17 @@ func New(rps float64, burst int) *Limiter {
 	return l
 }
 
-// SetRate updates the bucket parameters and clears existing buckets. It is safe
-// to call concurrently with Allow.
+// shardIndex maps a key onto a shard using FNV-1a, without allocating.
+func shardIndex(key string) int {
+	const prime = 16777619
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= prime
+	}
+	return int(h & shardMask)
+}
+
 func (l *Limiter) SetRate(rps float64, burst int) {
 	if l == nil {
 		return
@@ -55,11 +82,20 @@ func (l *Limiter) SetRate(rps float64, burst int) {
 		burst = 1
 	}
 
-	l.mu.Lock()
-	l.limit = rate.Limit(rps)
-	l.burst = burst
-	l.visitors = make(map[string]*visitor)
-	l.mu.Unlock()
+	l.limitBits.Store(math.Float64bits(float64(rate.Limit(rps))))
+	l.burst.Store(int64(burst))
+
+	for i := range l.shards {
+		s := &l.shards[i]
+		s.mu.Lock()
+		s.visitors = make(map[string]*visitor)
+		s.mu.Unlock()
+	}
+}
+
+// rate returns the current limit and burst parameters.
+func (l *Limiter) rate() (rate.Limit, int) {
+	return rate.Limit(math.Float64frombits(l.limitBits.Load())), int(l.burst.Load())
 }
 
 // Allow reports whether the key may proceed.
@@ -67,19 +103,20 @@ func (l *Limiter) Allow(key string) bool {
 	if l == nil {
 		return true
 	}
-
-	l.mu.Lock()
-	if l.limit <= 0 {
-		l.mu.Unlock()
+	limit, burst := l.rate()
+	if limit <= 0 {
 		return true
 	}
-	v, ok := l.visitors[key]
+
+	s := &l.shards[shardIndex(key)]
+	s.mu.Lock()
+	v, ok := s.visitors[key]
 	if !ok {
-		v = &visitor{limiter: rate.NewLimiter(l.limit, l.burst)}
-		l.visitors[key] = v
+		v = &visitor{limiter: rate.NewLimiter(limit, burst)}
+		s.visitors[key] = v
 	}
 	v.lastSeen = time.Now()
-	l.mu.Unlock()
+	s.mu.Unlock()
 
 	return v.limiter.Allow()
 }
@@ -98,13 +135,16 @@ func (l *Limiter) Cleanup(ctx context.Context) {
 			return
 		case <-ticker.C:
 			cutoff := time.Now().Add(-l.ttl)
-			l.mu.Lock()
-			for key, v := range l.visitors {
-				if v.lastSeen.Before(cutoff) {
-					delete(l.visitors, key)
+			for i := range l.shards {
+				s := &l.shards[i]
+				s.mu.Lock()
+				for key, v := range s.visitors {
+					if v.lastSeen.Before(cutoff) {
+						delete(s.visitors, key)
+					}
 				}
+				s.mu.Unlock()
 			}
-			l.mu.Unlock()
 		}
 	}
 }

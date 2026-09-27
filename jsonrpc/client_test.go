@@ -5,13 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
-	"example.com/gosvc/apierror"
+	"github.com/bytedance/sonic"
+
+	"github.com/Tokimorphling/gosvc/apierror"
 )
 
 type echoRequest struct {
@@ -164,5 +169,176 @@ func TestClientTCP(t *testing.T) {
 	}
 	if resp.Message != "hello again" {
 		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+// TestClientTCPPipelinesConcurrentCalls verifies that the TCP transport keeps
+// multiple requests in flight on one connection and matches responses by id:
+// a slow response must not delay an unrelated fast one.
+func TestClientTCPPipelinesConcurrentCalls(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	// slow echoes "slow" with a delay; every other name answers immediately.
+	// Requests are handled concurrently per connection so a pipelined client
+	// can overlap them.
+	var writeMu sync.Mutex
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				for {
+					line, err := reader.ReadBytes('\n')
+					if err != nil {
+						return
+					}
+					go func(line []byte) {
+						var req struct {
+							ID     json.RawMessage `json:"id"`
+							Params struct {
+								Name string `json:"name"`
+							} `json:"params"`
+						}
+						if err := sonic.Unmarshal(line, &req); err != nil {
+							return
+						}
+						if req.Params.Name == "slow" {
+							time.Sleep(300 * time.Millisecond)
+						}
+						resp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"message":"hello %s"}}`, req.ID, req.Params.Name)
+						writeMu.Lock()
+						_, _ = conn.Write([]byte(resp + "\n"))
+						writeMu.Unlock()
+					}(append([]byte(nil), line...))
+				}
+			}(conn)
+		}
+	}()
+
+	client := NewTCPClient(listener.Addr().String())
+	defer client.Close()
+
+	slowDone := make(chan error, 1)
+	fastDone := make(chan error, 1)
+	start := time.Now()
+
+	go func() {
+		_, err := client.Call[echoRequest, *echoResponse](context.Background(), "echo", echoRequest{Name: "slow"})
+		slowDone <- err
+	}()
+	// Give the slow request a head start so ordering alone cannot pass the
+	// test: the fast response must come back while the slow one is pending.
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		_, err := client.Call[echoRequest, *echoResponse](context.Background(), "echo", echoRequest{Name: "fast"})
+		fastDone <- err
+	}()
+
+	if err := <-fastDone; err != nil {
+		t.Fatalf("fast call failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("fast call waited %s for the slow one; requests are not pipelined", elapsed)
+	}
+	if err := <-slowDone; err != nil {
+		t.Fatalf("slow call failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+		t.Fatalf("slow call returned in %s, want at least the server delay", elapsed)
+	}
+}
+
+// TestClientTCPReconnectsAfterBreak verifies that a failed connection is
+// re-dialled on the next call.
+func TestClientTCPReconnectsAfterBreak(t *testing.T) {
+	d := newEchoDispatcher()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	serve := func(ln net.Listener) {
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					reader := bufio.NewReader(conn)
+					for {
+						line, err := reader.ReadBytes('\n')
+						if err != nil {
+							return
+						}
+						resp, ok := d.Serve(context.Background(), line)
+						if !ok {
+							continue
+						}
+						_, _ = conn.Write(append(resp, '\n'))
+					}
+				}(conn)
+			}
+		}()
+	}
+	serve(listener)
+
+	client := NewTCPClient(listener.Addr().String())
+	if _, err := client.Call[echoRequest, *echoResponse](context.Background(), "echo", echoRequest{Name: "one"}); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	// Killing the server breaks the connection; a new listener on the same
+	// port makes the next call succeed again.
+	_ = listener.Close()
+	listener, err = net.Listen("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("re-listen: %v", err)
+	}
+	defer listener.Close()
+	serve(listener)
+
+	resp, err := client.Call[echoRequest, *echoResponse](context.Background(), "echo", echoRequest{Name: "two"})
+	if err != nil {
+		t.Fatalf("call after reconnect: %v", err)
+	}
+	if resp.Message != "hello two" {
+		t.Fatalf("resp = %+v", resp)
+	}
+	_ = client.Close()
+}
+
+// TestClientHTTPMapsTransportErrors verifies that an error body produced by
+// the runtime's error mapping (a non-200 status with a {"error":{"code":...}}
+// body) surfaces as a typed apierror the caller can branch on.
+func TestClientHTTPMapsTransportErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"missing API key","requestId":"r1"}}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL)
+	defer client.Close()
+
+	_, err := client.Call[struct{}, any](context.Background(), "echo", struct{}{})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if apierror.KindOf(err) != apierror.KindUnauthenticated {
+		t.Fatalf("err = %v, want kind unauthenticated", err)
+	}
+	if msg := apierror.ClientMessage(err); msg != "missing API key" {
+		t.Fatalf("message = %q", msg)
 	}
 }

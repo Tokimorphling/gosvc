@@ -8,11 +8,11 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 
-	"example.com/gosvc/apierror"
-	greeterv1 "example.com/gosvc/examples/app/api/greeter/v1"
-	"example.com/gosvc/examples/app/greeter"
-	grpctransport "example.com/gosvc/transport/grpc"
-	httptransport "example.com/gosvc/transport/http"
+	"github.com/Tokimorphling/gosvc/apierror"
+	greeterv1 "github.com/Tokimorphling/gosvc/examples/app/api/greeter/v1"
+	"github.com/Tokimorphling/gosvc/examples/app/greeter"
+	grpctransport "github.com/Tokimorphling/gosvc/transport/grpc"
+	httptransport "github.com/Tokimorphling/gosvc/transport/http"
 )
 
 // registerHTTP adds the REST routes. Errors flow through the runtime's error

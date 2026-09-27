@@ -4,6 +4,7 @@ package admin
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,11 +17,11 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"example.com/gosvc/config"
-	"example.com/gosvc/health"
-	"example.com/gosvc/logging"
-	"example.com/gosvc/observability"
-	"example.com/gosvc/store"
+	"github.com/Tokimorphling/gosvc/config"
+	"github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/logging"
+	"github.com/Tokimorphling/gosvc/observability"
+	"github.com/Tokimorphling/gosvc/store"
 )
 
 // Options wires the admin server.
@@ -86,15 +87,41 @@ func New(opts Options) (*Server, error) {
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
+	// The admin endpoints (pprof, config, reload, log level) are powerful;
+	// when the operator configures a token every request must carry it as
+	// "Authorization: Bearer <token>". An empty token keeps the endpoints
+	// open, which is only appropriate on a loopback or otherwise private
+	// listener.
+	handler := http.Handler(mux)
+	if token := opts.Config.Admin.Token; token != "" {
+		handler = tokenHandler{next: mux, token: token}
+	}
+
 	return &Server{
 		httpServer: &http.Server{
-			Handler:           mux,
+			Handler:           handler,
 			ReadHeaderTimeout: 5 * time.Second,
 		},
 		listener: listener,
 		mux:      mux,
 		logger:   opts.Logger,
 	}, nil
+}
+
+// tokenHandler enforces the admin bearer token in constant time.
+type tokenHandler struct {
+	next  http.Handler
+	token string
+}
+
+func (h tokenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	provided := "Bearer " + h.token
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(provided)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="gosvc-admin"`)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid admin token"})
+		return
+	}
+	h.next.ServeHTTP(w, r)
 }
 
 // registerLogLevel exposes runtime log level control:
@@ -239,9 +266,14 @@ func (s *Server) Mux() *http.ServeMux { return s.mux }
 // Addr returns the effective listen address.
 func (s *Server) Addr() string { return s.listener.Addr().String() }
 
-// Serve blocks until ctx is cancelled or the server fails.
+// Serve blocks until ctx is cancelled or the server fails. When ctx is
+// cancelled it waits for the graceful drain to finish before returning, so
+// callers (gosvc.App.Run) do not exit the process while scrape or reload
+// requests are still in flight.
 func (s *Server) Serve(ctx context.Context) error {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -250,10 +282,13 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 	}()
 
+	// Serve returns as soon as Shutdown closes the listener; the drain
+	// continues afterwards, so join it.
 	err := s.httpServer.Serve(s.listener)
 	if err != nil && !errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
 		return fmt.Errorf("admin serve: %w", err)
 	}
+	<-done
 	return nil
 }
 

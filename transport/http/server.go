@@ -5,25 +5,33 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 
 	"github.com/cloudwego/hertz/pkg/app/server"
 	"github.com/cloudwego/hertz/pkg/common/hlog"
 	"go.opentelemetry.io/otel/trace"
 
-	"example.com/gosvc/auth"
-	"example.com/gosvc/config"
-	"example.com/gosvc/health"
-	"example.com/gosvc/jsonrpc"
-	"example.com/gosvc/observability"
-	"example.com/gosvc/ratelimit"
-	"example.com/gosvc/store"
+	"github.com/Tokimorphling/gosvc/auth"
+	"github.com/Tokimorphling/gosvc/config"
+	"github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/jsonrpc"
+	"github.com/Tokimorphling/gosvc/observability"
+	"github.com/Tokimorphling/gosvc/ratelimit"
+	"github.com/Tokimorphling/gosvc/store"
 )
+
+// hlogOnce installs the hlog adapter exactly once per process. Hertz routes
+// its internal logs through the process-global hlog package, so a second
+// SetLogger call would race with engines that are still logging (during
+// shutdown) and the last caller would silently win. The adapter resolves
+// slog.Default() at call time, so it always follows the current default
+// logger instead of a stale one.
+var hlogOnce sync.Once
 
 // Options wires the HTTP server.
 type Options struct {
 	Config        *config.Config
 	Logger        *slog.Logger
-	Level         *slog.LevelVar
 	Metrics       *observability.Metrics
 	Limiter       *ratelimit.Limiter
 	Authenticator *auth.Authenticator
@@ -34,6 +42,7 @@ type Options struct {
 	// only useful when the application registers no JSON-RPC methods.
 	Dispatcher *jsonrpc.Dispatcher
 	// PublicPaths bypass authentication in addition to /healthz and /readyz.
+	// Both request paths and route patterns ("/api/v1/orders/:id") match.
 	PublicPaths []string
 	// Version is reported by GET /healthz.
 	Version string
@@ -89,15 +98,16 @@ func New(opts Options) (*Server, error) {
 		version:       opts.Version,
 	}
 
-	// Route Hertz internal logs through the application logger.
-	hlog.SetLogger(newHlogAdapter(opts.Logger, opts.Level))
+	// Route Hertz internal logs through the application logger. See hlogOnce
+	// for why this happens at most once per process.
+	hlogOnce.Do(func() { hlog.SetLogger(newHlogAdapter()) })
 
 	engine.Use(
 		RequestID(),
 		Tracing(opts.Tracer),
 		AccessLog(opts.Metrics, opts.Recorder, opts.AccessLogger),
 		Recovery(opts.Logger),
-		CORS(),
+		CORS(opts.Config.HTTP.CORS),
 		RateLimit(opts.Limiter),
 		Auth(opts.Authenticator, append([]string{"/healthz", "/readyz"}, opts.PublicPaths...)...),
 	)
@@ -116,9 +126,14 @@ func (s *Server) Dispatcher() *jsonrpc.Dispatcher { return s.dispatcher }
 // Addr returns the effective listen address.
 func (s *Server) Addr() string { return s.listener.Addr().String() }
 
-// Serve blocks until ctx is cancelled or the server fails.
+// Serve blocks until ctx is cancelled or the server fails. When ctx is
+// cancelled it waits for the graceful drain to finish before returning, so
+// callers (gosvc.App.Run) do not exit the process while in-flight requests
+// are still being served.
 func (s *Server) Serve(ctx context.Context) error {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.D())
 		defer cancel()
@@ -127,9 +142,12 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 	}()
 
+	// engine.Run returns as soon as the listener is closed, which happens at
+	// the beginning of engine.Shutdown; the drain continues afterwards.
 	err := s.engine.Run()
 	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("http serve: %w", err)
 	}
+	<-done
 	return nil
 }

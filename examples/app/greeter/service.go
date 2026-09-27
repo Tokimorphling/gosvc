@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"example.com/gosvc/apierror"
+	"github.com/Tokimorphling/gosvc/apierror"
 )
 
 // Service implements the greeting domain logic.

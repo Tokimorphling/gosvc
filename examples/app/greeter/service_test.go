@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/gosvc/apierror"
+	"github.com/Tokimorphling/gosvc/apierror"
 )
 
 func newTestService() *Service {

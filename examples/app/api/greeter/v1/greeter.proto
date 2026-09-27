@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package greeter.v1;
 
-option go_package = "example.com/gosvc/examples/app/api/greeter/v1;greeterv1";
+option go_package = "github.com/Tokimorphling/gosvc/examples/app/api/greeter/v1;greeterv1";
 
 // Greeter demonstrates the multi-protocol template: the same domain service is
 // exposed through REST, JSON-RPC 2.0 and gRPC without duplicating business logic.

@@ -13,9 +13,9 @@ ARG COMMIT=none
 ARG BUILD_TIME=unknown
 RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags "-s -w \
-      -X example.com/gosvc/examples/app.Version=${VERSION} \
-      -X example.com/gosvc/examples/app.Commit=${COMMIT} \
-      -X example.com/gosvc/examples/app.BuildTime=${BUILD_TIME}" \
+      -X github.com/Tokimorphling/gosvc/examples/app.Version=${VERSION} \
+      -X github.com/Tokimorphling/gosvc/examples/app.Commit=${COMMIT} \
+      -X github.com/Tokimorphling/gosvc/examples/app.BuildTime=${BUILD_TIME}" \
     -o /out/gosvc ./cmd/gosvc
 
 FROM gcr.io/distroless/static-debian12:nonroot

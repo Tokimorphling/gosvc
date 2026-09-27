@@ -8,10 +8,10 @@
 ## 0. 前置
 
 - Go **1.27+**（库使用泛型方法与 `errors.AsType`）；
-- 库可 import：发布到你的仓库后 `go get github.com/you/gosvc@latest`，本地开发可用 `replace`：
+- 库可 import：发布到你的仓库后 `go get github.com/Tokimorphling/gosvc@latest`，本地开发可用 `replace`：
 
   ```bash
-  go mod edit -replace github.com/you/gosvc=/path/to/gosvc
+  go mod edit -replace github.com/Tokimorphling/gosvc=/path/to/gosvc
   ```
 
 ## 1. 创建模块
@@ -19,7 +19,7 @@
 ```bash
 mkdir myservice && cd myservice
 go mod init github.com/you/myservice
-go get github.com/you/gosvc
+go get github.com/Tokimorphling/gosvc
 ```
 
 推荐目录：
@@ -45,7 +45,7 @@ package main
 import (
 	"errors"
 
-	"example.com/gosvc"
+	"github.com/Tokimorphling/gosvc"
 )
 
 type Config struct {
@@ -101,7 +101,10 @@ dsn = "postgres://user:pass@localhost/app?sslmode=disable"
 ```
 
 环境变量覆盖（前缀可配）：`MYAPP_SERVICE_NAME`、`MYAPP_HTTP_ADDR`、`MYAPP_AUTH_API_KEYS`、
-`MYAPP_REDIS_ADDR`、`MYAPP_POSTGRES_DSN`、`MYAPP_OTLP_ENDPOINT`、`MYAPP_LOG_LEVEL`。
+`MYAPP_REDIS_ADDR`、`MYAPP_POSTGRES_DSN`、`MYAPP_OTLP_ENDPOINT`、`MYAPP_LOG_LEVEL`、`MYAPP_ADMIN_TOKEN`。
+
+> admin 端口暴露 pprof / 配置 / reload 等高权限端点：绑在内网或 loopback，或设置
+> `[admin].token`（`Authorization: Bearer <token>`）后再暴露。
 
 > `Strict: true` 会拒绝未知键——启动时抓拼写错误；热更新走非严格模式，好让应用段与运行时配置共存。
 
@@ -121,9 +124,9 @@ import (
 	"github.com/cloudwego/hertz/pkg/app/server"
 	ggrpc "google.golang.org/grpc"
 
-	"example.com/gosvc"
-	"example.com/gosvc/jsonrpc"
-	"example.com/gosvc/logging"
+	"github.com/Tokimorphling/gosvc"
+	"github.com/Tokimorphling/gosvc/jsonrpc"
+	"github.com/Tokimorphling/gosvc/logging"
 )
 
 const (
@@ -229,7 +232,7 @@ package service
 import (
 	"context"
 
-	"example.com/gosvc/apierror"
+	"github.com/Tokimorphling/gosvc/apierror"
 )
 
 type Order struct {
@@ -387,7 +390,7 @@ issuer = "myservice"
 | `auth.*` | 热生效（凭据原子替换） |
 | `limiter.*` | 热生效 |
 | `storage.*` | **重建连接**：新连接就绪后切换，旧连接优雅关闭；失败保留旧连接并记错误 |
-| `service` / `http` / `grpc` / `tcp` / `admin` / `telemetry` / `log.access.enabled` | 需要重启，重载日志会列出 |
+| `service` / `http`（含 `http.cors`）/ `grpc` / `tcp`（含 `tcp.handlerTimeout`）/ `admin`（含 `token`）/ `telemetry` / `log.access.enabled` | 需要重启，重载日志会列出 |
 
 应用自己的段用 `WithOnReload` 处理：
 
@@ -416,7 +419,7 @@ gosvc.WithOnReload(func(cfg *gosvc.Config) error {
 - [ ] `telemetry.enabled = true` 且 `sampleRatio` 按流量调（如 0.1）
 - [ ] `auth.enabled = true`，密钥用 `*_AUTH_API_KEYS` 环境变量注入
 - [ ] `storage.*` 配置 + `/readyz` 探针验证
-- [ ] admin 端口只绑内网（默认 `127.0.0.1`）
+- [ ] admin 端口只绑内网（默认 `127.0.0.1`），要暴露就设置 `admin.token`
 - [ ] TCP 传输（如启用）在网关终止 TLS
 - [ ] 容器探针用 `myservice -healthcheck http://127.0.0.1:6060/healthz`
 

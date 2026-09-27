@@ -1,6 +1,6 @@
 package gosvc
 
-import "example.com/gosvc/config"
+import "github.com/Tokimorphling/gosvc/config"
 
 // Convenience aliases so applications can build their configuration with a
 // single import. They are aliases, not copies: config.Config remains the single

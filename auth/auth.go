@@ -14,8 +14,8 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"example.com/gosvc/apierror"
-	"example.com/gosvc/config"
+	"github.com/Tokimorphling/gosvc/apierror"
+	"github.com/Tokimorphling/gosvc/config"
 )
 
 // Method describes how a caller authenticated.

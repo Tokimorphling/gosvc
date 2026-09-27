@@ -15,12 +15,12 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
-	"example.com/gosvc/auth"
-	"example.com/gosvc/config"
-	apphealth "example.com/gosvc/health"
-	"example.com/gosvc/observability"
-	"example.com/gosvc/ratelimit"
-	"example.com/gosvc/store"
+	"github.com/Tokimorphling/gosvc/auth"
+	"github.com/Tokimorphling/gosvc/config"
+	apphealth "github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/observability"
+	"github.com/Tokimorphling/gosvc/ratelimit"
+	"github.com/Tokimorphling/gosvc/store"
 )
 
 // Options wires the gRPC server.
@@ -66,6 +66,15 @@ func New(opts Options) (*Server, error) {
 			metricsInterceptor(opts.Metrics),
 			rateLimitInterceptor(opts.Limiter),
 		),
+		ggrpc.ChainStreamInterceptor(
+			recoveryStreamInterceptor(opts.Logger),
+			requestIDStreamInterceptor(),
+			traceStreamInterceptor(),
+			authStreamInterceptor(opts.Authenticator),
+			loggingStreamInterceptor(opts.Recorder, opts.AccessLogger),
+			metricsStreamInterceptor(opts.Metrics),
+			rateLimitStreamInterceptor(opts.Limiter),
+		),
 	}
 	if opts.Tracer != nil {
 		serverOptions = append(serverOptions, ggrpc.StatsHandler(otelgrpc.NewServerHandler()))
@@ -94,30 +103,41 @@ func (s *Server) Server() *ggrpc.Server { return s.server }
 // Addr returns the effective listen address.
 func (s *Server) Addr() string { return s.listener.Addr().String() }
 
-// Serve blocks until ctx is cancelled or the server fails.
+// Serve blocks until ctx is cancelled or the server fails. When ctx is
+// cancelled it waits for the graceful drain to finish before returning, so
+// callers (gosvc.App.Run) do not exit the process while in-flight RPCs are
+// still being served.
 func (s *Server) Serve(ctx context.Context) error {
 	s.health.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		<-ctx.Done()
 		s.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
 
-		done := make(chan struct{})
+		drainDone := make(chan struct{})
 		go func() {
+			defer close(drainDone)
 			s.server.GracefulStop()
-			close(done)
 		}()
+		timeout := time.NewTimer(s.cfg.ShutdownTimeout.D())
+		defer timeout.Stop()
 		select {
-		case <-done:
-		case <-time.After(s.cfg.ShutdownTimeout.D()):
+		case <-drainDone:
+		case <-timeout.C:
 			s.logger.Warn("grpc graceful stop timed out, forcing stop")
 			s.server.Stop()
+			<-drainDone
 		}
 	}()
 
+	// Serve returns as soon as GracefulStop closes the listener; the drain
+	// continues afterwards, so join it before reporting the server stopped.
 	err := s.server.Serve(s.listener)
 	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("grpc serve: %w", err)
 	}
+	<-done
 	return nil
 }

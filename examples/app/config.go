@@ -7,8 +7,8 @@ import (
 	"errors"
 	"fmt"
 
-	"example.com/gosvc"
-	"example.com/gosvc/config"
+	"github.com/Tokimorphling/gosvc"
+	"github.com/Tokimorphling/gosvc/config"
 )
 
 // Config is the application configuration. It embeds the runtime config and

@@ -3,7 +3,7 @@ package greeter
 import (
 	"context"
 
-	"example.com/gosvc/jsonrpc"
+	"github.com/Tokimorphling/gosvc/jsonrpc"
 )
 
 // RegisterJSONRPC binds the service to a JSON-RPC dispatcher using typed
