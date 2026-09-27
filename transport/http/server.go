@@ -35,6 +35,8 @@ type Options struct {
 	Dispatcher *jsonrpc.Dispatcher
 	// PublicPaths bypass authentication in addition to /healthz and /readyz.
 	PublicPaths []string
+	// Version is reported by GET /healthz.
+	Version string
 }
 
 // Server serves the health endpoints, the JSON-RPC endpoint and the routes the
@@ -47,6 +49,7 @@ type Server struct {
 	dispatcher    *jsonrpc.Dispatcher
 	authenticator *auth.Authenticator
 	ready         *health.Ready
+	version       string
 }
 
 // New binds the listener and wires middleware. The listener is created eagerly
@@ -80,6 +83,7 @@ func New(opts Options) (*Server, error) {
 		dispatcher:    dispatcher,
 		authenticator: opts.Authenticator,
 		ready:         opts.Ready,
+		version:       opts.Version,
 	}
 
 	// Route Hertz internal logs through the application logger.

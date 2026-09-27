@@ -49,8 +49,14 @@ func New(ctx context.Context, cfg config.TelemetryConfig, service, env, serviceV
 	if ratio <= 0 {
 		ratio = 1
 	}
+
+	batchOptions := []sdktrace.BatchSpanProcessorOption{}
+	if timeout := cfg.BatchTimeout.D(); timeout > 0 {
+		batchOptions = append(batchOptions, sdktrace.WithBatchTimeout(timeout))
+	}
+
 	provider := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+		sdktrace.WithBatcher(exporter, batchOptions...),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))),
 	)

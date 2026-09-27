@@ -3,9 +3,9 @@ VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo d
 COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS    := -s -w \
-	-X $(MODULE)/version.Version=$(VERSION) \
-	-X $(MODULE)/version.Commit=$(COMMIT) \
-	-X $(MODULE)/version.BuildTime=$(BUILD_TIME)
+	-X $(MODULE)/examples/app.Version=$(VERSION) \
+	-X $(MODULE)/examples/app.Commit=$(COMMIT) \
+	-X $(MODULE)/examples/app.BuildTime=$(BUILD_TIME)
 
 .PHONY: all build run test race vet fmt lint proto clean docker help
 
@@ -18,7 +18,7 @@ build:
 
 ## run: build and start the service with the example config
 run: build
-	./bin/gosvc -c configs/config.example.json
+	./bin/gosvc -c configs/config.example.toml
 
 ## test: run unit tests
 test:

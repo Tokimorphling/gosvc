@@ -1,11 +1,13 @@
 package config
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 func TestDefaultIsValid(t *testing.T) {
@@ -16,12 +18,20 @@ func TestDefaultIsValid(t *testing.T) {
 
 func TestLoadFileMergesDefaults(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	content := `{
-		"service": {"name": "svc", "env": "prod"},
-		"http": {"port": 1234, "readTimeout": "3s"},
-		"log": {"level": "debug", "format": "text"}
-	}`
+	path := filepath.Join(dir, "config.toml")
+	content := `
+[service]
+name = "svc"
+env = "prod"
+
+[http]
+port = 1234
+readTimeout = "3s"
+
+[log]
+level = "debug"
+format = "text"
+`
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -45,6 +55,31 @@ func TestLoadFileMergesDefaults(t *testing.T) {
 	}
 	if cfg.Log.Level != "debug" || cfg.Log.Format != "text" {
 		t.Fatalf("log = %+v", cfg.Log)
+	}
+}
+
+func TestStrictRejectsUnknownKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `
+[service]
+name = "svc"
+env = "dev"
+
+[typo]
+enabled = true
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := (Source{Path: path, Strict: true}).Load[Config](); err == nil {
+		t.Fatal("strict mode must reject unknown keys")
+	} else if !strings.Contains(err.Error(), "typo") {
+		t.Fatalf("error should name the unknown key, got %v", err)
+	}
+
+	if _, err := (Source{Path: path}).Load[Config](); err != nil {
+		t.Fatalf("non-strict mode must ignore unknown keys: %v", err)
 	}
 }
 
@@ -123,43 +158,83 @@ func TestValidateRejectsBadConfig(t *testing.T) {
 	}
 }
 
-func TestRedacted(t *testing.T) {
-	cfg := Default()
-	cfg.Auth.Enabled = true
-	cfg.Auth.APIKeys = []string{"key-1", "key-2"}
-	cfg.Auth.JWT.Secret = "0123456789abcdef"
-	cfg.Storage.Redis.Password = "redis-secret"
+func TestRedisValidation(t *testing.T) {
+	cases := map[string]func(*RedisConfig){
+		"single without addr":   func(c *RedisConfig) { c.Mode = "single"; c.Addr = "" },
+		"cluster without addrs": func(c *RedisConfig) { c.Mode = "cluster" },
+		"sentinel without master": func(c *RedisConfig) {
+			c.Mode = "sentinel"
+			c.Addrs = []string{"127.0.0.1:26379"}
+		},
+		"unknown mode": func(c *RedisConfig) { c.Mode = "ring" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			redis := Default().Storage.Redis
+			redis.Enabled = true
+			mutate(&redis)
+			if err := redis.Validate(); err == nil {
+				t.Fatalf("expected a validation error for %s", name)
+			}
+		})
+	}
 
-	redacted := cfg.Redacted()
-	if redacted.Auth.JWT.Secret != "***" || redacted.Storage.Redis.Password != "***" {
-		t.Fatalf("secrets not redacted: %+v", redacted.Auth.JWT.Secret)
-	}
-	for _, key := range redacted.Auth.APIKeys {
-		if key != "***" {
-			t.Fatalf("api key not redacted: %q", key)
-		}
-	}
-	// The original must stay untouched.
-	if cfg.Auth.JWT.Secret != "0123456789abcdef" || cfg.Auth.APIKeys[0] != "key-1" {
-		t.Fatal("Redacted modified the original config")
+	valid := Default().Storage.Redis
+	valid.Enabled = true
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("default redis config must be valid: %v", err)
 	}
 }
 
-func TestDurationUnmarshal(t *testing.T) {
+func TestPostgresValidation(t *testing.T) {
+	cases := map[string]func(*PostgresConfig){
+		"missing dsn": func(c *PostgresConfig) { c.DSN = "" },
+		"idle above open": func(c *PostgresConfig) {
+			c.DSN = "postgres://localhost/app"
+			c.MaxOpenConns = 2
+			c.MaxIdleConns = 4
+		},
+		"zero ping timeout": func(c *PostgresConfig) {
+			c.DSN = "postgres://localhost/app"
+			c.PingTimeout = 0
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			pg := Default().Storage.Postgres
+			pg.Enabled = true
+			mutate(&pg)
+			if err := pg.Validate(); err == nil {
+				t.Fatalf("expected a validation error for %s", name)
+			}
+		})
+	}
+
+	valid := Default().Storage.Postgres
+	valid.Enabled = true
+	valid.DSN = "postgres://localhost/app"
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid postgres config rejected: %v", err)
+	}
+}
+
+func TestDurationUnmarshalTOML(t *testing.T) {
 	tests := []struct {
 		raw     string
 		want    time.Duration
 		wantErr bool
 	}{
-		{raw: `"5s"`, want: 5 * time.Second},
-		{raw: `2`, want: 2 * time.Second},
-		{raw: `null`, want: 0},
-		{raw: `"bogus"`, wantErr: true},
-		{raw: `{}`, wantErr: true},
+		{raw: `d = "5s"`, want: 5 * time.Second},
+		{raw: `d = 2`, want: 2 * time.Second},
+		{raw: `d = 1.5`, want: 1500 * time.Millisecond},
+		{raw: `d = "1h30m"`, want: 90 * time.Minute},
+		{raw: `d = "bogus"`, wantErr: true},
 	}
 	for _, tt := range tests {
-		var d Duration
-		err := json.Unmarshal([]byte(tt.raw), &d)
+		var out struct {
+			D Duration `toml:"d"`
+		}
+		err := toml.Unmarshal([]byte(tt.raw), &out)
 		if tt.wantErr {
 			if err == nil {
 				t.Fatalf("Duration(%s): expected an error", tt.raw)
@@ -169,8 +244,34 @@ func TestDurationUnmarshal(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Duration(%s): %v", tt.raw, err)
 		}
-		if d.D() != tt.want {
-			t.Fatalf("Duration(%s) = %s, want %s", tt.raw, d, tt.want)
+		if out.D.D() != tt.want {
+			t.Fatalf("Duration(%s) = %s, want %s", tt.raw, out.D, tt.want)
 		}
+	}
+}
+
+func TestRedacted(t *testing.T) {
+	cfg := Default()
+	cfg.Auth.Enabled = true
+	cfg.Auth.APIKeys = []string{"key-1", "key-2"}
+	cfg.Auth.JWT.Secret = "0123456789abcdef"
+	cfg.Storage.Redis.Password = "redis-secret"
+	cfg.Storage.Postgres.DSN = "postgres://user:pass@localhost/app"
+
+	redacted := cfg.Redacted()
+	if redacted.Auth.JWT.Secret != "***" || redacted.Storage.Redis.Password != "***" {
+		t.Fatalf("secrets not redacted: %+v", redacted.Auth.JWT.Secret)
+	}
+	if redacted.Storage.Postgres.DSN != "***" {
+		t.Fatalf("dsn not redacted: %q", redacted.Storage.Postgres.DSN)
+	}
+	for _, key := range redacted.Auth.APIKeys {
+		if key != "***" {
+			t.Fatalf("api key not redacted: %q", key)
+		}
+	}
+	// The original must stay untouched.
+	if cfg.Auth.JWT.Secret != "0123456789abcdef" || cfg.Auth.APIKeys[0] != "key-1" {
+		t.Fatal("Redacted modified the original config")
 	}
 }

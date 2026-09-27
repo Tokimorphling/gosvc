@@ -28,7 +28,7 @@ func Build(opts Options) (*gosvc.App, error) {
 
 	runtimeOptions := []gosvc.Option{
 		gosvc.WithLogger(opts.Log),
-		gosvc.WithVersion(opts.Version),
+		gosvc.WithVersion(FullVersion()),
 	}
 	if opts.ConfigPath != "" {
 		runtimeOptions = append(runtimeOptions, gosvc.WithHotReload(opts.ConfigPath, opts.EnvPrefix))

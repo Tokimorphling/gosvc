@@ -1,4 +1,4 @@
-package redisx
+package redis
 
 import (
 	"context"
@@ -52,6 +52,27 @@ func TestStoreIncrAndRange(t *testing.T) {
 	}
 	if buckets[0].Value != 5.5 {
 		t.Fatalf("value = %v, want 5.5", buckets[0].Value)
+	}
+}
+
+func TestUniversalOptionsModes(t *testing.T) {
+	single := universalOptions(config.RedisConfig{Addr: "127.0.0.1:6379"})
+	if len(single.Addrs) != 1 || single.Addrs[0] != "127.0.0.1:6379" || single.MasterName != "" {
+		t.Fatalf("single options = %+v", single)
+	}
+
+	cluster := universalOptions(config.RedisConfig{Mode: "cluster", Addrs: []string{"a:6379", "b:6379"}})
+	if len(cluster.Addrs) != 2 || cluster.MasterName != "" {
+		t.Fatalf("cluster options = %+v", cluster)
+	}
+
+	sentinel := universalOptions(config.RedisConfig{
+		Mode:       "sentinel",
+		Addrs:      []string{"s1:26379", "s2:26379"},
+		MasterName: "mymaster",
+	})
+	if len(sentinel.Addrs) != 2 || sentinel.MasterName != "mymaster" {
+		t.Fatalf("sentinel options = %+v", sentinel)
 	}
 }
 

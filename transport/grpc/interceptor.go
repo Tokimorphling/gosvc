@@ -17,7 +17,6 @@ import (
 	"example.com/gosvc/logging"
 	"example.com/gosvc/observability"
 	"example.com/gosvc/ratelimit"
-	"example.com/gosvc/reqid"
 	"example.com/gosvc/store"
 )
 
@@ -48,11 +47,19 @@ func requestIDInterceptor() ggrpc.UnaryServerInterceptor {
 			}
 		}
 		if id == "" {
-			id = reqid.New()
+			id = logging.NewRequestID()
 		}
-		ctx = reqid.With(ctx, id)
+		ctx = logging.WithRequestID(ctx, id)
 		ctx = logging.WithLogger(ctx, logging.FromContext(ctx).With("request_id", id))
 		return handler(ctx, req)
+	}
+}
+
+// traceInterceptor adds the active span identifiers (started by the otelgrpc
+// stats handler) to the context logger.
+func traceInterceptor() ggrpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *ggrpc.UnaryServerInfo, handler ggrpc.UnaryHandler) (any, error) {
+		return handler(logging.WithTrace(ctx), req)
 	}
 }
 

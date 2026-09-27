@@ -1,0 +1,103 @@
+# gosvc example configuration.
+#
+# Precedence: built-in defaults < this file < environment variables (GOSVC_*).
+# Durations are strings ("10s", "1h30m") or numbers (seconds).
+
+[service]
+name = "gosvc"
+env = "dev"
+
+[http]
+host = "0.0.0.0"
+port = 8080
+readTimeout = "10s"
+writeTimeout = "10s"
+idleTimeout = "60s"
+shutdownTimeout = "10s"
+maxBodyBytes = 1048576
+
+[grpc]
+host = "0.0.0.0"
+port = 9090
+shutdownTimeout = "10s"
+
+[tcp]
+enabled = false
+host = "0.0.0.0"
+port = 7070
+workers = 4
+queueSize = 1024
+maxFrameBytes = 1048576
+readTimeout = "60s"
+shutdownTimeout = "5s"
+
+[admin]
+host = "127.0.0.1"
+port = 6060
+
+[log]
+level = "info"
+format = "terminal"
+output = "stdout"
+color = "auto"
+addSource = false
+
+[log.file]
+path = "logs/gosvc.log"
+maxSizeMB = 100
+maxBackups = 5
+maxAgeDays = 7
+compress = true
+
+[log.sampling]
+enabled = false
+initial = 100
+thereafter = 100
+tick = "1s"
+
+[limiter]
+rps = 0
+burst = 0
+
+[auth]
+enabled = false
+apiKeys = []
+
+[auth.jwt]
+secret = ""
+issuer = "gosvc"
+audience = ""
+
+[telemetry]
+enabled = false
+otlpEndpoint = "127.0.0.1:4318"
+insecure = true
+sampleRatio = 1.0
+batchTimeout = "5s"
+
+[storage.redis]
+enabled = false
+mode = "single"          # single | cluster | sentinel
+addr = "127.0.0.1:6379"  # single mode
+addrs = []               # cluster seeds or sentinel nodes
+masterName = ""          # sentinel mode
+password = ""
+db = 0
+prefix = "gosvc"
+bucketTtl = "25h"
+queueSize = 4096
+poolSize = 0
+
+[storage.postgres]
+enabled = false
+dsn = ""
+maxOpenConns = 16
+maxIdleConns = 4
+connMaxLifetime = "1h"
+connMaxIdleTime = "10m"
+pingTimeout = "3s"
+
+# Application-specific section (used by the example app only).
+[greeting]
+prefix = "hello"
+maxNameLen = 64

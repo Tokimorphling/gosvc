@@ -14,11 +14,10 @@ import (
 
 	"example.com/gosvc/examples/app"
 	"example.com/gosvc/logging"
-	"example.com/gosvc/version"
 )
 
 const (
-	defaultConfigFile = "configs/config.example.json"
+	defaultConfigFile = "configs/config.example.toml"
 	envPrefix         = "GOSVC"
 )
 
@@ -43,7 +42,7 @@ func run(configPath string) error {
 		return err
 	}
 
-	logHandle, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, version.Version)
+	logHandle, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, app.Version)
 	if err != nil {
 		return err
 	}
@@ -54,7 +53,7 @@ func run(configPath string) error {
 		Log:        logHandle,
 		ConfigPath: configPath,
 		EnvPrefix:  envPrefix,
-		Version:    version.Version,
+		Version:    app.Version,
 	})
 	if err != nil {
 		return err

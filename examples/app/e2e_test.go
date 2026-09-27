@@ -10,9 +10,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,7 +30,6 @@ import (
 	"example.com/gosvc/examples/app/greeter"
 	"example.com/gosvc/jsonrpc"
 	"example.com/gosvc/logging"
-	"example.com/gosvc/version"
 )
 
 // TestEndToEnd boots the whole application on ephemeral ports and exercises
@@ -404,20 +405,43 @@ func TestLogSampling(t *testing.T) {
 // manual reload endpoint works.
 func TestConfigHotReload(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
+	path := filepath.Join(dir, "config.toml")
 
 	const secret = "0123456789abcdef"
 	writeConfig := func(apiKey, level string) {
 		t.Helper()
-		content := `{
-			"service": {"name": "reload-test", "env": "dev"},
-			"http": {"host": "127.0.0.1", "port": 0},
-			"grpc": {"host": "127.0.0.1", "port": 0},
-			"admin": {"host": "127.0.0.1", "port": 0},
-			"log": {"level": "` + level + `", "format": "json"},
-			"auth": {"enabled": true, "apiKeys": ["` + apiKey + `"], "jwt": {"secret": "` + secret + `"}},
-			"greeting": {"prefix": "hi", "maxNameLen": 32}
-		}`
+		content := `
+[service]
+name = "reload-test"
+env = "dev"
+
+[http]
+host = "127.0.0.1"
+port = 0
+
+[grpc]
+host = "127.0.0.1"
+port = 0
+
+[admin]
+host = "127.0.0.1"
+port = 0
+
+[log]
+level = "` + level + `"
+format = "json"
+
+[auth]
+enabled = true
+apiKeys = ["` + apiKey + `"]
+
+[auth.jwt]
+secret = "` + secret + `"
+
+[greeting]
+prefix = "hi"
+maxNameLen = 32
+`
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -490,6 +514,84 @@ func TestConfigHotReload(t *testing.T) {
 	}
 }
 
+// TestTraceContextInLogs enables tracing against a fake OTLP collector and
+// verifies that request logs carry trace_id/span_id and that spans are
+// exported.
+func TestTraceContextInLogs(t *testing.T) {
+	var exported atomic.Int64
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		exported.Add(1)
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer collector.Close()
+
+	logPath := filepath.Join(t.TempDir(), "app.log")
+
+	cfg := baseConfig()
+	cfg.Log.Level = "info"
+	cfg.Log.Output = "file"
+	cfg.Log.File.Path = logPath
+	cfg.Telemetry.Enabled = true
+	cfg.Telemetry.OTLPEndpoint = strings.TrimPrefix(collector.URL, "http://")
+	cfg.Telemetry.Insecure = true
+	cfg.Telemetry.BatchTimeout = config.Duration(200 * time.Millisecond)
+
+	application, stop := startApp(t, cfg, "")
+	defer stop()
+
+	httpBase := "http://" + application.HTTPAddr()
+	waitReady(t, httpBase+"/readyz")
+	getBody(t, httpBase+"/api/v1/hello?name=trace")
+
+	conn, err := ggrpc.NewClient(application.GRPCAddr(), ggrpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial grpc: %v", err)
+	}
+	defer conn.Close()
+	client := greeterv1.NewGreeterClient(conn)
+	callCtx, callCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer callCancel()
+	if _, err := client.SayHello(callCtx, &greeterv1.SayHelloRequest{Name: "trace"}); err != nil {
+		t.Fatalf("SayHello: %v", err)
+	}
+
+	waitFor(t, 5*time.Second, func() bool {
+		return logRecordHas(t, logPath, "http request", "trace_id")
+	})
+	waitFor(t, 5*time.Second, func() bool {
+		return logRecordHas(t, logPath, "grpc request", "trace_id")
+	})
+	waitFor(t, 5*time.Second, func() bool { return exported.Load() > 0 })
+}
+
+// logRecordHas reports whether the JSON log file contains a record with the
+// given msg and a non-empty string field.
+func logRecordHas(t *testing.T, path, msg, field string) bool {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			continue
+		}
+		if record["msg"] != msg {
+			continue
+		}
+		if value, ok := record[field].(string); ok && value != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func baseConfig() *Config {
 	cfg := &Config{}
 	cfg.SetDefaults()
@@ -507,7 +609,7 @@ func startApp(t *testing.T, cfg *Config, configPath string) (*gosvc.App, func())
 		t.Fatalf("validate config: %v", err)
 	}
 
-	logHandle, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, version.Version)
+	logHandle, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, Version)
 	if err != nil {
 		t.Fatalf("build logger: %v", err)
 	}
@@ -518,7 +620,7 @@ func startApp(t *testing.T, cfg *Config, configPath string) (*gosvc.App, func())
 		Log:        logHandle,
 		ConfigPath: configPath,
 		EnvPrefix:  "GOSVC",
-		Version:    version.Version,
+		Version:    Version,
 	})
 	if err != nil {
 		t.Fatalf("build app: %v", err)

@@ -7,7 +7,6 @@ import (
 	"github.com/cloudwego/hertz/pkg/app/server"
 
 	"example.com/gosvc/apierror"
-	"example.com/gosvc/version"
 )
 
 // registerRoutes wires the endpoints owned by the runtime. Application routes
@@ -26,7 +25,7 @@ func (s *Server) registerRoutes(h *server.Hertz) {
 }
 
 func (s *Server) handleHealthz(_ context.Context, c *app.RequestContext) {
-	writeJSON(c, 200, map[string]string{"status": "ok", "version": version.Full()})
+	writeJSON(c, 200, map[string]string{"status": "ok", "version": s.version})
 }
 
 func (s *Server) handleReadyz(_ context.Context, c *app.RequestContext) {

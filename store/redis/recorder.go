@@ -1,4 +1,4 @@
-package redisx
+package redis
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	goredis "github.com/redis/go-redis/v9"
 
 	"example.com/gosvc/store"
 )
@@ -127,7 +127,7 @@ func (r *Recorder) flush(ctx context.Context) {
 		pipe.IncrByFloat(ctx, key, delta)
 		pipe.Expire(ctx, key, r.store.ttl)
 	}
-	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+	if _, err := pipe.Exec(ctx); err != nil && err != goredis.Nil {
 		r.logger.Warn("failed to flush time-series samples", "error", err, "metrics", len(batch))
 	}
 }

@@ -44,23 +44,24 @@ import (
 	"golang.org/x/sync/errgroup"
 	ggrpc "google.golang.org/grpc"
 
-	"example.com/gosvc/admin"
 	"example.com/gosvc/auth"
 	"example.com/gosvc/config"
 	"example.com/gosvc/health"
+	"example.com/gosvc/internal/admin"
+	"example.com/gosvc/internal/reload"
+	"example.com/gosvc/internal/telemetry"
+	"example.com/gosvc/internal/version"
 	"example.com/gosvc/jsonrpc"
 	"example.com/gosvc/logging"
 	"example.com/gosvc/observability"
 	"example.com/gosvc/ratelimit"
-	"example.com/gosvc/reload"
 	"example.com/gosvc/state"
 	"example.com/gosvc/store"
-	"example.com/gosvc/store/redisx"
-	"example.com/gosvc/telemetry"
+	"example.com/gosvc/store/postgres"
+	"example.com/gosvc/store/redis"
 	grpctransport "example.com/gosvc/transport/grpc"
 	httptransport "example.com/gosvc/transport/http"
 	tcptransport "example.com/gosvc/transport/tcp"
-	"example.com/gosvc/version"
 )
 
 // ErrStarted is returned when handlers are registered after Run has been called.
@@ -129,8 +130,9 @@ type App struct {
 	admin *admin.Server
 
 	telemetry *telemetry.Provider
-	store     *redisx.Store
-	recorder  *redisx.Recorder
+	store     *redis.Store
+	recorder  *redis.Recorder
+	postgres  *postgres.DB
 
 	mu        sync.Mutex
 	started   bool
@@ -180,11 +182,23 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 	a.telemetry = tracer
 
 	if cfg.Storage.Redis.Enabled {
-		a.store, err = redisx.New(context.Background(), cfg.Storage.Redis)
+		a.store, err = redis.New(context.Background(), cfg.Storage.Redis)
 		if err != nil {
 			return nil, err
 		}
-		a.recorder = redisx.NewRecorder(a.store, cfg.Storage.Redis.QueueSize, logger)
+		a.recorder = redis.NewRecorder(a.store, cfg.Storage.Redis.QueueSize, logger)
+	}
+
+	if cfg.Storage.Postgres.Enabled {
+		a.postgres, err = postgres.New(context.Background(), cfg.Storage.Postgres)
+		if err != nil {
+			return nil, err
+		}
+		// Readiness reflects the database and the pool metrics are exported.
+		a.ready.AddCheck("postgres", a.postgres.HealthCheck())
+		if err := a.metrics.RegisterDBPool("postgres", a.postgres.DB); err != nil {
+			logger.Warn("failed to register database pool metrics", "error", err)
+		}
 	}
 
 	// One dispatcher shared by the HTTP /rpc endpoint and the TCP transport, so
@@ -208,6 +222,7 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 		Ready:         a.ready,
 		Dispatcher:    dispatcher,
 		PublicPaths:   o.publicPaths,
+		Version:       o.version,
 	})
 	if err != nil {
 		return nil, err
@@ -238,6 +253,7 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 			Recorder:   a.recorder,
 			Ready:      a.ready,
 			Dispatcher: dispatcher,
+			Tracer:     tracer.Tracer,
 		})
 		if err != nil {
 			return nil, err
@@ -258,6 +274,7 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 		TimeSeries:    timeSeries,
 		Reload:        a.Reload,
 		CurrentConfig: a.CurrentConfig,
+		Version:       o.version,
 	})
 	if err != nil {
 		return nil, err
@@ -401,6 +418,9 @@ func (a *App) Run(ctx context.Context) error {
 	if a.store != nil {
 		_ = a.store.Close()
 	}
+	if a.postgres != nil {
+		_ = a.postgres.Close()
+	}
 
 	logger.Info("service stopped")
 	return err
@@ -455,7 +475,14 @@ func (a *App) Auth() *auth.Authenticator { return a.auth }
 func (a *App) Recorder() store.Recorder { return a.recorder }
 
 // Store returns the Redis store, or nil when Redis is disabled.
-func (a *App) Store() *redisx.Store { return a.store }
+func (a *App) Store() *redis.Store { return a.store }
+
+// Postgres returns the PostgreSQL pool, or nil when it is disabled.
+func (a *App) Postgres() *postgres.DB { return a.postgres }
+
+// Health exposes readiness so applications can register their own dependency
+// checks.
+func (a *App) Health() *health.Ready { return a.ready }
 
 // HTTPAddr returns the effective REST/JSON-RPC address.
 func (a *App) HTTPAddr() string { return a.http.Addr() }
@@ -544,7 +571,7 @@ func restartRequiredFields(prev, next *config.Config) []string {
 	if prev.Telemetry != next.Telemetry {
 		fields = append(fields, "telemetry")
 	}
-	if prev.Storage != next.Storage {
+	if !reflect.DeepEqual(prev.Storage, next.Storage) {
 		fields = append(fields, "storage")
 	}
 	return fields

@@ -57,6 +57,7 @@ func New(opts Options) (*Server, error) {
 		ggrpc.ChainUnaryInterceptor(
 			recoveryInterceptor(opts.Logger),
 			requestIDInterceptor(),
+			traceInterceptor(),
 			authInterceptor(opts.Authenticator),
 			loggingInterceptor(opts.Recorder),
 			metricsInterceptor(opts.Metrics),

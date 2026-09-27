@@ -18,7 +18,6 @@ import (
 	"example.com/gosvc/logging"
 	"example.com/gosvc/observability"
 	"example.com/gosvc/ratelimit"
-	"example.com/gosvc/reqid"
 	"example.com/gosvc/store"
 )
 
@@ -28,10 +27,10 @@ func RequestID() app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
 		id := string(c.GetHeader("X-Request-ID"))
 		if id == "" {
-			id = reqid.New()
+			id = logging.NewRequestID()
 		}
 		c.Header("X-Request-ID", id)
-		ctx = reqid.With(ctx, id)
+		ctx = logging.WithRequestID(ctx, id)
 		ctx = logging.WithLogger(ctx, logging.FromContext(ctx).With("request_id", id))
 		c.Next(ctx)
 	}
@@ -59,6 +58,9 @@ func Tracing(tracer trace.Tracer) app.HandlerFunc {
 				attribute.String("http.route", route),
 			))
 		defer span.End()
+
+		// Correlate application logs with the trace.
+		ctx = logging.WithTrace(ctx)
 
 		c.Next(ctx)
 

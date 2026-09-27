@@ -1,10 +1,10 @@
 // Package config loads, merges and validates service configuration.
 //
-// Precedence: defaults < JSON file < environment variables.
+// Precedence: defaults < TOML file < environment variables. Durations are
+// written as strings ("10s", "1h30m") or numbers (seconds).
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -13,38 +13,41 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
+
 	"example.com/gosvc/slogx"
 )
 
-// Config is the root configuration object.
+// Config is the runtime configuration. Applications embed it and add their own
+// sections.
 type Config struct {
-	Service   ServiceConfig   `json:"service"`
-	HTTP      HTTPConfig      `json:"http"`
-	GRPC      GRPCConfig      `json:"grpc"`
-	TCP       TCPConfig       `json:"tcp"`
-	Admin     AdminConfig     `json:"admin"`
-	Log       LogConfig       `json:"log"`
-	Limiter   LimiterConfig   `json:"limiter"`
-	Auth      AuthConfig      `json:"auth"`
-	Telemetry TelemetryConfig `json:"telemetry"`
-	Storage   StorageConfig   `json:"storage"`
+	Service   ServiceConfig   `json:"service" toml:"service"`
+	HTTP      HTTPConfig      `json:"http" toml:"http"`
+	GRPC      GRPCConfig      `json:"grpc" toml:"grpc"`
+	TCP       TCPConfig       `json:"tcp" toml:"tcp"`
+	Admin     AdminConfig     `json:"admin" toml:"admin"`
+	Log       LogConfig       `json:"log" toml:"log"`
+	Limiter   LimiterConfig   `json:"limiter" toml:"limiter"`
+	Auth      AuthConfig      `json:"auth" toml:"auth"`
+	Telemetry TelemetryConfig `json:"telemetry" toml:"telemetry"`
+	Storage   StorageConfig   `json:"storage" toml:"storage"`
 }
 
 // ServiceConfig holds service identity.
 type ServiceConfig struct {
-	Name string `json:"name"`
-	Env  string `json:"env"` // dev | staging | prod
+	Name string `json:"name" toml:"name"`
+	Env  string `json:"env" toml:"env"` // dev | staging | prod
 }
 
 // HTTPConfig configures the REST/JSON-RPC server.
 type HTTPConfig struct {
-	Host            string   `json:"host"`
-	Port            int      `json:"port"`
-	ReadTimeout     Duration `json:"readTimeout"`
-	WriteTimeout    Duration `json:"writeTimeout"`
-	IdleTimeout     Duration `json:"idleTimeout"`
-	ShutdownTimeout Duration `json:"shutdownTimeout"`
-	MaxBodyBytes    int      `json:"maxBodyBytes"`
+	Host            string   `json:"host" toml:"host"`
+	Port            int      `json:"port" toml:"port"`
+	ReadTimeout     Duration `json:"readTimeout" toml:"readTimeout"`
+	WriteTimeout    Duration `json:"writeTimeout" toml:"writeTimeout"`
+	IdleTimeout     Duration `json:"idleTimeout" toml:"idleTimeout"`
+	ShutdownTimeout Duration `json:"shutdownTimeout" toml:"shutdownTimeout"`
+	MaxBodyBytes    int      `json:"maxBodyBytes" toml:"maxBodyBytes"`
 }
 
 // Addr returns the host:port listen address.
@@ -52,18 +55,35 @@ func (c HTTPConfig) Addr() string { return net.JoinHostPort(c.Host, strconv.Itoa
 
 // GRPCConfig configures the gRPC server.
 type GRPCConfig struct {
-	Host            string   `json:"host"`
-	Port            int      `json:"port"`
-	ShutdownTimeout Duration `json:"shutdownTimeout"`
+	Host            string   `json:"host" toml:"host"`
+	Port            int      `json:"port" toml:"port"`
+	ShutdownTimeout Duration `json:"shutdownTimeout" toml:"shutdownTimeout"`
 }
 
 // Addr returns the host:port listen address.
 func (c GRPCConfig) Addr() string { return net.JoinHostPort(c.Host, strconv.Itoa(c.Port)) }
 
+// TCPConfig configures the optional netpoll based line-delimited JSON-RPC
+// server. It is meant for internal, high-connection-count traffic: terminate
+// TLS at a gateway in front of it.
+type TCPConfig struct {
+	Enabled         bool     `json:"enabled" toml:"enabled"`
+	Host            string   `json:"host" toml:"host"`
+	Port            int      `json:"port" toml:"port"`
+	Workers         int      `json:"workers" toml:"workers"`     // bounded worker pool size
+	QueueSize       int      `json:"queueSize" toml:"queueSize"` // bounded queue size
+	MaxFrameBytes   int      `json:"maxFrameBytes" toml:"maxFrameBytes"`
+	ReadTimeout     Duration `json:"readTimeout" toml:"readTimeout"`
+	ShutdownTimeout Duration `json:"shutdownTimeout" toml:"shutdownTimeout"`
+}
+
+// Addr returns the host:port listen address.
+func (c TCPConfig) Addr() string { return net.JoinHostPort(c.Host, strconv.Itoa(c.Port)) }
+
 // AdminConfig configures the operations server (metrics, pprof, health).
 type AdminConfig struct {
-	Host string `json:"host"`
-	Port int    `json:"port"`
+	Host string `json:"host" toml:"host"`
+	Port int    `json:"port" toml:"port"`
 }
 
 // Addr returns the host:port listen address.
@@ -71,95 +91,95 @@ func (c AdminConfig) Addr() string { return net.JoinHostPort(c.Host, strconv.Ito
 
 // LogConfig configures the slog logger.
 type LogConfig struct {
-	Level     string            `json:"level"`     // trace | debug | info | warn | error
-	Format    string            `json:"format"`    // auto | terminal | json | logfmt
-	Output    string            `json:"output"`    // stdout | file | both
-	Color     string            `json:"color"`     // auto | always | never
-	AddSource bool              `json:"addSource"` // add source location (JSON sinks)
-	File      FileLogConfig     `json:"file"`
-	Sampling  SamplingLogConfig `json:"sampling"`
-}
-
-// SamplingLogConfig configures per-message log sampling for high QPS services.
-type SamplingLogConfig struct {
-	Enabled    bool     `json:"enabled"`
-	Initial    int      `json:"initial"`    // records always emitted per (level,message) per tick
-	Thereafter int      `json:"thereafter"` // then emit one out of every N
-	Tick       Duration `json:"tick"`       // sampling window
+	Level     string            `json:"level" toml:"level"`
+	Format    string            `json:"format" toml:"format"` // auto | terminal | json | logfmt
+	Output    string            `json:"output" toml:"output"` // stdout | file | both
+	Color     string            `json:"color" toml:"color"`   // auto | always | never
+	AddSource bool              `json:"addSource" toml:"addSource"`
+	File      FileLogConfig     `json:"file" toml:"file"`
+	Sampling  SamplingLogConfig `json:"sampling" toml:"sampling"`
 }
 
 // FileLogConfig configures the rotating file sink.
 type FileLogConfig struct {
-	Path       string `json:"path"`
-	MaxSizeMB  int    `json:"maxSizeMB"`
-	MaxBackups int    `json:"maxBackups"`
-	MaxAgeDays int    `json:"maxAgeDays"`
-	Compress   bool   `json:"compress"`
+	Path       string `json:"path" toml:"path"`
+	MaxSizeMB  int    `json:"maxSizeMB" toml:"maxSizeMB"`
+	MaxBackups int    `json:"maxBackups" toml:"maxBackups"`
+	MaxAgeDays int    `json:"maxAgeDays" toml:"maxAgeDays"`
+	Compress   bool   `json:"compress" toml:"compress"`
+}
+
+// SamplingLogConfig configures per-message log sampling for high QPS services.
+type SamplingLogConfig struct {
+	Enabled    bool     `json:"enabled" toml:"enabled"`
+	Initial    int      `json:"initial" toml:"initial"`
+	Thereafter int      `json:"thereafter" toml:"thereafter"`
+	Tick       Duration `json:"tick" toml:"tick"`
 }
 
 // LimiterConfig configures the per-client token bucket limiter.
 type LimiterConfig struct {
-	RPS   float64 `json:"rps"`   // 0 disables rate limiting
-	Burst int     `json:"burst"` // required when RPS > 0
+	RPS   float64 `json:"rps" toml:"rps"`     // 0 disables rate limiting
+	Burst int     `json:"burst" toml:"burst"` // required when RPS > 0
 }
-
-// TCPConfig configures the optional netpoll based line-delimited JSON-RPC
-// server. It is meant for internal, high-connection-count traffic: terminate
-// TLS at a gateway in front of it.
-type TCPConfig struct {
-	Enabled         bool     `json:"enabled"`
-	Host            string   `json:"host"`
-	Port            int      `json:"port"`
-	Workers         int      `json:"workers"`       // bounded worker pool size
-	QueueSize       int      `json:"queueSize"`     // bounded queue size
-	MaxFrameBytes   int      `json:"maxFrameBytes"` // maximum request line size
-	ReadTimeout     Duration `json:"readTimeout"`
-	ShutdownTimeout Duration `json:"shutdownTimeout"`
-}
-
-// Addr returns the host:port listen address.
-func (c TCPConfig) Addr() string { return net.JoinHostPort(c.Host, strconv.Itoa(c.Port)) }
 
 // AuthConfig configures API key and JWT authentication.
 type AuthConfig struct {
-	Enabled bool      `json:"enabled"`
-	APIKeys []string  `json:"apiKeys"`
-	JWT     JWTConfig `json:"jwt"`
+	Enabled bool      `json:"enabled" toml:"enabled"`
+	APIKeys []string  `json:"apiKeys" toml:"apiKeys"`
+	JWT     JWTConfig `json:"jwt" toml:"jwt"`
 }
 
 // JWTConfig configures HS256 JWT verification.
 type JWTConfig struct {
-	Secret   string `json:"secret"`
-	Issuer   string `json:"issuer"`
-	Audience string `json:"audience"`
+	Secret   string `json:"secret" toml:"secret"`
+	Issuer   string `json:"issuer" toml:"issuer"`
+	Audience string `json:"audience" toml:"audience"`
 }
 
 // TelemetryConfig configures OpenTelemetry tracing (OTLP/HTTP).
 type TelemetryConfig struct {
-	Enabled      bool    `json:"enabled"`
-	OTLPEndpoint string  `json:"otlpEndpoint"` // host:port
-	Insecure     bool    `json:"insecure"`
-	SampleRatio  float64 `json:"sampleRatio"` // 0..1
+	Enabled      bool     `json:"enabled" toml:"enabled"`
+	OTLPEndpoint string   `json:"otlpEndpoint" toml:"otlpEndpoint"` // host:port
+	Insecure     bool     `json:"insecure" toml:"insecure"`
+	SampleRatio  float64  `json:"sampleRatio" toml:"sampleRatio"` // 0..1
+	BatchTimeout Duration `json:"batchTimeout" toml:"batchTimeout"`
 }
 
 // StorageConfig configures optional persistence.
 type StorageConfig struct {
-	Redis RedisConfig `json:"redis"`
+	Redis    RedisConfig    `json:"redis" toml:"redis"`
+	Postgres PostgresConfig `json:"postgres" toml:"postgres"`
 }
 
 // RedisConfig configures the Redis backed time-series store.
 type RedisConfig struct {
-	Enabled   bool     `json:"enabled"`
-	Addr      string   `json:"addr"`
-	Password  string   `json:"password"`
-	DB        int      `json:"db"`
-	Prefix    string   `json:"prefix"`
-	BucketTTL Duration `json:"bucketTtl"`
-	QueueSize int      `json:"queueSize"`
+	Enabled    bool     `json:"enabled" toml:"enabled"`
+	Mode       string   `json:"mode" toml:"mode"` // single | cluster | sentinel
+	Addr       string   `json:"addr" toml:"addr"` // single
+	Addrs      []string `json:"addrs" toml:"addrs"`
+	MasterName string   `json:"masterName" toml:"masterName"` // sentinel
+	Password   string   `json:"password" toml:"password"`
+	DB         int      `json:"db" toml:"db"` // single/sentinel
+	Prefix     string   `json:"prefix" toml:"prefix"`
+	BucketTTL  Duration `json:"bucketTtl" toml:"bucketTtl"`
+	QueueSize  int      `json:"queueSize" toml:"queueSize"`
+	PoolSize   int      `json:"poolSize" toml:"poolSize"`
 }
 
-// Duration is a time.Duration that unmarshals from either a Go duration string
-// ("5s", "1m") or a number of seconds in JSON.
+// PostgresConfig configures the PostgreSQL connection pool.
+type PostgresConfig struct {
+	Enabled         bool     `json:"enabled" toml:"enabled"`
+	DSN             string   `json:"dsn" toml:"dsn"`
+	MaxOpenConns    int      `json:"maxOpenConns" toml:"maxOpenConns"`
+	MaxIdleConns    int      `json:"maxIdleConns" toml:"maxIdleConns"`
+	ConnMaxLifetime Duration `json:"connMaxLifetime" toml:"connMaxLifetime"`
+	ConnMaxIdleTime Duration `json:"connMaxIdleTime" toml:"connMaxIdleTime"`
+	PingTimeout     Duration `json:"pingTimeout" toml:"pingTimeout"`
+}
+
+// Duration is a time.Duration that decodes from a TOML string ("10s", "1h30m")
+// or a number of seconds, and marshals to a string for the admin JSON API.
 type Duration time.Duration
 
 // D returns the underlying time.Duration.
@@ -169,28 +189,26 @@ func (d Duration) String() string { return time.Duration(d).String() }
 
 // MarshalJSON implements json.Marshaler.
 func (d Duration) MarshalJSON() ([]byte, error) {
-	return json.Marshal(time.Duration(d).String())
+	return []byte(strconv.Quote(time.Duration(d).String())), nil
 }
 
-// UnmarshalJSON implements json.Unmarshaler.
-func (d *Duration) UnmarshalJSON(b []byte) error {
-	var raw any
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return err
-	}
-	switch v := raw.(type) {
-	case nil:
-		return nil
+// UnmarshalTOML implements toml.Unmarshaler.
+func (d *Duration) UnmarshalTOML(value any) error {
+	switch v := value.(type) {
 	case string:
 		parsed, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("invalid duration %q: %w", v, err)
 		}
 		*d = Duration(parsed)
+	case int64:
+		*d = Duration(time.Duration(v) * time.Second)
 	case float64:
 		*d = Duration(time.Duration(v * float64(time.Second)))
+	case nil:
+		return nil
 	default:
-		return fmt.Errorf("invalid duration: %v", raw)
+		return fmt.Errorf("invalid duration: %v", value)
 	}
 	return nil
 }
@@ -213,7 +231,6 @@ func Default() *Config {
 			Port:            9090,
 			ShutdownTimeout: Duration(10 * time.Second),
 		},
-		Admin: AdminConfig{Host: "127.0.0.1", Port: 6060},
 		TCP: TCPConfig{
 			Enabled:         false,
 			Host:            "0.0.0.0",
@@ -224,6 +241,7 @@ func Default() *Config {
 			ReadTimeout:     Duration(60 * time.Second),
 			ShutdownTimeout: Duration(5 * time.Second),
 		},
+		Admin: AdminConfig{Host: "127.0.0.1", Port: 6060},
 		Log: LogConfig{
 			Level:  "info",
 			Format: "auto",
@@ -249,14 +267,24 @@ func Default() *Config {
 			OTLPEndpoint: "127.0.0.1:4318",
 			Insecure:     true,
 			SampleRatio:  1.0,
+			BatchTimeout: Duration(5 * time.Second),
 		},
 		Storage: StorageConfig{
 			Redis: RedisConfig{
 				Enabled:   false,
+				Mode:      "single",
 				Addr:      "127.0.0.1:6379",
 				Prefix:    "gosvc",
 				BucketTTL: Duration(25 * time.Hour),
 				QueueSize: 4096,
+			},
+			Postgres: PostgresConfig{
+				Enabled:         false,
+				MaxOpenConns:    16,
+				MaxIdleConns:    4,
+				ConnMaxLifetime: Duration(time.Hour),
+				ConnMaxIdleTime: Duration(10 * time.Minute),
+				PingTimeout:     Duration(3 * time.Second),
 			},
 		},
 	}
@@ -278,23 +306,27 @@ type EnvApplier interface {
 
 // Source describes where a configuration comes from.
 type Source struct {
-	// Path is the JSON file path; empty means defaults plus environment only.
+	// Path is the TOML file path; empty means defaults plus environment only.
 	Path string
 	// EnvPrefix is the environment variable prefix, for example "MYAPP" for
 	// MYAPP_HTTP_ADDR. Empty means "GOSVC".
 	EnvPrefix string
+	// Strict rejects unknown keys in the file, which catches typos. Hot reload
+	// typically leaves it off so application sections can coexist with the
+	// runtime config.
+	Strict bool
 }
 
 const defaultEnvPrefix = "GOSVC"
 
-// Load reads defaults, then the JSON file, then environment overrides into a
+// Load reads defaults, then the TOML file, then environment overrides into a
 // freshly allocated T and validates the result.
 //
 // The PT type parameter is the idiomatic way to require that *T satisfies
 // Configurable, which keeps the check at compile time:
 //
-//	cfg, err := config.Source{Path: "config.json"}.Load[config.Config]()
-//	appCfg, err := config.Source{Path: "config.json", EnvPrefix: "MYAPP"}.Load[app.Config]()
+//	cfg, err := config.Source{Path: "config.toml"}.Load[config.Config]()
+//	appCfg, err := config.Source{Path: "config.toml", EnvPrefix: "MYAPP"}.Load[app.Config]()
 func (s Source) Load[T any, PT interface {
 	*T
 	Configurable
@@ -303,12 +335,18 @@ func (s Source) Load[T any, PT interface {
 	target.SetDefaults()
 
 	if s.Path != "" {
-		raw, err := os.ReadFile(s.Path)
+		meta, err := toml.DecodeFile(s.Path, target)
 		if err != nil {
-			return nil, fmt.Errorf("read config %s: %w", s.Path, err)
-		}
-		if err := json.Unmarshal(raw, target); err != nil {
 			return nil, fmt.Errorf("parse config %s: %w", s.Path, err)
+		}
+		if s.Strict {
+			if undecoded := meta.Undecoded(); len(undecoded) > 0 {
+				keys := make([]string, 0, len(undecoded))
+				for _, key := range undecoded {
+					keys = append(keys, key.String())
+				}
+				return nil, fmt.Errorf("config %s: unknown keys: %s", s.Path, strings.Join(keys, ", "))
+			}
 		}
 	}
 
@@ -363,6 +401,10 @@ func (c *Config) ApplyEnv(prefix string) error {
 	if v := os.Getenv(env("REDIS_ADDR")); v != "" {
 		c.Storage.Redis.Enabled = true
 		c.Storage.Redis.Addr = v
+	}
+	if v := os.Getenv(env("POSTGRES_DSN")); v != "" {
+		c.Storage.Postgres.Enabled = true
+		c.Storage.Postgres.DSN = v
 	}
 	for _, item := range []struct {
 		suffix string
@@ -482,6 +524,9 @@ func (c *Config) Validate() error {
 		if c.Telemetry.SampleRatio < 0 || c.Telemetry.SampleRatio > 1 {
 			return fmt.Errorf("telemetry.sampleRatio must be within [0,1]")
 		}
+		if c.Telemetry.BatchTimeout < 0 {
+			return fmt.Errorf("telemetry.batchTimeout must not be negative")
+		}
 	}
 
 	if c.TCP.Enabled {
@@ -499,16 +544,67 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.Storage.Redis.Enabled {
-		if strings.TrimSpace(c.Storage.Redis.Addr) == "" {
-			return fmt.Errorf("storage.redis.addr must be set when redis is enabled")
+	if err := c.Storage.Redis.Validate(); err != nil {
+		return err
+	}
+	if err := c.Storage.Postgres.Validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Validate checks the Redis section.
+func (c RedisConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Mode)) {
+	case "", "single":
+		if strings.TrimSpace(c.Addr) == "" {
+			return fmt.Errorf("storage.redis.addr must be set in single mode")
 		}
-		if c.Storage.Redis.BucketTTL <= 0 {
-			return fmt.Errorf("storage.redis.bucketTtl must be positive")
+	case "cluster":
+		if len(c.Addrs) == 0 {
+			return fmt.Errorf("storage.redis.addrs must list seed nodes in cluster mode")
 		}
-		if c.Storage.Redis.QueueSize <= 0 {
-			return fmt.Errorf("storage.redis.queueSize must be > 0")
+	case "sentinel":
+		if len(c.Addrs) == 0 {
+			return fmt.Errorf("storage.redis.addrs must list sentinel nodes in sentinel mode")
 		}
+		if strings.TrimSpace(c.MasterName) == "" {
+			return fmt.Errorf("storage.redis.masterName must be set in sentinel mode")
+		}
+	default:
+		return fmt.Errorf("storage.redis.mode must be one of single|cluster|sentinel, got %q", c.Mode)
+	}
+	if c.BucketTTL <= 0 {
+		return fmt.Errorf("storage.redis.bucketTtl must be positive")
+	}
+	if c.QueueSize <= 0 {
+		return fmt.Errorf("storage.redis.queueSize must be > 0")
+	}
+	if c.PoolSize < 0 {
+		return fmt.Errorf("storage.redis.poolSize must not be negative")
+	}
+	return nil
+}
+
+// Validate checks the PostgreSQL section.
+func (c PostgresConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(c.DSN) == "" {
+		return fmt.Errorf("storage.postgres.dsn must be set when postgres is enabled")
+	}
+	if c.MaxOpenConns < 0 || c.MaxIdleConns < 0 {
+		return fmt.Errorf("storage.postgres maxOpenConns/maxIdleConns must not be negative")
+	}
+	if c.MaxIdleConns > c.MaxOpenConns && c.MaxOpenConns > 0 {
+		return fmt.Errorf("storage.postgres.maxIdleConns must not exceed maxOpenConns")
+	}
+	if c.PingTimeout <= 0 {
+		return fmt.Errorf("storage.postgres.pingTimeout must be positive")
 	}
 	return nil
 }
@@ -527,6 +623,9 @@ func (c *Config) Redacted() *Config {
 	}
 	if clone.Storage.Redis.Password != "" {
 		clone.Storage.Redis.Password = "***"
+	}
+	if clone.Storage.Postgres.DSN != "" {
+		clone.Storage.Postgres.DSN = "***"
 	}
 	return &clone
 }

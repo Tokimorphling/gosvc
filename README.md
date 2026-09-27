@@ -51,7 +51,7 @@ func (c *Config) Validate() error {
 
 func main() {
 	// 2. 加载：默认值 < 文件 < 环境变量（泛型方法，编译期检查）
-	cfg, err := (gosvc.Source{Path: "config.json", EnvPrefix: "MYAPP"}).Load[Config]()
+	cfg, err := (gosvc.Source{Path: "config.toml", EnvPrefix: "MYAPP", Strict: true}).Load[Config]()
 	if err != nil {
 		slog.Error("config", "error", err)
 		os.Exit(1)
@@ -68,7 +68,7 @@ func main() {
 	app, err := gosvc.New(&cfg.Config,
 		gosvc.WithLogger(logHandle),
 		gosvc.WithVersion("v1.0.0"),
-		gosvc.WithHotReload("config.json", "MYAPP"),
+		gosvc.WithHotReload("config.toml", "MYAPP"),
 	)
 	if err != nil {
 		slog.Error("runtime", "error", err)
@@ -108,9 +108,11 @@ func main() {
 | 统一错误模型 | `apierror.Kind` 一处定义，各协议自动映射（HTTP 状态码 / JSON-RPC code / gRPC code），内部错误不泄漏 |
 | 认证 | API Key（constant-time）+ HS256 JWT，HTTP 中间件与 gRPC 拦截器共用；health/reflection 默认放行 |
 | 链路追踪 | OpenTelemetry OTLP/HTTP，W3C TraceContext 传播，Hertz 中间件 + `otelgrpc` StatsHandler |
+| 日志-链路关联 | 请求日志自动带 `trace_id` / `span_id`（HTTP、gRPC、TCP 一致），与导出的 span 对应 |
 | 日志 | 两层：`slogx`（geth 风格 handler，零依赖）+ `logging`（多 sink、轮转、采样、运行期级别） |
-| 可观测性 | Prometheus 指标、pprof、healthz/readyz/version、日志统计、配置查看、时间序列查询，独立 admin 端口 |
-| 时间序列存储 | Redis 分钟桶 + 内存聚合批量写；`state.Snapshot[T]` 提供无锁读的状态快照 |
+| 可观测性 | Prometheus 指标、pprof、healthz/readyz（含依赖探针）、日志统计、配置查看、时间序列查询，独立 admin 端口 |
+| 存储连接器 | Redis（单机 / Cluster / Sentinel，分钟桶 + 内存聚合批量写）与 PostgreSQL（pgx 连接池、池指标、就绪探针） |
+| 无锁状态 | `state.Snapshot[T]` 提供读无锁、写替换的共享状态 |
 | 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 免重启生效，其余字段提示 `restartRequired`；`POST /debug/reload` 手动触发 |
 | 有界并发 | `workerpool`（显式 `ErrFull`/`ErrClosed`）+ netpoll 事件循环 + 每连接写串行化，慢业务不阻塞 IO |
 | 压测器 | `examples/app/cmd/bench` 支持 rest / jsonrpc / grpc |
@@ -121,26 +123,36 @@ func main() {
 .
 ├── app.go                  # package gosvc：运行时门面（New / Register* / Run / Reload）
 ├── types.go                # 配置类型别名，方便单 import 使用
-├── config/                 # 基础配置 + 泛型加载器 Source.Load[T]
-├── logging/                # 日志装配（Handle：多 sink、轮转、级别、采样统计、Reload）
+│
+│  # 公开包（应用可以 import）
+├── config/                 # 配置 + 泛型加载器 Source.Load[T]（TOML）
+├── logging/                # 日志装配 + request id + trace_id 注入
 ├── slogx/                  # geth 风格 slog handler（terminal/json/logfmt、采样、SwapHandler）
 ├── auth/                   # API Key + JWT（支持运行期 Reload）
 ├── apierror/               # 传输无关错误
-├── telemetry/              # OpenTelemetry 初始化
-├── observability/          # Prometheus 指标
+├── health/                 # 就绪标志 + 命名依赖探针
+├── observability/          # Prometheus 指标（含数据库连接池采集器）
 ├── ratelimit/              # 按 key 的 token bucket（运行期 SetRate）
-├── reload/                 # 配置文件监听（fsnotify + 去抖）
 ├── state/                  # 泛型无锁快照 Snapshot[T]
-├── workerpool/             # 有界 goroutine 池
-├── jsonrpc/                # JSON-RPC 2.0：Dispatcher（含 RegisterTyped）+ Client（含 Call）
-├── store/                  # 存储接口；store/redisx 为 Redis 分钟桶实现
-├── transport/http/         # Hertz：REST 基础路由、/rpc、中间件链（认证/限流/追踪/日志）
+├── jsonrpc/                # JSON-RPC 2.0：Dispatcher（RegisterTyped）+ Client（Call）
+├── store/                  # 存储接口（Recorder / TimeSeries）
+│   ├── redis/              #   Redis：单机 / Cluster / Sentinel + 分钟桶
+│   └── postgres/           #   PostgreSQL：pgx 连接池 + 健康探针
+├── transport/http/         # Hertz：/rpc、中间件链（认证/限流/追踪/日志）
 ├── transport/grpc/         # grpc-go：拦截器、health、reflection、ToStatus
 ├── transport/tcp/          # netpoll：行分隔 JSON-RPC + 有界 worker pool
-├── admin/                  # 运维端口：metrics / pprof / health / loglevel / logstats / config / reload / ts
-└── examples/
-    ├── app/                # 示例应用（greeter）：config / bindings / cmd / e2e 测试
-    └── kitex/              # Kitex 服务间 RPC 示例（不进入库依赖）
+│
+│  # 实现细节（不对外，应用无需 import）
+└── internal/
+    ├── admin/              # 运维端口
+    ├── reload/             # 配置文件监听
+    ├── telemetry/          # OpenTelemetry 初始化
+    ├── version/            # 库自身构建信息（应用用自己的版本变量）
+    └── workerpool/         # 有界 goroutine 池（tcp 使用）
+
+examples/
+├── app/                    # 示例应用（greeter）：config / bindings / cmd / e2e 测试
+└── kitex/                  # Kitex 服务间 RPC 示例（不进入库依赖）
 ```
 
 ## API 速查
@@ -163,6 +175,9 @@ app.Logger()            // *slog.Logger
 app.Metrics()           // *observability.Metrics
 app.Auth()              // *auth.Authenticator
 app.Recorder()          // store.Recorder（未启用 Redis 时为 nil）
+app.Store()             // *redis.Store（未启用时为 nil）
+app.Postgres()          // *postgres.DB（未启用时为 nil）
+app.Health()            // *health.Ready，可注册自己的依赖探针
 app.Config()            // 当前生效配置（未脱敏）
 app.CurrentConfig()     // 脱敏快照（admin /debug/config 用）
 app.HTTPAddr() / GRPCAddr() / TCPAddr() / AdminAddr()
@@ -175,7 +190,7 @@ app.Reload()            // 手动重载配置
 
 ```go
 // 泛型方法：T 是应用配置类型，*T 必须实现 Configurable（SetDefaults/Validate）
-cfg, err := (gosvc.Source{Path: "config.json", EnvPrefix: "MYAPP"}).Load[Config]()
+cfg, err := (gosvc.Source{Path: "config.toml", EnvPrefix: "MYAPP", Strict: true}).Load[Config]()
 
 // 嵌入 gosvc.Config 即自动获得 SetDefaults/Validate/ApplyEnv，按需覆盖
 func (c *Config) SetDefaults() { c.Config.SetDefaults(); /* 应用默认值 */ }
@@ -242,28 +257,107 @@ config.Update(func(cur *RouteTable) *RouteTable { ... })  // CAS 循环
 
 ## 配置参考
 
-```json
-{
-  "service": { "name": "myapp", "env": "dev" },
-  "http": { "host": "0.0.0.0", "port": 8080, "readTimeout": "10s", "writeTimeout": "10s",
-            "idleTimeout": "60s", "shutdownTimeout": "10s", "maxBodyBytes": 1048576 },
-  "grpc": { "host": "0.0.0.0", "port": 9090, "shutdownTimeout": "10s" },
-  "tcp": { "enabled": false, "host": "0.0.0.0", "port": 7070, "workers": 4, "queueSize": 1024,
-           "maxFrameBytes": 1048576, "readTimeout": "60s", "shutdownTimeout": "5s" },
-  "admin": { "host": "127.0.0.1", "port": 6060 },
-  "log": {
-    "level": "info", "format": "terminal", "output": "stdout", "color": "auto", "addSource": false,
-    "file": { "path": "logs/app.log", "maxSizeMB": 100, "maxBackups": 5, "maxAgeDays": 7, "compress": true },
-    "sampling": { "enabled": false, "initial": 100, "thereafter": 100, "tick": "1s" }
-  },
-  "limiter": { "rps": 0, "burst": 0 },
-  "auth": { "enabled": false, "apiKeys": [], "jwt": { "secret": "", "issuer": "myapp", "audience": "" } },
-  "telemetry": { "enabled": false, "otlpEndpoint": "127.0.0.1:4318", "insecure": true, "sampleRatio": 1.0 },
-  "storage": { "redis": { "enabled": false, "addr": "127.0.0.1:6379", "password": "", "db": 0,
-                          "prefix": "myapp", "bucketTtl": "25h", "queueSize": 4096 } },
+TOML 文件；优先级：内置默认值 < 文件 < 环境变量。时长写字符串（`"10s"`、`"1h30m"`）或数字（秒）。
+`Source.Strict = true` 会拒绝未知键，能在启动时抓出拼写错误。
 
-  "database": { "dsn": "postgres://localhost/app" }
-}
+```toml
+[service]
+name = "myapp"
+env = "dev"
+
+[http]
+host = "0.0.0.0"
+port = 8080
+readTimeout = "10s"
+writeTimeout = "10s"
+idleTimeout = "60s"
+shutdownTimeout = "10s"
+maxBodyBytes = 1048576
+
+[grpc]
+host = "0.0.0.0"
+port = 9090
+shutdownTimeout = "10s"
+
+[tcp]
+enabled = false
+host = "0.0.0.0"
+port = 7070
+workers = 4
+queueSize = 1024
+maxFrameBytes = 1048576
+readTimeout = "60s"
+shutdownTimeout = "5s"
+
+[admin]
+host = "127.0.0.1"
+port = 6060
+
+[log]
+level = "info"
+format = "terminal"       # auto | terminal | json | logfmt
+output = "stdout"         # stdout | file | both
+color = "auto"
+addSource = false
+
+[log.file]
+path = "logs/app.log"
+maxSizeMB = 100
+maxBackups = 5
+maxAgeDays = 7
+compress = true
+
+[log.sampling]
+enabled = false
+initial = 100
+thereafter = 100
+tick = "1s"
+
+[limiter]
+rps = 0
+burst = 0
+
+[auth]
+enabled = false
+apiKeys = []
+
+[auth.jwt]
+secret = ""
+issuer = "myapp"
+audience = ""
+
+[telemetry]
+enabled = false
+otlpEndpoint = "127.0.0.1:4318"
+insecure = true
+sampleRatio = 1.0
+batchTimeout = "5s"
+
+[storage.redis]
+enabled = false
+mode = "single"            # single | cluster | sentinel
+addr = "127.0.0.1:6379"    # single
+addrs = []                 # cluster 种子节点 / sentinel 节点
+masterName = ""            # sentinel
+password = ""
+db = 0
+prefix = "myapp"
+bucketTtl = "25h"
+queueSize = 4096
+poolSize = 0
+
+[storage.postgres]
+enabled = false
+dsn = "postgres://user:pass@localhost/app?sslmode=disable"
+maxOpenConns = 16
+maxIdleConns = 4
+connMaxLifetime = "1h"
+connMaxIdleTime = "10m"
+pingTimeout = "3s"
+
+# 应用自己的段
+[database]
+dsn = "postgres://localhost/app"
 ```
 
 ## 日志
@@ -271,19 +365,62 @@ config.Update(func(cur *RouteTable) *RouteTable { ... })  // CAS 循环
 两层结构：`slogx`（一行长什么样，零依赖）与 `logging`（写到哪、什么级别、带什么字段）。
 
 ```
-INFO  2026-09-27T01:31:46.481Z middleware.go:47   - http request   service=myapp env=dev request_id=... method=GET route=/api/v1/orders status=200
+INFO  2026-09-27T01:31:46.481Z middleware.go:47   - http request   service=myapp env=dev request_id=... trace_id=638ec9c8... method=GET route=/api/v1/orders status=200
 ```
 
 - `format`: `auto`（dev→terminal，其它→json）| `terminal` | `json` | `logfmt`；
 - `output`: `stdout`（推荐，交给平台收集）| `file` | `both`（终端彩色、文件固定 JSON + lumberjack 轮转）；
 - **采样**：按 `(级别, 消息)` 计数，每窗口前 `initial` 条必出、之后每 `thereafter` 条抽 1 条，`warn`/`error` 豁免；
+- **日志与链路关联**：开启 tracing 后，HTTP/gRPC/TCP 的请求日志自动带 `trace_id` / `span_id`
+  （`logging.WithTrace(ctx)` 由各传输在 span 创建后注入），在 Jaeger/Tempo 里可以按 trace 反查日志；
 - 运行期改级别 `PUT /debug/loglevel`，采样计数 `GET /debug/logstats`。
+
+## 存储与就绪
+
+### Redis（时间序列）
+
+- `mode`: `single`（`addr`）| `cluster`（`addrs` 种子节点）| `sentinel`（`addrs` + `masterName`），
+  由 go-redis 的 universal client 统一处理；
+- 请求路径只做非阻塞入队，后台单写者聚合后按**分钟桶**批量写：`{prefix}:ts:{metric}:{yyyyMMddHHmm}`，带 TTL；
+- 查询：`GET /debug/ts?metric=http.requests:/api/v1/hello&minutes=60`；
+- 环境变量：`GOSVC_REDIS_ADDR`（单机模式快捷方式）。
+
+### PostgreSQL
+
+```toml
+[storage.postgres]
+enabled = true
+dsn = "postgres://user:pass@localhost/app?sslmode=disable"
+maxOpenConns = 16
+maxIdleConns = 4
+connMaxLifetime = "1h"
+```
+
+- 基于 `database/sql` + pgx，启动时 Ping（带 `pingTimeout`），失败即拒绝启动；
+- 连接池参数在启动时应用；池指标自动注册：`gosvc_db_pool_open_connections`、
+  `in_use_connections`、`idle_connections`、`wait_total`、`max_open_connections`；
+- 环境变量：`GOSVC_POSTGRES_DSN`；
+- 使用：`app.Postgres()` 拿到 `*sql.DB` 包装，直接查询即可。
+
+### 就绪探针
+
+`readyz` 会聚合命名依赖探针（PostgreSQL 启用时自动注册），返回逐项状态：
+
+```json
+{"status":"not_ready","checks":{"postgres":"dial tcp 127.0.0.1:5432: connect: connection refused"}}
+```
+
+应用也可以注册自己的探针：
+
+```go
+app.Health().AddCheck("redis", func(ctx context.Context) error { return redisClient.Ping(ctx).Err() })
+```
 
 ## 运维端点（admin 端口）
 
 | 端点 | 说明 |
 |---|---|
-| `GET /healthz` / `GET /readyz` | 存活 / 就绪（k8s 探针可用 `app -healthcheck <url>`） |
+| `GET /healthz` / `GET /readyz` | 存活 / 就绪（含依赖探针明细；k8s 探针可用 `app -healthcheck <url>`） |
 | `GET /metrics` | Prometheus（HTTP / JSON-RPC / gRPC / Go runtime） |
 | `GET /debug/pprof/*` | CPU、heap、goroutine |
 | `GET/PUT /debug/loglevel` | 查看/修改日志级别 |
@@ -324,10 +461,10 @@ distroless + 非 root；admin 端口默认只绑 `127.0.0.1`；TCP 传输不做 
 
 ## Roadmap
 
-- [ ] Redis Cluster / Sentinel 客户端
 - [ ] 前端静态资源 embed 辅助（Hertz StaticFS + 构建产物）
-- [ ] OpenTelemetry 日志桥接（trace_id 注入日志）
 - [ ] 可选的结构化访问日志（access log 单独 sink）
+- [ ] 配置热更新支持 Postgres/Redis 连接的优雅重建
+- [ ] 示例：把 trace_id 注入到 OTLP 日志导出（logs signal）
 
 ## 重命名模块
 

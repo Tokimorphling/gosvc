@@ -5,14 +5,15 @@
 //     writer, so the request path never talks to Redis;
 //   - reads use per-minute keys with MGET-style pipelines instead of scanning
 //     an unbounded sorted set.
-package redisx
+package redis
 
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	goredis "github.com/redis/go-redis/v9"
 
 	"example.com/gosvc/config"
 	"example.com/gosvc/store"
@@ -25,27 +26,21 @@ const (
 
 // Store is a Redis backed time-series store.
 type Store struct {
-	client *redis.Client
+	client goredis.UniversalClient
 	prefix string
 	ttl    time.Duration
 }
 
-// New connects to Redis and verifies connectivity.
+// New connects to Redis and verifies connectivity. It supports single node,
+// cluster and sentinel deployments through go-redis' universal client.
 func New(ctx context.Context, cfg config.RedisConfig) (*Store, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr:         cfg.Addr,
-		Password:     cfg.Password,
-		DB:           cfg.DB,
-		DialTimeout:  3 * time.Second,
-		ReadTimeout:  2 * time.Second,
-		WriteTimeout: 2 * time.Second,
-	})
+	client := goredis.NewUniversalClient(universalOptions(cfg))
 
 	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	if err := client.Ping(pingCtx).Err(); err != nil {
 		_ = client.Close()
-		return nil, fmt.Errorf("redis ping %s: %w", cfg.Addr, err)
+		return nil, fmt.Errorf("redis ping: %w", err)
 	}
 
 	prefix := cfg.Prefix
@@ -53,6 +48,30 @@ func New(ctx context.Context, cfg config.RedisConfig) (*Store, error) {
 		prefix = "gosvc"
 	}
 	return &Store{client: client, prefix: prefix, ttl: cfg.BucketTTL.D()}, nil
+}
+
+// universalOptions maps the configuration onto go-redis' universal client,
+// which selects the single node, cluster or sentinel implementation.
+func universalOptions(cfg config.RedisConfig) *goredis.UniversalOptions {
+	options := &goredis.UniversalOptions{
+		Password:     cfg.Password,
+		DB:           cfg.DB,
+		PoolSize:     cfg.PoolSize,
+		DialTimeout:  3 * time.Second,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+	}
+
+	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
+	case "cluster":
+		options.Addrs = cfg.Addrs
+	case "sentinel":
+		options.Addrs = cfg.Addrs
+		options.MasterName = cfg.MasterName
+	default:
+		options.Addrs = []string{cfg.Addr}
+	}
+	return options
 }
 
 func (s *Store) key(metric string, t time.Time) string {
@@ -95,18 +114,18 @@ func (s *Store) Range(ctx context.Context, metric string, from, to time.Time) ([
 	}
 
 	pipe := s.client.Pipeline()
-	cmds := make([]*redis.StringCmd, len(keys))
+	cmds := make([]*goredis.StringCmd, len(keys))
 	for i, key := range keys {
 		cmds[i] = pipe.Get(ctx, key)
 	}
-	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+	if _, err := pipe.Exec(ctx); err != nil && err != goredis.Nil {
 		return nil, err
 	}
 
 	buckets := make([]store.Bucket, 0, len(keys))
 	for i, cmd := range cmds {
 		value, err := cmd.Float64()
-		if err == redis.Nil {
+		if err == goredis.Nil {
 			continue
 		}
 		if err != nil {

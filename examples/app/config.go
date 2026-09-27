@@ -16,13 +16,13 @@ import (
 type Config struct {
 	gosvc.Config
 
-	Greeting GreetingConfig `json:"greeting"`
+	Greeting GreetingConfig `json:"greeting" toml:"greeting"`
 }
 
 // GreetingConfig holds application-specific settings.
 type GreetingConfig struct {
-	Prefix     string `json:"prefix"`
-	MaxNameLen int    `json:"maxNameLen"`
+	Prefix     string `json:"prefix" toml:"prefix"`
+	MaxNameLen int    `json:"maxNameLen" toml:"maxNameLen"`
 }
 
 // SetDefaults fills the runtime defaults and then the application ones. The
@@ -56,9 +56,10 @@ func (c *Config) Validate() error {
 // Load reads the application configuration: defaults < file < environment.
 //
 // config.Source.Load is generic; Config is checked at compile time to satisfy
-// config.Configurable through its pointer type.
+// config.Configurable through its pointer type. Strict mode rejects unknown
+// keys, which catches typos in the TOML file.
 func Load(path, envPrefix string) (*Config, error) {
-	cfg, err := (config.Source{Path: path, EnvPrefix: envPrefix}).Load[Config]()
+	cfg, err := (config.Source{Path: path, EnvPrefix: envPrefix, Strict: true}).Load[Config]()
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}

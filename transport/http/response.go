@@ -9,7 +9,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 
 	"example.com/gosvc/apierror"
-	"example.com/gosvc/reqid"
+	"example.com/gosvc/logging"
 )
 
 type errorBody struct {
@@ -43,7 +43,7 @@ func WriteError(ctx context.Context, c *app.RequestContext, err error) {
 	writeJSON(c, statusFromKind(kind), errorBody{Error: errorInfo{
 		Code:      string(kind),
 		Message:   apierror.ClientMessage(err),
-		RequestID: reqid.From(ctx),
+		RequestID: logging.RequestID(ctx),
 	}})
 }
 
@@ -73,7 +73,7 @@ func writeInternalError(ctx context.Context, c *app.RequestContext, message stri
 	writeJSON(c, 500, errorBody{Error: errorInfo{
 		Code:      string(apierror.KindInternal),
 		Message:   message,
-		RequestID: reqid.From(ctx),
+		RequestID: logging.RequestID(ctx),
 	}})
 }
 

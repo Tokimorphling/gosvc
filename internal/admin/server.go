@@ -21,7 +21,6 @@ import (
 	"example.com/gosvc/logging"
 	"example.com/gosvc/observability"
 	"example.com/gosvc/store"
-	"example.com/gosvc/version"
 )
 
 // Options wires the admin server.
@@ -34,6 +33,8 @@ type Options struct {
 	TimeSeries    store.TimeSeries
 	Reload        func() error
 	CurrentConfig func() *config.Config
+	// Version is reported by GET /version.
+	Version string
 }
 
 // Server is the operations HTTP server.
@@ -57,15 +58,21 @@ func New(opts Options) (*Server, error) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if !opts.Ready.IsReady() {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
-			return
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ready, details := opts.Ready.Check(r.Context())
+		status := http.StatusOK
+		body := map[string]any{"status": "ready"}
+		if !ready {
+			status = http.StatusServiceUnavailable
+			body["status"] = "not_ready"
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+		if details != nil {
+			body["checks"] = details
+		}
+		writeJSON(w, status, body)
 	})
 	mux.HandleFunc("/version", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"version": version.Full()})
+		writeJSON(w, http.StatusOK, map[string]string{"version": opts.Version})
 	})
 
 	registerLogLevel(mux, opts)

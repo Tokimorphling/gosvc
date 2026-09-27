@@ -19,15 +19,18 @@ import (
 	"time"
 
 	"github.com/cloudwego/netpoll"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"example.com/gosvc/config"
 	"example.com/gosvc/health"
+	"example.com/gosvc/internal/workerpool"
 	"example.com/gosvc/jsonrpc"
+	"example.com/gosvc/logging"
 	"example.com/gosvc/observability"
 	"example.com/gosvc/ratelimit"
-	"example.com/gosvc/reqid"
 	"example.com/gosvc/store"
-	"example.com/gosvc/workerpool"
 )
 
 const requestTimeout = 5 * time.Second
@@ -49,6 +52,8 @@ type Options struct {
 	// Dispatcher is shared with the HTTP /rpc endpoint so methods are
 	// registered once.
 	Dispatcher *jsonrpc.Dispatcher
+	// Tracer records one span per request. Optional.
+	Tracer trace.Tracer
 }
 
 // Server is the netpoll based JSON-RPC server.
@@ -62,6 +67,7 @@ type Server struct {
 	limiter    *ratelimit.Limiter
 	recorder   store.Recorder
 	ready      *health.Ready
+	tracer     trace.Tracer
 }
 
 type connState struct {
@@ -91,6 +97,7 @@ func New(opts Options) (*Server, error) {
 		limiter:    opts.Limiter,
 		recorder:   opts.Recorder,
 		ready:      opts.Ready,
+		tracer:     opts.Tracer,
 	}
 	s.pool.SetPanicHandler(func(recovered any) {
 		opts.Logger.Error("tcp worker panic", "panic", recovered)
@@ -174,7 +181,26 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 func (s *Server) process(connection netpoll.Connection, parent context.Context, body []byte) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), requestTimeout)
 	defer cancel()
-	ctx = reqid.With(ctx, reqid.New())
+	ctx = logging.WithRequestID(ctx, logging.NewRequestID())
+
+	if s.tracer != nil {
+		var span trace.Span
+		ctx, span = s.tracer.Start(ctx, "tcp.request",
+			trace.WithSpanKind(trace.SpanKindServer),
+			trace.WithAttributes(
+				attribute.String("network.transport", "tcp"),
+				attribute.String("rpc.system", "jsonrpc"),
+				attribute.String("server.address", connection.RemoteAddr().String()),
+			))
+		defer span.End()
+		ctx = logging.WithTrace(ctx)
+
+		defer func() {
+			if recover() != nil {
+				span.SetStatus(codes.Error, "panic")
+			}
+		}()
+	}
 
 	response, ok := s.dispatcher.Serve(ctx, body)
 	if s.recorder != nil {
