@@ -91,7 +91,7 @@ func (c *Client) Notify(ctx context.Context, method string, params any) error {
 	if c == nil || c.transport == nil {
 		return fmt.Errorf("jsonrpc: client has no transport")
 	}
-	body, err := c.encodeRequest(0, method, params, true)
+	body, err := EncodeNotification(method, params)
 	if err != nil {
 		return err
 	}
@@ -107,7 +107,7 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) encodeRequest(id int64, method string, params any, notification bool) ([]byte, error) {
-	encodedParams, err := encodeParams(params)
+	encodedParams, err := encodeParamsOf(params)
 	if err != nil {
 		return nil, err
 	}
@@ -133,27 +133,21 @@ func (c *Client) encodeRequest(id int64, method string, params any, notification
 	return body, nil
 }
 
-// encodeParams drops empty params so methods without arguments stay clean.
-func encodeParams[Req any](req Req) (json.RawMessage, error) {
-	raw, err := sonic.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("jsonrpc: encode params: %w", err)
-	}
-	switch string(raw) {
-	case "null", "{}":
-		return nil, nil
-	}
-	return raw, nil
-}
-
 // ClientOption customises the convenience clients.
 type ClientOption func(*clientOptions)
 
 type clientOptions struct {
-	httpClient *http.Client
-	headers    http.Header
-	timeout    time.Duration
+	httpClient     *http.Client
+	headers        http.Header
+	timeout        time.Duration
+	onNotification NotificationHandler
 }
+
+// NotificationHandler receives server-originated notifications pushed over a
+// transport that supports them (the TCP transport). method is the JSON-RPC
+// method name; params is the raw params value, or nil when the frame carried
+// none. Handlers run on the transport's read loop and must not block.
+type NotificationHandler func(method string, params json.RawMessage)
 
 // WithHTTPClient supplies the HTTP client used by NewHTTPClient.
 func WithHTTPClient(client *http.Client) ClientOption {
@@ -173,6 +167,13 @@ func WithHeader(key, value string) ClientOption {
 // WithTimeout sets the per-request timeout.
 func WithTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.timeout = d }
+}
+
+// WithNotificationHandler installs a callback for server-originated
+// notifications. It only has an effect on transports that support them
+// (NewTCPClient); HTTP is strictly request/response and never invokes it.
+func WithNotificationHandler(fn NotificationHandler) ClientOption {
+	return func(o *clientOptions) { o.onNotification = fn }
 }
 
 // NewHTTPClient posts to baseURL + "/rpc", the endpoint served by
@@ -196,13 +197,14 @@ func NewHTTPClient(baseURL string, opts ...ClientOption) *Client {
 }
 
 // NewTCPClient speaks the line-delimited JSON-RPC protocol served by
-// transport/tcp.
+// transport/tcp, including server-pushed notifications when
+// WithNotificationHandler is supplied.
 func NewTCPClient(addr string, opts ...ClientOption) *Client {
 	o := clientOptions{}
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return NewClient(&TCPTransport{Addr: addr, Timeout: o.timeout})
+	return NewClient(&TCPTransport{Addr: addr, Timeout: o.timeout, OnNotification: o.onNotification})
 }
 
 // HTTPTransport posts JSON-RPC bodies to an HTTP endpoint.
@@ -298,6 +300,9 @@ func (t *HTTPTransport) do(ctx context.Context, request []byte) (*http.Response,
 type TCPTransport struct {
 	Addr    string
 	Timeout time.Duration
+	// OnNotification, when set, receives server-originated notification
+	// frames (no id). It runs on the read loop and must not block.
+	OnNotification NotificationHandler
 
 	mu      sync.Mutex
 	conn    net.Conn
@@ -447,10 +452,19 @@ func (t *TCPTransport) readLoop(conn net.Conn, reader *bufio.Reader) {
 			return
 		}
 		var head struct {
-			ID json.RawMessage `json:"id"`
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
 		}
-		if sonic.Unmarshal(line, &head) != nil || len(head.ID) == 0 {
-			continue // not routable (for example a parse error with id null)
+		if sonic.Unmarshal(line, &head) != nil {
+			continue
+		}
+		if len(head.ID) == 0 {
+			// No id: either unsolicited traffic or a server notification.
+			if head.Method != "" && t.OnNotification != nil {
+				t.OnNotification(head.Method, head.Params)
+			}
+			continue
 		}
 		key := string(head.ID)
 		t.mu.Lock()

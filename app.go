@@ -471,6 +471,11 @@ func (a *App) Metrics() *observability.Metrics { return a.metrics }
 // Auth returns the authenticator used by the HTTP and gRPC transports.
 func (a *App) Auth() *auth.Authenticator { return a.auth }
 
+// JSONRPCDispatcher returns the shared JSON-RPC dispatcher used by the HTTP
+// /rpc endpoint and the TCP transport, so HTTP registration callbacks can add
+// methods in the same place they wire routes.
+func (a *App) JSONRPCDispatcher() *jsonrpc.Dispatcher { return a.dispatcher }
+
 // Recorder returns the time-series recorder, or nil when Redis is disabled.
 func (a *App) Recorder() store.Recorder { return a.recorders.Current() }
 

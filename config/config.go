@@ -83,8 +83,10 @@ type TCPConfig struct {
 	QueueSize       int      `json:"queueSize" toml:"queueSize"` // bounded queue size
 	MaxFrameBytes   int      `json:"maxFrameBytes" toml:"maxFrameBytes"`
 	ReadTimeout     Duration `json:"readTimeout" toml:"readTimeout"`
-	HandlerTimeout  Duration `json:"handlerTimeout" toml:"handlerTimeout"` // per-request business handler budget
-	ShutdownTimeout Duration `json:"shutdownTimeout" toml:"shutdownTimeout"`
+	HandlerTimeout  Duration `json:"handlerTimeout" toml:"handlerTimeout"`   // per-request business handler budget
+	ShutdownTimeout Duration `json:"shutdownTimeout" toml:"shutdownTimeout"` // graceful drain budget
+	NotifyQueueSize int      `json:"notifyQueueSize" toml:"notifyQueueSize"` // per-connection outbound notification queue
+	NotifyPolicy    string   `json:"notifyPolicy" toml:"notifyPolicy"`       // drop | disconnect, applied when the queue is full
 }
 
 // Addr returns the host:port listen address.
@@ -268,6 +270,8 @@ func Default() *Config {
 			ReadTimeout:     Duration(60 * time.Second),
 			HandlerTimeout:  Duration(5 * time.Second),
 			ShutdownTimeout: Duration(5 * time.Second),
+			NotifyQueueSize: 256,
+			NotifyPolicy:    "drop",
 		},
 		Admin: AdminConfig{Host: "127.0.0.1", Port: 6060},
 		Log: LogConfig{
@@ -594,6 +598,14 @@ func (c *Config) Validate() error {
 		}
 		if c.TCP.HandlerTimeout <= 0 {
 			return fmt.Errorf("tcp.handlerTimeout must be positive")
+		}
+		if c.TCP.NotifyQueueSize <= 0 {
+			return fmt.Errorf("tcp.notifyQueueSize must be > 0")
+		}
+		switch strings.ToLower(strings.TrimSpace(c.TCP.NotifyPolicy)) {
+		case "", "drop", "disconnect":
+		default:
+			return fmt.Errorf("tcp.notifyPolicy must be one of drop|disconnect, got %q", c.TCP.NotifyPolicy)
 		}
 	}
 

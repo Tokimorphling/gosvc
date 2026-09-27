@@ -37,6 +37,8 @@ maxFrameBytes = 1048576
 readTimeout = "60s"
 handlerTimeout = "5s"     # per-request business handler budget
 shutdownTimeout = "5s"
+notifyQueueSize = 256     # per-connection outbound notification queue
+notifyPolicy = "drop"     # drop | disconnect, applied when the queue is full
 
 [admin]
 host = "127.0.0.1"

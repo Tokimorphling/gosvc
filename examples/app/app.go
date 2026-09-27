@@ -25,10 +25,11 @@ type Options struct {
 }
 
 // Build assembles the runtime and registers the greeter bindings on all
-// transports.
+// transports, including the push examples (TCP sessions, SSE, gRPC streams).
 func Build(opts Options) (*gosvc.App, error) {
 	cfg := opts.Config
 	service := greeter.New(cfg.Service.Name, opts.Version, cfg.Greeting.Prefix, cfg.Greeting.MaxNameLen)
+	events := newEventsBroadcaster()
 
 	runtimeOptions := []gosvc.Option{
 		gosvc.WithLogger(opts.Log),
@@ -46,7 +47,10 @@ func Build(opts Options) (*gosvc.App, error) {
 		return nil, err
 	}
 
-	if err := application.RegisterHTTP(func(h *server.Hertz) { registerHTTP(h, service) }); err != nil {
+	if err := application.RegisterHTTP(func(h *server.Hertz) {
+		registerHTTP(h, service)
+		registerPushBindings(h, application.Metrics(), application.JSONRPCDispatcher(), events)
+	}); err != nil {
 		return nil, err
 	}
 	if err := application.RegisterJSONRPC(func(d *jsonrpc.Dispatcher) { greeter.RegisterJSONRPC(d, service) }); err != nil {

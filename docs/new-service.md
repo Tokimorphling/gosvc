@@ -390,7 +390,7 @@ issuer = "myservice"
 | `auth.*` | 热生效（凭据原子替换） |
 | `limiter.*` | 热生效 |
 | `storage.*` | **重建连接**：新连接就绪后切换，旧连接优雅关闭；失败保留旧连接并记错误 |
-| `service` / `http`（含 `http.cors`）/ `grpc` / `tcp`（含 `tcp.handlerTimeout`）/ `admin`（含 `token`）/ `telemetry` / `log.access.enabled` | 需要重启，重载日志会列出 |
+| `service` / `http`（含 `http.cors`）/ `grpc` / `tcp`（含 `handlerTimeout`、`notifyQueueSize`、`notifyPolicy`）/ `admin`（含 `token`）/ `telemetry` / `log.access.enabled` | 需要重启，重载日志会列出 |
 
 应用自己的段用 `WithOnReload` 处理：
 
@@ -421,6 +421,7 @@ gosvc.WithOnReload(func(cfg *gosvc.Config) error {
 - [ ] `storage.*` 配置 + `/readyz` 探针验证
 - [ ] admin 端口只绑内网（默认 `127.0.0.1`），要暴露就设置 `admin.token`
 - [ ] TCP 传输（如启用）在网关终止 TLS
+- [ ] 需要推送时按传输选型：TCP `Session.Notify`（内部）/ SSE `RegisterSSE`（浏览器）/ gRPC `stream` RPC；订阅端点鉴权随现有中间件链
 - [ ] 容器探针用 `myservice -healthcheck http://127.0.0.1:6060/healthz`
 
 ## 11. 常见坑

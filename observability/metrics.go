@@ -15,12 +15,14 @@ const namespace = "gosvc"
 type Metrics struct {
 	registry *prometheus.Registry
 
-	httpRequests *prometheus.CounterVec
-	httpDuration *prometheus.HistogramVec
-	rpcRequests  *prometheus.CounterVec
-	rpcDuration  *prometheus.HistogramVec
-	grpcRequests *prometheus.CounterVec
-	grpcDuration *prometheus.HistogramVec
+	httpRequests  *prometheus.CounterVec
+	httpDuration  *prometheus.HistogramVec
+	rpcRequests   *prometheus.CounterVec
+	rpcDuration   *prometheus.HistogramVec
+	grpcRequests  *prometheus.CounterVec
+	grpcDuration  *prometheus.HistogramVec
+	notifySent    *prometheus.CounterVec
+	notifyDropped *prometheus.CounterVec
 }
 
 // New builds the registry and registers all collectors.
@@ -62,12 +64,21 @@ func New(service string) *Metrics {
 			Help: "gRPC request latency in seconds.", ConstLabels: labels,
 			Buckets: prometheus.DefBuckets,
 		}, []string{"method"}),
+		notifySent: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "notify_sent_total",
+			Help: "Total number of outbound notifications accepted for delivery.", ConstLabels: labels,
+		}, []string{"transport"}),
+		notifyDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "notify_dropped_total",
+			Help: "Total number of outbound notifications dropped (queue full or session closed).", ConstLabels: labels,
+		}, []string{"transport", "reason"}),
 	}
 
 	registry.MustRegister(
 		m.httpRequests, m.httpDuration,
 		m.rpcRequests, m.rpcDuration,
 		m.grpcRequests, m.grpcDuration,
+		m.notifySent, m.notifyDropped,
 	)
 	return m
 }
@@ -91,4 +102,25 @@ func (m *Metrics) ObserveJSONRPC(method string, code int, d time.Duration) {
 func (m *Metrics) ObserveGRPC(method, code string, d time.Duration) {
 	m.grpcRequests.WithLabelValues(method, code).Inc()
 	m.grpcDuration.WithLabelValues(method).Observe(d.Seconds())
+}
+
+// ObserveNotifySent records one outbound notification accepted for delivery
+// (it is queued for the client; actual delivery is asynchronous). A nil
+// Metrics records nothing.
+func (m *Metrics) ObserveNotifySent(transport string) {
+	if m == nil {
+		return
+	}
+	m.notifySent.WithLabelValues(transport).Inc()
+}
+
+// ObserveNotifyDropped records one outbound notification that was dropped,
+// for example because the per-connection send queue was full (reason
+// "queue_full") or the session was already closed (reason "closed"). A nil
+// Metrics records nothing.
+func (m *Metrics) ObserveNotifyDropped(transport, reason string) {
+	if m == nil {
+		return
+	}
+	m.notifyDropped.WithLabelValues(transport, reason).Inc()
 }

@@ -237,6 +237,131 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("tcp push notifications", func(t *testing.T) {
+		// Subscriber A: raw connection, subscribes and keeps reading.
+		subscriber, err := net.DialTimeout("tcp", application.TCPAddr(), 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial tcp: %v", err)
+		}
+		defer subscriber.Close()
+
+		if _, err := subscriber.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"events.subscribe"}` + "\n")); err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
+		reader := bufio.NewReader(subscriber)
+		if err := subscriber.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read subscribe response: %v", err)
+		}
+		if !strings.Contains(line, `"subscribers":1`) {
+			t.Fatalf("subscribe response = %s", line)
+		}
+
+		// Trigger B: a second connection pokes the broker.
+		trigger, err := net.DialTimeout("tcp", application.TCPAddr(), 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial tcp: %v", err)
+		}
+		defer trigger.Close()
+		if _, err := trigger.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"events.ping"}` + "\n")); err != nil {
+			t.Fatalf("ping: %v", err)
+		}
+
+		// A receives the pushed notification.
+		if err := subscriber.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
+		line, err = reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read pushed notification: %v", err)
+		}
+		if !strings.Contains(line, `"method":"events.pong"`) || strings.Contains(line, `"id":1`) {
+			t.Fatalf("pushed frame must be an id-less notification, got %s", line)
+		}
+
+		// The push is observable as a metric.
+		if !strings.Contains(string(getBody(t, "http://"+application.AdminAddr()+"/metrics")), "gosvc_notify_sent_total") {
+			t.Fatal("metrics output does not contain the notify counter")
+		}
+	})
+
+	t.Run("tcp push subscribe requires the tcp transport", func(t *testing.T) {
+		// events.subscribe through HTTP /rpc must fail with a typed error:
+		// sessions only exist on TCP connections.
+		raw := postJSON(t, httpBase+"/rpc", `{"jsonrpc":"2.0","id":2,"method":"events.subscribe"}`)
+		if !strings.Contains(string(raw), "requires the TCP transport") {
+			t.Fatalf("subscribe over HTTP must be rejected, got %s", raw)
+		}
+	})
+
+	t.Run("grpc server streaming", func(t *testing.T) {
+		conn, err := ggrpc.NewClient(application.GRPCAddr(), ggrpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatalf("dial grpc: %v", err)
+		}
+		defer conn.Close()
+		client := greeterv1.NewGreeterClient(conn)
+
+		streamCtx, streamCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer streamCancel()
+		stream, err := client.WatchGreetings(streamCtx, &greeterv1.WatchGreetingsRequest{Id: 1})
+		if err != nil {
+			t.Fatalf("WatchGreetings: %v", err)
+		}
+
+		updates := 0
+		for {
+			update, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Recv: %v", err)
+			}
+			if update.GetText() != "hello" || update.GetSequence() != int64(updates) {
+				t.Fatalf("update = %+v, want sequence %d", update, updates)
+			}
+			updates++
+			if updates == 2 {
+				break // two updates prove the stream keeps producing
+			}
+		}
+		if err := stream.CloseSend(); err != nil {
+			t.Fatalf("CloseSend: %v", err)
+		}
+	})
+
+	t.Run("sse event stream", func(t *testing.T) {
+		resp, err := http.Get(httpBase + "/api/v1/events")
+		if err != nil {
+			t.Fatalf("GET events: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+			t.Fatalf("content-type = %q", got)
+		}
+
+		scanner := bufio.NewScanner(resp.Body)
+		var data string
+		for scanner.Scan() {
+			if line := scanner.Text(); strings.HasPrefix(line, "data:") {
+				data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				break
+			}
+		}
+		if !strings.Contains(data, "hello from the event stream") {
+			t.Fatalf("first event data = %q", data)
+		}
+		// Closing the response cancels the server-side handler through the
+		// runtime's disconnect detection.
+	})
+
 	t.Run("loglevel runtime control", func(t *testing.T) {
 		body := getBody(t, "http://"+application.AdminAddr()+"/debug/loglevel")
 		if !strings.Contains(string(body), "error") {
@@ -360,6 +485,29 @@ func TestAuthEnforced(t *testing.T) {
 		authedCtx := metadata.AppendToOutgoingContext(callCtx, "x-api-key", "test-key")
 		if _, err := client.SayHello(authedCtx, &greeterv1.SayHelloRequest{Name: "x"}); err != nil {
 			t.Fatalf("authenticated SayHello: %v", err)
+		}
+	})
+
+	t.Run("grpc stream auth", func(t *testing.T) {
+		conn, err := ggrpc.NewClient(application.GRPCAddr(), ggrpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatalf("dial grpc: %v", err)
+		}
+		defer conn.Close()
+		client := greeterv1.NewGreeterClient(conn)
+
+		callCtx, callCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer callCancel()
+
+		// Streaming RPCs go through the same auth interceptor chain. The
+		// stream is established lazily, so the rejection surfaces on the
+		// first Recv, not on the opening call.
+		stream, err := client.WatchGreetings(callCtx, &greeterv1.WatchGreetingsRequest{Id: 1})
+		if err == nil {
+			_, err = stream.Recv()
+		}
+		if status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("code = %v, want Unauthenticated on streams", status.Code(err))
 		}
 	})
 }

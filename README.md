@@ -125,6 +125,7 @@ func main() {
 | 无锁状态 | `state.Snapshot[T]` 提供读无锁、写替换的共享状态 |
 | 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 热生效，`storage.*` **重建连接**（新连接就绪后切换，失败保留旧连接且有效配置回滚），其余字段提示 `restartRequired` |
 | 有界并发 | `workerpool`（显式 `ErrFull`/`ErrClosed`）+ netpoll 事件循环 + 每连接写串行化，慢业务不阻塞 IO；TCP 帧长在缓冲前强制（防恶意大帧） |
+| 推送（push） | 三种形态按传输显式提供：TCP 出站 JSON-RPC notification（每连接有界队列 + drop/disconnect 背压策略）、SSE（复用现有中间件链）、gRPC streaming（拦截器链全覆盖）；不做 WebSocket、不做 HTTP/2 server push |
 | 真正的优雅退出 | 四个传输的 `Serve` 都会 join 自己的 drain：`Run` 返回时，在途请求已处理完（受各 `shutdownTimeout` 约束），不会随进程退出被掐断 |
 | 压测器 | `examples/app/cmd/bench` 支持 rest / jsonrpc / grpc |
 
@@ -229,6 +230,71 @@ order, err := client.Call[GetOrderRequest, *Order](ctx, "orders.get", GetOrderRe
 - HTTP 客户端把运行时错误映射（401/429 + `{"error":{"code":"..."}}`）还原成 `*apierror.Error`，调用方按 `apierror.KindOf` 分支即可；
 - 服务端 handler panic 不会丢连接：worker 存活，客户端收到 `internal error` 帧。
 
+## 推送（push）
+
+推送不是 Dispatcher 的通用能力，而是**按传输、显式声明**的一等能力：`RegisterTyped` 的请求/响应模型保持不动。三种形态：
+
+### TCP：出站 JSON-RPC notification
+
+handler 通过 `tcp.SessionFromContext(ctx)` 拿到**本连接的推送会话**并可在请求结束后持有它：
+
+```go
+// "events.subscribe" handler 内
+session := tcptransport.SessionFromContext(ctx)
+if session == nil {
+    return nil, apierror.New(apierror.KindInvalidArgument, "requires the TCP transport")
+}
+broker.Add(session) // 应用自己的订阅表
+
+// 之后任何时候（连接存活期间）
+err := session.Notify("events.pong", map[string]any{"at": time.Now()})
+// 或类型化形式 session.NotifyTyped("events.pong", Pong{At: ...})
+```
+
+背压与生命周期：
+
+- 每连接一个**有界发送队列**（`tcp.notifyQueueSize`，默认 256），独立 pump goroutine 写出；
+- 队列满时按 `tcp.notifyPolicy` 处理：`drop`（默认，返回 `ErrNotifyDropped` + `gosvc_notify_dropped_total{reason="queue_full"}`）或 `disconnect`（断开慢消费者，客户端重连重订阅）；
+- 连接关闭后 `Notify` 返回 `ErrSessionClosed`（pump 的 reaper 会回收死会话）；
+- shutdown 时先广播 going-away（`gosvc.shutdown` notification）再 drain；
+- 会话**惰性创建**：不调用 `SessionFromContext` 的连接零开销（无队列、无 goroutine）。
+
+客户端用 `jsonrpc.NewTCPClient(addr, jsonrpc.WithNotificationHandler(fn))` 接收服务端推送；`fn(method, params)` 在读循环上回调，不要阻塞。
+
+### SSE：HTTP 单向推送
+
+`httptransport.RegisterSSE` 在普通 GET 路由上输出 `text/event-stream`，wire 处理复用 Hertz 官方 `protocol/sse`。**鉴权、限流、追踪、访问日志全部照旧生效**（就是普通路由）；gosvc 开启了 Hertz 的断连感知，客户端断开时 `stream.Done()` 触发，handler 应尽快返回：
+
+```go
+application.RegisterHTTP(func(h *server.Hertz) {
+    httptransport.RegisterSSE(h, "/api/v1/events", application.Metrics(),
+        func(ctx context.Context, stream *httptransport.SSEStream) {
+            if err := stream.Send("greet", payload); err != nil { return } // 客户端已断开
+            heartbeat := time.NewTicker(httptransport.SSEHeartbeat)
+            defer heartbeat.Stop()
+            for {
+                select {
+                case <-stream.Done(): return
+                case <-heartbeat.C:
+                    if err := stream.Ping(); err != nil { return }
+                }
+            }
+        })
+})
+```
+
+慢消费者由 `http.writeTimeout` 兜底（写不出去就断）；长时间空闲请靠 `Ping` 心跳防代理掐连接。
+
+### gRPC：streaming
+
+原生能力：在 proto 里声明 `stream` RPC 即可，**unary 与 stream 拦截器链完全一致**（recovery / request-id / trace / auth / logging / metrics / rate limit）。注意 stream 的鉴权错误在首个 `Recv()` 上浮现（stream 惰性建立）。示例见 `examples/app` 的 `WatchGreetings`。
+
+### 明确不做
+
+- **WebSocket**：双向交互才需要，握手鉴权/子协议/心跳是一整套新面，等真实需求出现再说；
+- **HTTP/2 server push**：已废弃的浏览器特性，与业务推送无关；
+- JSON-RPC over HTTP 保持无状态请求-响应，不提供推送（要推送用 SSE 或 TCP）。
+
 ### 错误映射
 
 ```go
@@ -312,6 +378,8 @@ maxFrameBytes = 1048576
 readTimeout = "60s"
 handlerTimeout = "5s"     # 单个请求的业务处理预算
 shutdownTimeout = "5s"
+notifyQueueSize = 256     # 每连接出站 notification 队列上限
+notifyPolicy = "drop"     # 队列满时：drop（丢弃+计数）| disconnect（断开慢消费者）
 
 [admin]
 host = "127.0.0.1"

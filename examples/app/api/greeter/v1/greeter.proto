@@ -10,6 +10,10 @@ service Greeter {
   rpc SayHello(SayHelloRequest) returns (SayHelloResponse);
   rpc GetGreeting(GetGreetingRequest) returns (GetGreetingResponse);
   rpc Info(InfoRequest) returns (InfoResponse);
+  // Server-streaming demo: the same domain data, streamed until the client
+  // cancels. Stream RPCs go through the same interceptor chain (auth, rate
+  // limit, metrics, logging) as unary ones.
+  rpc WatchGreetings(WatchGreetingsRequest) returns (stream GreetingUpdate);
 }
 
 message SayHelloRequest {
@@ -40,4 +44,14 @@ message InfoResponse {
   string started_at = 3;
   int64 uptime_seconds = 4;
   int64 requests = 5;
+}
+
+message WatchGreetingsRequest {
+  int64 id = 1;
+}
+
+message GreetingUpdate {
+  int64 id = 1;
+  string text = 2;
+  int64 sequence = 3;
 }

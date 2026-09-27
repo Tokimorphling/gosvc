@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -253,6 +254,69 @@ func TestClientTCPPipelinesConcurrentCalls(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
 		t.Fatalf("slow call returned in %s, want at least the server delay", elapsed)
+	}
+}
+
+// TestClientTCPReceivesNotifications verifies that the TCP transport routes
+// server-originated notifications (frames without an id) to the handler while
+// responses keep being matched to their calls.
+func TestClientTCPReceivesNotifications(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	notifications := make(chan string, 4)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if sonic.Unmarshal(line, &req) != nil || req.ID == nil {
+				continue
+			}
+			// Push a notification before the response: the client must route
+			// it to the handler instead of confusing it with the reply.
+			_, _ = conn.Write([]byte(`{"jsonrpc":"2.0","method":"events.tick","params":{"n":1}}` + "\n"))
+			resp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"message":"hello"}}`, req.ID)
+			_, _ = conn.Write([]byte(resp + "\n"))
+		}
+	}()
+
+	client := NewTCPClient(listener.Addr().String(), WithNotificationHandler(func(method string, params json.RawMessage) {
+		if method == "events.tick" {
+			notifications <- string(params)
+		}
+	}))
+	defer client.Close()
+
+	resp, err := client.Call[echoRequest, *echoResponse](context.Background(), "echo", echoRequest{Name: "x"})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if resp.Message != "hello" {
+		t.Fatalf("resp = %+v", resp)
+	}
+
+	select {
+	case params := <-notifications:
+		if !strings.Contains(params, `"n":1`) {
+			t.Fatalf("params = %s", params)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("notification handler was not invoked")
 	}
 }
 

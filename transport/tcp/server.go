@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/netpoll"
 	"go.opentelemetry.io/otel/attribute"
@@ -71,14 +72,27 @@ type Server struct {
 	dispatcher *jsonrpc.Dispatcher
 	cfg        config.TCPConfig
 	logger     *slog.Logger
+	metrics    *observability.Metrics
 	limiter    *ratelimit.Limiter
 	recorder   store.Recorder
 	ready      *health.Ready
 	tracer     trace.Tracer
+
+	// sessions tracks live push sessions for the shutdown broadcast.
+	sessions sync.Map
 }
 
+// connState is created per connection on the event loop and carried in the
+// connection context. It owns the per-connection write lock and, lazily, the
+// push session.
 type connState struct {
-	writeMu sync.Mutex
+	server *Server
+	conn   netpoll.Connection
+	remote string
+
+	writeMu   sync.Mutex
+	sessionMu sync.Mutex
+	session   *Session
 }
 
 type connStateKey struct{}
@@ -101,10 +115,14 @@ func New(opts Options) (*Server, error) {
 		dispatcher: dispatcher,
 		cfg:        opts.Config.TCP,
 		logger:     opts.Logger,
+		metrics:    opts.Metrics,
 		limiter:    opts.Limiter,
 		recorder:   opts.Recorder,
 		ready:      opts.Ready,
 		tracer:     opts.Tracer,
+	}
+	if s.metrics == nil {
+		s.metrics = observability.New("gosvc")
 	}
 	s.pool.SetPanicHandler(func(recovered any) {
 		opts.Logger.Error("tcp worker panic", "panic", recovered)
@@ -112,8 +130,9 @@ func New(opts Options) (*Server, error) {
 
 	eventLoop, err := netpoll.NewEventLoop(
 		s.handleRequest,
-		netpoll.WithOnPrepare(func(netpoll.Connection) context.Context {
-			return context.WithValue(context.Background(), connStateKey{}, &connState{})
+		netpoll.WithOnPrepare(func(connection netpoll.Connection) context.Context {
+			state := &connState{server: s, conn: connection, remote: connection.RemoteAddr().String()}
+			return context.WithValue(context.Background(), connStateKey{}, state)
 		}),
 		netpoll.WithReadTimeout(opts.Config.TCP.ReadTimeout.D()),
 	)
@@ -131,20 +150,24 @@ func (s *Server) Dispatcher() *jsonrpc.Dispatcher { return s.dispatcher }
 func (s *Server) Addr() string { return s.listener.Addr().String() }
 
 // Serve blocks until ctx is cancelled or the event loop fails. When ctx is
-// cancelled it waits for the event loop to stop and for queued requests to
-// drain before returning, so callers (gosvc.App.Run) do not exit the process
-// while in-flight requests are still running.
+// cancelled it broadcasts a going-away notification to live push sessions,
+// waits for the event loop to stop and for queued requests to drain before
+// returning, so callers (gosvc.App.Run) do not exit the process while
+// in-flight requests are still running.
 func (s *Server) Serve(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		<-ctx.Done()
+		s.notifyShutdown()
+		time.Sleep(shutdownGrace) // let pumps flush the going-away frames
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.D())
 		defer cancel()
 		if err := s.eventLoop.Shutdown(shutdownCtx); err != nil {
 			s.logger.Warn("tcp shutdown returned error", "error", err)
 		}
 		s.pool.Stop()
+		s.closeSessions()
 	}()
 
 	err := s.eventLoop.Serve(s.listener)
@@ -152,10 +175,37 @@ func (s *Server) Serve(ctx context.Context) error {
 		return fmt.Errorf("tcp serve: %w", err)
 	}
 	// eventLoop.Serve returns when the loop stops; the shutdown goroutine is
-	// still draining the worker pool, so join it.
+	// still draining the worker pool and pushing sessions, so join it.
 	<-done
 	return nil
 }
+
+// notifyShutdown enqueues the going-away notification on every live session,
+// best-effort: sessions with a full queue simply miss it.
+func (s *Server) notifyShutdown() {
+	s.sessions.Range(func(key, value any) bool {
+		if session, ok := value.(*Session); ok {
+			_ = session.enqueue(shuttingDownFrame)
+		}
+		return true
+	})
+}
+
+// closeSessions tears down every live session (used on shutdown).
+func (s *Server) closeSessions() {
+	s.sessions.Range(func(key, value any) bool {
+		if session, ok := value.(*Session); ok {
+			session.close()
+		}
+		return true
+	})
+}
+
+// addSession registers a live session for the shutdown broadcast.
+func (s *Server) addSession(session *Session) { s.sessions.Store(session, struct{}{}) }
+
+// removeSession drops a session from the registry.
+func (s *Server) removeSession(session *Session) { s.sessions.Delete(session) }
 
 // handleRequest runs on the netpoll event loop: it must only read and dispatch.
 func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connection) error {

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"strconv"
+	"time"
 
 	"github.com/bytedance/sonic"
 	"github.com/cloudwego/hertz/pkg/app"
@@ -133,4 +134,33 @@ func (g *greeterServer) Info(ctx context.Context, _ *greeterv1.InfoRequest) (*gr
 		UptimeSeconds: resp.UptimeSeconds,
 		Requests:      resp.Requests,
 	}, nil
+}
+
+// WatchGreetings is the server-streaming demo: it streams the greeting and
+// keeps re-sending it until the client cancels, going through the same
+// interceptor chain (auth, rate limit, metrics) as the unary RPCs.
+func (g *greeterServer) WatchGreetings(request *greeterv1.WatchGreetingsRequest, stream greeterv1.Greeter_WatchGreetingsServer) error {
+	greeting, err := g.service.GetGreeting(stream.Context(), request.GetId())
+	if err != nil {
+		return grpctransport.ToStatus(err)
+	}
+
+	sequence := int64(0)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := stream.Send(&greeterv1.GreetingUpdate{
+			Id:       greeting.ID,
+			Text:     greeting.Text,
+			Sequence: sequence,
+		}); err != nil {
+			return err
+		}
+		sequence++
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }

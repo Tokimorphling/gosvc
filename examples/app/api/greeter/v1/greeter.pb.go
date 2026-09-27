@@ -341,6 +341,110 @@ func (x *InfoResponse) GetRequests() int64 {
 	return 0
 }
 
+type WatchGreetingsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WatchGreetingsRequest) Reset() {
+	*x = WatchGreetingsRequest{}
+	mi := &file_examples_app_api_greeter_v1_greeter_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WatchGreetingsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WatchGreetingsRequest) ProtoMessage() {}
+
+func (x *WatchGreetingsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_examples_app_api_greeter_v1_greeter_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WatchGreetingsRequest.ProtoReflect.Descriptor instead.
+func (*WatchGreetingsRequest) Descriptor() ([]byte, []int) {
+	return file_examples_app_api_greeter_v1_greeter_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *WatchGreetingsRequest) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+type GreetingUpdate struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Text          string                 `protobuf:"bytes,2,opt,name=text,proto3" json:"text,omitempty"`
+	Sequence      int64                  `protobuf:"varint,3,opt,name=sequence,proto3" json:"sequence,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GreetingUpdate) Reset() {
+	*x = GreetingUpdate{}
+	mi := &file_examples_app_api_greeter_v1_greeter_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GreetingUpdate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GreetingUpdate) ProtoMessage() {}
+
+func (x *GreetingUpdate) ProtoReflect() protoreflect.Message {
+	mi := &file_examples_app_api_greeter_v1_greeter_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GreetingUpdate.ProtoReflect.Descriptor instead.
+func (*GreetingUpdate) Descriptor() ([]byte, []int) {
+	return file_examples_app_api_greeter_v1_greeter_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *GreetingUpdate) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *GreetingUpdate) GetText() string {
+	if x != nil {
+		return x.Text
+	}
+	return ""
+}
+
+func (x *GreetingUpdate) GetSequence() int64 {
+	if x != nil {
+		return x.Sequence
+	}
+	return 0
+}
+
 var File_examples_app_api_greeter_v1_greeter_proto protoreflect.FileDescriptor
 
 const file_examples_app_api_greeter_v1_greeter_proto_rawDesc = "" +
@@ -366,11 +470,18 @@ const file_examples_app_api_greeter_v1_greeter_proto_rawDesc = "" +
 	"\n" +
 	"started_at\x18\x03 \x01(\tR\tstartedAt\x12%\n" +
 	"\x0euptime_seconds\x18\x04 \x01(\x03R\ruptimeSeconds\x12\x1a\n" +
-	"\brequests\x18\x05 \x01(\x03R\brequests2\xdb\x01\n" +
+	"\brequests\x18\x05 \x01(\x03R\brequests\"'\n" +
+	"\x15WatchGreetingsRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\"P\n" +
+	"\x0eGreetingUpdate\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x12\n" +
+	"\x04text\x18\x02 \x01(\tR\x04text\x12\x1a\n" +
+	"\bsequence\x18\x03 \x01(\x03R\bsequence2\xae\x02\n" +
 	"\aGreeter\x12E\n" +
 	"\bSayHello\x12\x1b.greeter.v1.SayHelloRequest\x1a\x1c.greeter.v1.SayHelloResponse\x12N\n" +
 	"\vGetGreeting\x12\x1e.greeter.v1.GetGreetingRequest\x1a\x1f.greeter.v1.GetGreetingResponse\x129\n" +
-	"\x04Info\x12\x17.greeter.v1.InfoRequest\x1a\x18.greeter.v1.InfoResponseBFZDgithub.com/Tokimorphling/gosvc/examples/app/api/greeter/v1;greeterv1b\x06proto3"
+	"\x04Info\x12\x17.greeter.v1.InfoRequest\x1a\x18.greeter.v1.InfoResponse\x12Q\n" +
+	"\x0eWatchGreetings\x12!.greeter.v1.WatchGreetingsRequest\x1a\x1a.greeter.v1.GreetingUpdate0\x01BFZDgithub.com/Tokimorphling/gosvc/examples/app/api/greeter/v1;greeterv1b\x06proto3"
 
 var (
 	file_examples_app_api_greeter_v1_greeter_proto_rawDescOnce sync.Once
@@ -384,24 +495,28 @@ func file_examples_app_api_greeter_v1_greeter_proto_rawDescGZIP() []byte {
 	return file_examples_app_api_greeter_v1_greeter_proto_rawDescData
 }
 
-var file_examples_app_api_greeter_v1_greeter_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_examples_app_api_greeter_v1_greeter_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_examples_app_api_greeter_v1_greeter_proto_goTypes = []any{
-	(*SayHelloRequest)(nil),     // 0: greeter.v1.SayHelloRequest
-	(*SayHelloResponse)(nil),    // 1: greeter.v1.SayHelloResponse
-	(*GetGreetingRequest)(nil),  // 2: greeter.v1.GetGreetingRequest
-	(*GetGreetingResponse)(nil), // 3: greeter.v1.GetGreetingResponse
-	(*InfoRequest)(nil),         // 4: greeter.v1.InfoRequest
-	(*InfoResponse)(nil),        // 5: greeter.v1.InfoResponse
+	(*SayHelloRequest)(nil),       // 0: greeter.v1.SayHelloRequest
+	(*SayHelloResponse)(nil),      // 1: greeter.v1.SayHelloResponse
+	(*GetGreetingRequest)(nil),    // 2: greeter.v1.GetGreetingRequest
+	(*GetGreetingResponse)(nil),   // 3: greeter.v1.GetGreetingResponse
+	(*InfoRequest)(nil),           // 4: greeter.v1.InfoRequest
+	(*InfoResponse)(nil),          // 5: greeter.v1.InfoResponse
+	(*WatchGreetingsRequest)(nil), // 6: greeter.v1.WatchGreetingsRequest
+	(*GreetingUpdate)(nil),        // 7: greeter.v1.GreetingUpdate
 }
 var file_examples_app_api_greeter_v1_greeter_proto_depIdxs = []int32{
 	0, // 0: greeter.v1.Greeter.SayHello:input_type -> greeter.v1.SayHelloRequest
 	2, // 1: greeter.v1.Greeter.GetGreeting:input_type -> greeter.v1.GetGreetingRequest
 	4, // 2: greeter.v1.Greeter.Info:input_type -> greeter.v1.InfoRequest
-	1, // 3: greeter.v1.Greeter.SayHello:output_type -> greeter.v1.SayHelloResponse
-	3, // 4: greeter.v1.Greeter.GetGreeting:output_type -> greeter.v1.GetGreetingResponse
-	5, // 5: greeter.v1.Greeter.Info:output_type -> greeter.v1.InfoResponse
-	3, // [3:6] is the sub-list for method output_type
-	0, // [0:3] is the sub-list for method input_type
+	6, // 3: greeter.v1.Greeter.WatchGreetings:input_type -> greeter.v1.WatchGreetingsRequest
+	1, // 4: greeter.v1.Greeter.SayHello:output_type -> greeter.v1.SayHelloResponse
+	3, // 5: greeter.v1.Greeter.GetGreeting:output_type -> greeter.v1.GetGreetingResponse
+	5, // 6: greeter.v1.Greeter.Info:output_type -> greeter.v1.InfoResponse
+	7, // 7: greeter.v1.Greeter.WatchGreetings:output_type -> greeter.v1.GreetingUpdate
+	4, // [4:8] is the sub-list for method output_type
+	0, // [0:4] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -418,7 +533,7 @@ func file_examples_app_api_greeter_v1_greeter_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_examples_app_api_greeter_v1_greeter_proto_rawDesc), len(file_examples_app_api_greeter_v1_greeter_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

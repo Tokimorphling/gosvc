@@ -80,6 +80,9 @@ func New(opts Options) (*Server, error) {
 		server.WithExitWaitTime(opts.Config.HTTP.ShutdownTimeout.D()),
 		server.WithMaxRequestBodySize(opts.Config.HTTP.MaxBodyBytes),
 		server.WithDisablePrintRoute(true),
+		// Sense client disconnects so long-lived handlers (SSE streams) see
+		// ctx.Done when the client goes away.
+		server.WithSenseClientDisconnection(true),
 	)
 
 	dispatcher := opts.Dispatcher
