@@ -112,8 +112,9 @@ func main() {
 | 日志 | 两层：`slogx`（geth 风格 handler，零依赖）+ `logging`（多 sink、轮转、采样、运行期级别） |
 | 可观测性 | Prometheus 指标、pprof、healthz/readyz（含依赖探针）、日志统计、配置查看、时间序列查询，独立 admin 端口 |
 | 存储连接器 | Redis（单机 / Cluster / Sentinel，分钟桶 + 内存聚合批量写）与 PostgreSQL（pgx 连接池、池指标、就绪探针） |
+| 访问日志独立 sink | `log.access.*`：请求日志走自己的级别/格式/输出/文件，自动带 `request_id`/`trace_id`/`log_type=access` |
 | 无锁状态 | `state.Snapshot[T]` 提供读无锁、写替换的共享状态 |
-| 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 免重启生效，其余字段提示 `restartRequired`；`POST /debug/reload` 手动触发 |
+| 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 热生效，`storage.*` **重建连接**（新连接就绪后切换，失败保留旧连接），其余字段提示 `restartRequired` |
 | 有界并发 | `workerpool`（显式 `ErrFull`/`ErrClosed`）+ netpoll 事件循环 + 每连接写串行化，慢业务不阻塞 IO |
 | 压测器 | `examples/app/cmd/bench` 支持 rest / jsonrpc / grpc |
 
@@ -313,6 +314,21 @@ initial = 100
 thereafter = 100
 tick = "1s"
 
+# 请求日志独立 sink（关闭时与主日志共用）
+[log.access]
+enabled = false
+level = "info"
+format = "json"
+output = "stdout"
+color = "auto"
+
+[log.access.file]
+path = "logs/access.log"
+maxSizeMB = 100
+maxBackups = 5
+maxAgeDays = 7
+compress = true
+
 [limiter]
 rps = 0
 burst = 0
@@ -371,6 +387,8 @@ INFO  2026-09-27T01:31:46.481Z middleware.go:47   - http request   service=myapp
 - `format`: `auto`（dev→terminal，其它→json）| `terminal` | `json` | `logfmt`；
 - `output`: `stdout`（推荐，交给平台收集）| `file` | `both`（终端彩色、文件固定 JSON + lumberjack 轮转）；
 - **采样**：按 `(级别, 消息)` 计数，每窗口前 `initial` 条必出、之后每 `thereafter` 条抽 1 条，`warn`/`error` 豁免；
+- **访问日志独立 sink**：`log.access` 可把请求日志（HTTP/gRPC）路由到自己的级别/格式/输出/文件，
+  并自动带 `request_id` / `trace_id` / `log_type=access`；关闭时与主日志共用同一条链；
 - **日志与链路关联**：开启 tracing 后，HTTP/gRPC/TCP 的请求日志自动带 `trace_id` / `span_id`
   （`logging.WithTrace(ctx)` 由各传输在 span 创建后注入），在 Jaeger/Tempo 里可以按 trace 反查日志；
 - 运行期改级别 `PUT /debug/loglevel`，采样计数 `GET /debug/logstats`。
@@ -415,6 +433,14 @@ connMaxLifetime = "1h"
 ```go
 app.Health().AddCheck("redis", func(ctx context.Context) error { return redisClient.Ping(ctx).Err() })
 ```
+
+### 热更新时重建连接
+
+`storage.*` 变化时运行时会**新建连接 → 切换 → 优雅关闭旧连接**（recorder 先 flush 再关闭）：
+
+- 新连接建立失败（例如 DSN 写错、数据库不可达）时保留旧连接，日志记录 error，服务不中断；
+- 通过 `app.Store()` / `app.Postgres()` / `app.Recorder()` 读到的始终是当前生效的连接；
+- 池指标通过 provider 采集，切换后无需重新注册。
 
 ## 运维端点（admin 端口）
 
@@ -462,9 +488,13 @@ distroless + 非 root；admin 端口默认只绑 `127.0.0.1`；TCP 传输不做 
 ## Roadmap
 
 - [ ] 前端静态资源 embed 辅助（Hertz StaticFS + 构建产物）
-- [ ] 可选的结构化访问日志（access log 单独 sink）
-- [ ] 配置热更新支持 Postgres/Redis 连接的优雅重建
-- [ ] 示例：把 trace_id 注入到 OTLP 日志导出（logs signal）
+- [ ] 把 trace_id 注入到 OTLP 日志导出（logs signal）
+- [ ] 配置热更新支持 TLS 证书轮换
+
+## 写一个新服务
+
+- 逐步指南：**[docs/new-service.md](docs/new-service.md)**（配置、入口、协议绑定、存储、测试、部署清单）
+- 可运行示例：`examples/app`；OpenCode 用户可加载技能 `gosvc-new-service`
 
 ## 重命名模块
 

@@ -55,6 +55,22 @@ initial = 100
 thereafter = 100
 tick = "1s"
 
+# Request logs can go to their own sink (level/format/output/file).
+# Enabling or disabling requires a restart; the rest is hot reloadable.
+[log.access]
+enabled = false
+level = "info"
+format = "json"
+output = "stdout"
+color = "auto"
+
+[log.access.file]
+path = "logs/access.log"
+maxSizeMB = 100
+maxBackups = 5
+maxAgeDays = 7
+compress = true
+
 [limiter]
 rps = 0
 burst = 0

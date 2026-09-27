@@ -83,16 +83,23 @@ func authInterceptor(authenticator *auth.Authenticator) ggrpc.UnaryServerInterce
 	}
 }
 
-func loggingInterceptor(recorder store.Recorder) ggrpc.UnaryServerInterceptor {
+func loggingInterceptor(recorder store.Recorder, accessLogger *slog.Logger) ggrpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *ggrpc.UnaryServerInfo, handler ggrpc.UnaryHandler) (any, error) {
 		start := time.Now()
 		resp, err := handler(ctx, req)
-		logging.FromContext(ctx).Info("grpc request",
+
+		fields := []any{
 			"method", info.FullMethod,
 			"code", status.Code(err).String(),
-			"latency_ms", float64(time.Since(start).Microseconds())/1000.0,
+			"latency_ms", float64(time.Since(start).Microseconds()) / 1000.0,
 			"peer", peerAddr(ctx),
-		)
+		}
+		if accessLogger != nil {
+			accessLogger.Info("grpc request", append(logging.RequestAttrs(ctx), fields...)...)
+		} else {
+			logging.FromContext(ctx).Info("grpc request", fields...)
+		}
+
 		if recorder != nil {
 			_ = recorder.Incr(ctx, "grpc.requests:"+info.FullMethod, 1)
 		}

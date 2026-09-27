@@ -32,6 +32,7 @@ package gosvc
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -130,9 +131,10 @@ type App struct {
 	admin *admin.Server
 
 	telemetry *telemetry.Provider
-	store     *redis.Store
-	recorder  *redis.Recorder
-	postgres  *postgres.DB
+
+	storageMu sync.RWMutex
+	storage   *storageState
+	recorders *store.Holder
 
 	mu        sync.Mutex
 	started   bool
@@ -181,24 +183,31 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 	}
 	a.telemetry = tracer
 
-	if cfg.Storage.Redis.Enabled {
-		a.store, err = redis.New(context.Background(), cfg.Storage.Redis)
-		if err != nil {
-			return nil, err
-		}
-		a.recorder = redis.NewRecorder(a.store, cfg.Storage.Redis.QueueSize, logger)
-	}
+	a.recorders = store.NewHolder(nil)
 
-	if cfg.Storage.Postgres.Enabled {
-		a.postgres, err = postgres.New(context.Background(), cfg.Storage.Postgres)
-		if err != nil {
-			return nil, err
+	storage, err := a.startStorage(context.Background(), cfg.Storage)
+	if err != nil {
+		return nil, err
+	}
+	a.storage = storage
+	a.recorders.Set(store.Nilable(storage.recorder))
+
+	// Readiness reflects the database when enabled, and pool metrics are
+	// exported through a provider so a reload can swap the pool.
+	a.ready.AddCheck("postgres", func(ctx context.Context) error {
+		db := a.Postgres()
+		if db == nil {
+			return health.ErrSkipped
 		}
-		// Readiness reflects the database and the pool metrics are exported.
-		a.ready.AddCheck("postgres", a.postgres.HealthCheck())
-		if err := a.metrics.RegisterDBPool("postgres", a.postgres.DB); err != nil {
-			logger.Warn("failed to register database pool metrics", "error", err)
+		return db.Ping(ctx)
+	})
+	if err := a.metrics.RegisterDBPoolProvider("postgres", func() *sql.DB {
+		if db := a.Postgres(); db != nil {
+			return db.DB
 		}
+		return nil
+	}); err != nil {
+		logger.Warn("failed to register database pool metrics", "error", err)
 	}
 
 	// One dispatcher shared by the HTTP /rpc endpoint and the TCP transport, so
@@ -218,11 +227,12 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 		Limiter:       a.limiter,
 		Authenticator: authenticator,
 		Tracer:        tracer.Tracer,
-		Recorder:      a.recorder,
+		Recorder:      a.recorders,
 		Ready:         a.ready,
 		Dispatcher:    dispatcher,
 		PublicPaths:   o.publicPaths,
 		Version:       o.version,
+		AccessLogger:  logHandle.Access(),
 	})
 	if err != nil {
 		return nil, err
@@ -236,8 +246,9 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 		Limiter:       a.limiter,
 		Authenticator: authenticator,
 		Tracer:        tracer.Tracer,
-		Recorder:      a.recorder,
+		Recorder:      a.recorders,
 		Ready:         a.ready,
+		AccessLogger:  logHandle.Access(),
 	})
 	if err != nil {
 		return nil, err
@@ -250,7 +261,7 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 			Logger:     logger,
 			Metrics:    a.metrics,
 			Limiter:    a.limiter,
-			Recorder:   a.recorder,
+			Recorder:   a.recorders,
 			Ready:      a.ready,
 			Dispatcher: dispatcher,
 			Tracer:     tracer.Tracer,
@@ -262,8 +273,8 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 	}
 
 	var timeSeries store.TimeSeries
-	if a.store != nil {
-		timeSeries = a.store
+	if current := a.currentStorage(); current != nil && current.store != nil {
+		timeSeries = current.store
 	}
 	adminServer, err := admin.New(admin.Options{
 		Config:        cfg,
@@ -390,12 +401,6 @@ func (a *App) Run(ctx context.Context) error {
 	if a.tcp != nil {
 		group.Go(func() error { return a.tcp.Serve(ctx) })
 	}
-	if a.recorder != nil {
-		group.Go(func() error {
-			a.recorder.Run(ctx)
-			return nil
-		})
-	}
 	if a.opts.hotReload && a.opts.source.Path != "" {
 		group.Go(func() error {
 			return reload.New(a.opts.source.Path, logger, a.loadConfig, a.applyConfig).Run(ctx)
@@ -415,12 +420,7 @@ func (a *App) Run(ctx context.Context) error {
 			logger.Warn("telemetry shutdown returned error", "error", shutdownErr)
 		}
 	}
-	if a.store != nil {
-		_ = a.store.Close()
-	}
-	if a.postgres != nil {
-		_ = a.postgres.Close()
-	}
+	a.stopStorage(a.currentStorage())
 
 	logger.Info("service stopped")
 	return err
@@ -472,13 +472,29 @@ func (a *App) Metrics() *observability.Metrics { return a.metrics }
 func (a *App) Auth() *auth.Authenticator { return a.auth }
 
 // Recorder returns the time-series recorder, or nil when Redis is disabled.
-func (a *App) Recorder() store.Recorder { return a.recorder }
+func (a *App) Recorder() store.Recorder { return a.recorders.Current() }
 
 // Store returns the Redis store, or nil when Redis is disabled.
-func (a *App) Store() *redis.Store { return a.store }
+func (a *App) Store() *redis.Store {
+	if current := a.currentStorage(); current != nil {
+		return current.store
+	}
+	return nil
+}
 
 // Postgres returns the PostgreSQL pool, or nil when it is disabled.
-func (a *App) Postgres() *postgres.DB { return a.postgres }
+func (a *App) Postgres() *postgres.DB {
+	if current := a.currentStorage(); current != nil {
+		return current.postgres
+	}
+	return nil
+}
+
+func (a *App) currentStorage() *storageState {
+	a.storageMu.RLock()
+	defer a.storageMu.RUnlock()
+	return a.storage
+}
 
 // Health exposes readiness so applications can register their own dependency
 // checks.
@@ -537,6 +553,14 @@ func (a *App) applyConfig(next *config.Config) {
 		changed = append(changed, "limiter")
 	}
 
+	if !reflect.DeepEqual(prev.Storage, next.Storage) {
+		if err := a.reloadStorage(next.Storage); err != nil {
+			logger.Error("failed to rebuild storage, keeping the current connections", "error", err)
+		} else {
+			changed = append(changed, "storage")
+		}
+	}
+
 	restart := restartRequiredFields(prev, next)
 	a.cfg.Store(next)
 
@@ -571,8 +595,85 @@ func restartRequiredFields(prev, next *config.Config) []string {
 	if prev.Telemetry != next.Telemetry {
 		fields = append(fields, "telemetry")
 	}
-	if !reflect.DeepEqual(prev.Storage, next.Storage) {
-		fields = append(fields, "storage")
+	if prev.Log.Access.Enabled != next.Log.Access.Enabled {
+		fields = append(fields, "log.access.enabled")
 	}
 	return fields
+}
+
+// storageState holds the optional storage connections plus the recorder
+// goroutine that belongs to them.
+type storageState struct {
+	store    *redis.Store
+	recorder *redis.Recorder
+	postgres *postgres.DB
+	cancel   context.CancelFunc
+}
+
+// startStorage opens the configured storage connections. On failure nothing is
+// left behind.
+func (a *App) startStorage(ctx context.Context, cfg config.StorageConfig) (*storageState, error) {
+	state := &storageState{}
+
+	if cfg.Redis.Enabled {
+		redisStore, err := redis.New(ctx, cfg.Redis)
+		if err != nil {
+			return nil, err
+		}
+		state.store = redisStore
+
+		recorderCtx, cancel := context.WithCancel(ctx)
+		state.cancel = cancel
+		state.recorder = redis.NewRecorder(redisStore, cfg.Redis.QueueSize, a.log.Logger())
+		go state.recorder.Run(recorderCtx)
+	}
+
+	if cfg.Postgres.Enabled {
+		db, err := postgres.New(ctx, cfg.Postgres)
+		if err != nil {
+			a.stopStorage(state)
+			return nil, err
+		}
+		state.postgres = db
+	}
+
+	return state, nil
+}
+
+// stopStorage flushes the recorder and then closes the connections.
+func (a *App) stopStorage(state *storageState) {
+	if state == nil {
+		return
+	}
+	if state.recorder != nil {
+		state.cancel()
+		state.recorder.Wait()
+	}
+	if state.store != nil {
+		_ = state.store.Close()
+	}
+	if state.postgres != nil {
+		_ = state.postgres.Close()
+	}
+}
+
+// reloadStorage builds the new storage connections, swaps them in and then tears
+// down the previous ones. A failure keeps the current state.
+func (a *App) reloadStorage(cfg config.StorageConfig) error {
+	next, err := a.startStorage(context.Background(), cfg)
+	if err != nil {
+		return err
+	}
+
+	// Swap the recorder first so transports never record into a closed store,
+	// then publish the new storage state.
+	a.recorders.Set(store.Nilable(next.recorder))
+
+	a.storageMu.Lock()
+	previous := a.storage
+	a.storage = next
+	a.storageMu.Unlock()
+
+	a.stopStorage(previous)
+	return nil
 }

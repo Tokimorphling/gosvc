@@ -88,9 +88,9 @@ func (h *hertzCarrier) Keys() []string {
 	return keys
 }
 
-// AccessLog logs one line per request and records metrics and time-series
-// samples.
-func AccessLog(metrics *observability.Metrics, recorder store.Recorder) app.HandlerFunc {
+// AccessLog writes one line per request: to the dedicated access logger when
+// one is configured, otherwise to the request-scoped application logger.
+func AccessLog(metrics *observability.Metrics, recorder store.Recorder, accessLogger *slog.Logger) app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
 		start := time.Now()
 		c.Next(ctx)
@@ -103,14 +103,20 @@ func AccessLog(metrics *observability.Metrics, recorder store.Recorder) app.Hand
 		}
 		status := c.Response.StatusCode()
 
-		logging.FromContext(ctx).Info("http request",
+		fields := []any{
 			"method", method,
 			"path", string(c.Path()),
 			"route", route,
 			"status", status,
-			"latency_ms", float64(latency.Microseconds())/1000.0,
+			"latency_ms", float64(latency.Microseconds()) / 1000.0,
 			"client_ip", c.ClientIP(),
-		)
+		}
+		if accessLogger != nil {
+			accessLogger.Info("http request", append(logging.RequestAttrs(ctx), fields...)...)
+		} else {
+			logging.FromContext(ctx).Info("http request", fields...)
+		}
+
 		metrics.ObserveHTTP(method, route, status, latency)
 		if recorder != nil {
 			_ = recorder.Incr(ctx, "http.requests:"+route, 1)

@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	ggrpc "google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -590,6 +591,127 @@ func logRecordHas(t *testing.T, path, msg, field string) bool {
 		}
 	}
 	return false
+}
+
+// TestAccessLogSink verifies that request logs can be routed to a dedicated
+// sink without leaking into the application log.
+func TestAccessLogSink(t *testing.T) {
+	dir := t.TempDir()
+	appLog := filepath.Join(dir, "app.log")
+	accessLog := filepath.Join(dir, "access.log")
+
+	cfg := baseConfig()
+	cfg.Log.Level = "info"
+	cfg.Log.Output = "file"
+	cfg.Log.File.Path = appLog
+	cfg.Log.Access.Enabled = true
+	cfg.Log.Access.Output = "file"
+	cfg.Log.Access.File.Path = accessLog
+
+	application, stop := startApp(t, cfg, "")
+	defer stop()
+
+	httpBase := "http://" + application.HTTPAddr()
+	waitReady(t, httpBase+"/readyz")
+	getBody(t, httpBase+"/api/v1/hello?name=access")
+
+	waitFor(t, 5*time.Second, func() bool {
+		return logRecordHas(t, accessLog, "http request", "log_type")
+	})
+	if raw, err := os.ReadFile(appLog); err == nil && strings.Contains(string(raw), "http request") {
+		t.Fatalf("access lines must not appear in the application log: %s", raw)
+	}
+}
+
+// TestStorageHotReload verifies that storage connections are rebuilt on reload,
+// that disabling Redis clears the recorder, and that a failing rebuild keeps the
+// current state and the service alive.
+func TestStorageHotReload(t *testing.T) {
+	mini := miniredis.RunT(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+
+	writeConfig := func(redisAddr, postgresDSN string) {
+		t.Helper()
+		content := `
+[service]
+name = "storage-reload"
+env = "dev"
+
+[http]
+host = "127.0.0.1"
+port = 0
+
+[grpc]
+host = "127.0.0.1"
+port = 0
+
+[admin]
+host = "127.0.0.1"
+port = 0
+
+[log]
+level = "error"
+format = "json"
+`
+		if redisAddr != "" {
+			content += `
+[storage.redis]
+enabled = true
+mode = "single"
+addr = "` + redisAddr + `"
+prefix = "reload-test"
+bucketTtl = "1h"
+queueSize = 64
+`
+		}
+		if postgresDSN != "" {
+			content += `
+[storage.postgres]
+enabled = true
+dsn = "` + postgresDSN + `"
+pingTimeout = "300ms"
+`
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeConfig(mini.Addr(), "")
+	cfg, err := Load(path, "GOSVC")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	application, stop := startApp(t, cfg, path)
+	defer stop()
+
+	httpBase := "http://" + application.HTTPAddr()
+	waitReady(t, httpBase+"/readyz")
+
+	if application.Store() == nil {
+		t.Fatal("redis store must be enabled")
+	}
+	if application.Recorder() == nil {
+		t.Fatal("recorder must be set")
+	}
+
+	// Disabling Redis closes the store and clears the recorder.
+	writeConfig("", "")
+	waitFor(t, 8*time.Second, func() bool {
+		return application.Store() == nil && application.Recorder() == nil
+	})
+
+	// A failing rebuild (unreachable postgres) keeps the current state and the
+	// service keeps serving.
+	writeConfig("", "postgres://user:pass@127.0.0.1:1/app")
+	waitFor(t, 8*time.Second, func() bool { return application.Config().Storage.Postgres.Enabled })
+	if application.Postgres() != nil {
+		t.Fatal("failed rebuild must not install a broken pool")
+	}
+	getBody(t, httpBase+"/healthz")
 }
 
 func baseConfig() *Config {

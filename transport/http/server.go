@@ -37,6 +37,9 @@ type Options struct {
 	PublicPaths []string
 	// Version is reported by GET /healthz.
 	Version string
+	// AccessLogger receives request logs. When nil they share the application
+	// logger.
+	AccessLogger *slog.Logger
 }
 
 // Server serves the health endpoints, the JSON-RPC endpoint and the routes the
@@ -92,7 +95,7 @@ func New(opts Options) (*Server, error) {
 	engine.Use(
 		RequestID(),
 		Tracing(opts.Tracer),
-		AccessLog(opts.Metrics, opts.Recorder),
+		AccessLog(opts.Metrics, opts.Recorder, opts.AccessLogger),
 		Recovery(opts.Logger),
 		CORS(),
 		RateLimit(opts.Limiter),

@@ -98,6 +98,19 @@ type LogConfig struct {
 	AddSource bool              `json:"addSource" toml:"addSource"`
 	File      FileLogConfig     `json:"file" toml:"file"`
 	Sampling  SamplingLogConfig `json:"sampling" toml:"sampling"`
+	Access    AccessLogConfig   `json:"access" toml:"access"`
+}
+
+// AccessLogConfig routes request logs (HTTP/gRPC) to a dedicated sink. When
+// disabled, access logs share the main logger. Enabling or disabling it
+// requires a restart; format, output and level are hot reloadable.
+type AccessLogConfig struct {
+	Enabled bool          `json:"enabled" toml:"enabled"`
+	Level   string        `json:"level" toml:"level"`   // debug | info | warn | error
+	Format  string        `json:"format" toml:"format"` // auto | terminal | json | logfmt
+	Output  string        `json:"output" toml:"output"` // stdout | file | both
+	Color   string        `json:"color" toml:"color"`   // auto | always | never
+	File    FileLogConfig `json:"file" toml:"file"`
 }
 
 // FileLogConfig configures the rotating file sink.
@@ -258,6 +271,19 @@ func Default() *Config {
 				Initial:    100,
 				Thereafter: 100,
 				Tick:       Duration(time.Second),
+			},
+			Access: AccessLogConfig{
+				Enabled: false,
+				Level:   "info",
+				Format:  "json",
+				Output:  "stdout",
+				Color:   "auto",
+				File: FileLogConfig{
+					MaxSizeMB:  100,
+					MaxBackups: 5,
+					MaxAgeDays: 7,
+					Compress:   true,
+				},
 			},
 		},
 		Limiter: LimiterConfig{RPS: 0, Burst: 0},
@@ -500,6 +526,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("log.sampling.tick must be positive")
 		}
 	}
+	if err := c.Log.Access.Validate(); err != nil {
+		return err
+	}
 
 	if c.Limiter.RPS < 0 || c.Limiter.Burst < 0 {
 		return fmt.Errorf("limiter.rps and limiter.burst must not be negative")
@@ -549,6 +578,35 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Storage.Postgres.Validate(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// Validate checks the access log section.
+func (c AccessLogConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if _, err := slogx.ParseLevel(c.Level); err != nil {
+		return fmt.Errorf("log.access.level: %w", err)
+	}
+	if _, err := slogx.NormalizeFormat(c.Format); err != nil {
+		return fmt.Errorf("log.access.format: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Output)) {
+	case "", "stdout", "file", "both":
+	default:
+		return fmt.Errorf("log.access.output must be one of stdout|file|both, got %q", c.Output)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Color)) {
+	case "", "auto", "always", "never":
+	default:
+		return fmt.Errorf("log.access.color must be one of auto|always|never, got %q", c.Color)
+	}
+	if strings.EqualFold(c.Output, "file") || strings.EqualFold(c.Output, "both") {
+		if strings.TrimSpace(c.File.Path) == "" {
+			return fmt.Errorf("log.access.file.path must be set when log.access.output is %q", c.Output)
+		}
 	}
 	return nil
 }

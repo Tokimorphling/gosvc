@@ -33,6 +33,9 @@ type Options struct {
 	Tracer        trace.Tracer
 	Recorder      store.Recorder
 	Ready         *apphealth.Ready
+	// AccessLogger receives request logs. When nil they share the application
+	// logger.
+	AccessLogger *slog.Logger
 }
 
 // Server serves the health and reflection services plus whatever the
@@ -59,7 +62,7 @@ func New(opts Options) (*Server, error) {
 			requestIDInterceptor(),
 			traceInterceptor(),
 			authInterceptor(opts.Authenticator),
-			loggingInterceptor(opts.Recorder),
+			loggingInterceptor(opts.Recorder, opts.AccessLogger),
 			metricsInterceptor(opts.Metrics),
 			rateLimitInterceptor(opts.Limiter),
 		),

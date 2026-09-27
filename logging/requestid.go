@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -38,4 +40,21 @@ func RequestID(ctx context.Context) string {
 		return id
 	}
 	return ""
+}
+
+// RequestAttrs returns the request-scoped attributes available in ctx:
+// request_id and, when tracing is active, trace_id and span_id. It is used by
+// transports that write access logs to a sink outside the context logger.
+func RequestAttrs(ctx context.Context) []any {
+	attrs := make([]any, 0, 6)
+	if id := RequestID(ctx); id != "" {
+		attrs = append(attrs, "request_id", id)
+	}
+	if spanContext := trace.SpanContextFromContext(ctx); spanContext.IsValid() {
+		attrs = append(attrs,
+			"trace_id", spanContext.TraceID().String(),
+			"span_id", spanContext.SpanID().String(),
+		)
+	}
+	return attrs
 }

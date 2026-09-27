@@ -3,12 +3,17 @@ package health
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 )
 
 // Check probes one dependency. It must respect ctx and return quickly.
 type Check func(ctx context.Context) error
+
+// ErrSkipped lets a check opt out without affecting readiness, for example when
+// the dependency is disabled by configuration.
+var ErrSkipped = errors.New("check skipped")
 
 // Ready tracks the readiness flag plus named dependency checks. Transports use
 // IsReady for their fast path; the admin /readyz endpoint uses Check to report
@@ -63,12 +68,16 @@ func (r *Ready) Check(ctx context.Context) (bool, map[string]string) {
 
 	details := make(map[string]string, len(checks))
 	for name, check := range checks {
-		if err := check(ctx); err != nil {
+		err := check(ctx)
+		switch {
+		case err == nil:
+			details[name] = "ok"
+		case errors.Is(err, ErrSkipped):
+			details[name] = "skipped"
+		default:
 			ready = false
 			details[name] = err.Error()
-			continue
 		}
-		details[name] = "ok"
 	}
 	return ready, details
 }
