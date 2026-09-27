@@ -1,16 +1,17 @@
 // Package kitexexample demonstrates adding Kitex as an optional
 // service-to-service RPC layer on top of this template.
 //
-// The generated code lives in api/kitex/echo (see api/kitex/echo.thrift and
-// `make kitex`). This example is deliberately isolated from the main binary:
-// nothing under internal/ imports Kitex, so the core service stays lean.
+// The generated code lives in examples/kitex/api/echo (see
+// examples/kitex/idl/echo.thrift and `make kitex`). This example is
+// deliberately isolated from the library: no package under the module root
+// imports Kitex, so importing gosvc stays lean.
 package kitexexample
 
 import (
 	"context"
 	"fmt"
 
-	"example.com/gosvc/api/kitex/echo"
+	"example.com/gosvc/examples/kitex/api/echo"
 )
 
 // EchoServiceImpl implements the generated echo.EchoService interface.

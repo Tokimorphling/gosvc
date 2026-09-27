@@ -25,4 +25,4 @@ done
 
 go mod edit -module "$new"
 echo "renamed module to $new"
-echo "remember to update api/greeter/v1/greeter.proto and run: make proto"
+echo "remember to update examples/app/api/greeter/v1/greeter.proto and examples/kitex/idl/echo.thrift, then run: make proto kitex"

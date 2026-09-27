@@ -45,6 +45,10 @@
     "rps": 0,
     "burst": 0
   },
+  "greeting": {
+    "prefix": "hello",
+    "maxNameLen": 64
+  },
   "auth": {
     "enabled": false,
     "apiKeys": [],

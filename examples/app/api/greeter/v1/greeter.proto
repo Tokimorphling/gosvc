@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package greeter.v1;
+
+option go_package = "example.com/gosvc/examples/app/api/greeter/v1;greeterv1";
+
+// Greeter demonstrates the multi-protocol template: the same domain service is
+// exposed through REST, JSON-RPC 2.0 and gRPC without duplicating business logic.
+service Greeter {
+  rpc SayHello(SayHelloRequest) returns (SayHelloResponse);
+  rpc GetGreeting(GetGreetingRequest) returns (GetGreetingResponse);
+  rpc Info(InfoRequest) returns (InfoResponse);
+}
+
+message SayHelloRequest {
+  string name = 1;
+}
+
+message SayHelloResponse {
+  string message = 1;
+  string server = 2;
+  string protocol = 3;
+  string served_at = 4;
+}
+
+message GetGreetingRequest {
+  int64 id = 1;
+}
+
+message GetGreetingResponse {
+  int64 id = 1;
+  string text = 2;
+}
+
+message InfoRequest {}
+
+message InfoResponse {
+  string name = 1;
+  string version = 2;
+  string started_at = 3;
+  int64 uptime_seconds = 4;
+  int64 requests = 5;
+}

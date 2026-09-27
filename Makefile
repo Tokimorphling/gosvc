@@ -3,9 +3,9 @@ VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo d
 COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS    := -s -w \
-	-X $(MODULE)/internal/version.Version=$(VERSION) \
-	-X $(MODULE)/internal/version.Commit=$(COMMIT) \
-	-X $(MODULE)/internal/version.BuildTime=$(BUILD_TIME)
+	-X $(MODULE)/version.Version=$(VERSION) \
+	-X $(MODULE)/version.Commit=$(COMMIT) \
+	-X $(MODULE)/version.BuildTime=$(BUILD_TIME)
 
 .PHONY: all build run test race vet fmt lint proto clean docker help
 
@@ -13,8 +13,8 @@ all: build
 
 ## build: compile the service and the load generator into ./bin
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/gosvc ./cmd/gosvc
-	go build -trimpath -o bin/bench ./cmd/bench
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/gosvc ./examples/app/cmd/gosvc
+	go build -trimpath -o bin/bench ./examples/app/cmd/bench
 
 ## run: build and start the service with the example config
 run: build
@@ -40,16 +40,16 @@ fmt:
 lint: vet
 	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
 
-## proto: regenerate protobuf/gRPC code
+## proto: regenerate protobuf/gRPC code for the example app
 proto:
 	protoc --proto_path=. \
 		--go_out=. --go_opt=paths=source_relative \
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
-		api/greeter/v1/greeter.proto
+		examples/app/api/greeter/v1/greeter.proto
 
 ## kitex: regenerate the Kitex example code (requires the kitex CLI)
 kitex:
-	kitex -module $(MODULE) -gen-path api/kitex api/kitex/echo.thrift
+	kitex -module $(MODULE) -gen-path examples/kitex/api examples/kitex/idl/echo.thrift
 
 ## bench: smoke-run the load generator against a local instance
 bench: build

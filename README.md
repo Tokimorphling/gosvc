@@ -1,145 +1,206 @@
-# gosvc — 多协议 Go 服务模板
+# gosvc — 多协议 Go 服务运行时（库）
 
-一个开箱即用的 Go 服务模板：同一套领域逻辑，同时通过 **REST**、**JSON-RPC 2.0**、**gRPC** 和
-**自定义 TCP（netpoll）** 暴露，自带认证、链路追踪、日志、指标、限流、时间序列存储、
-优雅退出、容器化和压测工具。
+`gosvc` 是一个可 import 的服务运行时：把日志、配置、认证、追踪、指标、限流、存储、
+HTTP / JSON-RPC / gRPC / TCP 四种传输和优雅退出都装好，业务代码只写自己的 handler 与领域逻辑。
 
-传输层基于 CloudWeGo 生态（Hertz / netpoll / sonic），RPC 层用 grpc-go，并附赠一个
-Kitex 服务间 RPC 示例。
+```bash
+go get github.com/you/gosvc        # 或先把本仓库改名为你的模块（见文末）
+```
+
+```go
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os/signal"
+	"syscall"
+
+	"github.com/cloudwego/hertz/pkg/app/server"
+	ggrpc "google.golang.org/grpc"
+
+	"github.com/you/gosvc"
+	"github.com/you/gosvc/jsonrpc"
+	"github.com/you/gosvc/logging"
+)
+
+// 1. 配置：嵌入运行时配置，加自己的段
+type Config struct {
+	gosvc.Config
+	Database DatabaseConfig `json:"database"`
+}
+
+type DatabaseConfig struct{ DSN string `json:"dsn"` }
+
+func (c *Config) SetDefaults() {
+	c.Config.SetDefaults()
+	if c.Database.DSN == "" {
+		c.Database.DSN = "postgres://localhost/app"
+	}
+}
+
+func (c *Config) Validate() error {
+	if err := c.Config.Validate(); err != nil {
+		return err
+	}
+	if c.Database.DSN == "" {
+		return errors.New("database.dsn is required")
+	}
+	return nil
+}
+
+func main() {
+	// 2. 加载：默认值 < 文件 < 环境变量（泛型方法，编译期检查）
+	cfg, err := (gosvc.Source{Path: "config.json", EnvPrefix: "MYAPP"}).Load[Config]()
+	if err != nil {
+		slog.Error("config", "error", err)
+		os.Exit(1)
+	}
+
+	logHandle, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, "v1.0.0")
+	if err != nil {
+		slog.Error("logger", "error", err)
+		os.Exit(1)
+	}
+	slog.SetDefault(logHandle.Logger())
+
+	// 3. 组装运行时
+	app, err := gosvc.New(&cfg.Config,
+		gosvc.WithLogger(logHandle),
+		gosvc.WithVersion("v1.0.0"),
+		gosvc.WithHotReload("config.json", "MYAPP"),
+	)
+	if err != nil {
+		slog.Error("runtime", "error", err)
+		os.Exit(1)
+	}
+
+	// 4. 注册业务 handler（三种协议共享同一个领域服务）
+	svc := NewOrderService(cfg.Database.DSN)
+	app.RegisterHTTP(func(h *server.Hertz) {
+		h.GET("/api/v1/orders/:id", handleGetOrder(svc))
+	})
+	app.RegisterJSONRPC(func(d *jsonrpc.Dispatcher) {
+		d.RegisterTyped("orders.get", func(ctx context.Context, req GetOrderRequest) (*Order, error) {
+			return svc.Get(ctx, req.ID)
+		})
+	})
+	app.RegisterGRPC(func(s *ggrpc.Server) {
+		orderv1.RegisterOrderServiceServer(s, newOrderServer(svc))
+	})
+
+	// 5. 运行：信号、优雅退出、热更新、指标全部由运行时处理
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := app.Run(ctx); err != nil {
+		slog.Error("run", "error", err)
+		os.Exit(1)
+	}
+}
+```
 
 ## 特性
 
 | 能力 | 说明 |
 |---|---|
-| 四协议同栈 | REST + JSON-RPC 2.0（HTTP 端口）、gRPC、行分隔 JSON-RPC over TCP（netpoll），共享同一 service 层 |
-| 统一错误模型 | `internal/apierror` 定义与传输无关的错误类型，各协议一处映射（见下表） |
-| 认证 | API Key（constant-time 比较）与 HS256 JWT，HTTP 中间件 + gRPC 拦截器共用；health/reflection 免认证 |
-| 链路追踪 | OpenTelemetry OTLP/HTTP，Hertz 自研中间件 + `otelgrpc` StatsHandler，W3C TraceContext 传播 |
-| 日志 | `internal/slogx`：移植自 not-only-mining-pool 的 geth 风格 slog handler（彩色/对齐/调用点）；支持 terminal / json / logfmt，stdout / 轮转文件 / 双写，运行期改级别；按 (级别,消息) 采样降噪 |
-| 配置热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 免重启生效，其余字段在重载日志中标记 `restartRequired`；`POST /debug/reload` 支持手动触发（ConfigMap 场景） |
-| 可观测性 | Prometheus 指标（HTTP / JSON-RPC / gRPC / Go runtime）、pprof、healthz / readyz / version、时间序列查询，独立 admin 端口 |
-| 时间序列存储 | Redis 分钟桶计数器 + 内存聚合批量写入（请求路径不碰 Redis），`/debug/ts` 查询 |
-| 配置 | 默认值 < JSON 文件 < 环境变量，带完整校验；`Duration` 支持 `"5s"` 与秒数 |
-| 生命周期 | `errgroup` + 信号处理 + 各组件优雅退出 + 就绪门 |
-| 中间件 | request id、tracing、access log、panic recovery、CORS、限流、认证（HTTP 与 gRPC 共用限流器） |
-| 压测器 | `cmd/bench` 支持 rest / jsonrpc / grpc，输出 QPS 与 p50/p90/p99 |
-| Kitex 示例 | `examples/kitex`：Thrift IDL + 代码生成 + server/client + 静态 resolver（服务发现扩展点） |
-| 工程化 | Makefile、distroless Dockerfile（二进制健康检查）、compose、CI（gofmt / vet / race）、golangci 配置、模块改名脚本 |
-
-本地冒烟数据（Apple Silicon，loopback，10 并发 2 秒，仅供参考）：
-
-```
-rest    qps=77393.9  p50=102µs  p99=408µs
-jsonrpc qps=69251.7  p50=109µs  p99=460µs
-grpc    qps=52694.3  p50=153µs  p99=720µs
-```
-
-## 快速开始
-
-```bash
-make build
-./bin/gosvc -c configs/config.example.json     # 或 make run
-```
-
-```bash
-# REST
-curl 'http://127.0.0.1:8080/api/v1/hello?name=world'
-curl http://127.0.0.1:8080/api/v1/greetings/1
-
-# JSON-RPC 2.0（支持批量与通知）
-curl -s -X POST http://127.0.0.1:8080/rpc \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"greeter.sayHello","params":{"name":"rpc"}}'
-
-# gRPC（server 已开启 reflection）
-grpcurl -plaintext 127.0.0.1:9090 list
-grpcurl -plaintext -d '{"name":"grpc"}' 127.0.0.1:9090 greeter.v1.Greeter/SayHello
-
-# 自定义 TCP（启用后）：行分隔 JSON-RPC 2.0
-printf '{"jsonrpc":"2.0","id":1,"method":"greeter.sayHello","params":{"name":"tcp"}}\n' | nc 127.0.0.1 7070
-
-# 运维端点
-curl http://127.0.0.1:6060/healthz
-curl http://127.0.0.1:6060/metrics
-curl http://127.0.0.1:6060/debug/loglevel          # GET 当前级别
-curl -X PUT -d '{"level":"debug"}' http://127.0.0.1:6060/debug/loglevel
-curl http://127.0.0.1:6060/debug/logstats          # 采样计数（emitted/dropped）
-curl http://127.0.0.1:6060/debug/config            # 当前生效配置（密钥脱敏）
-curl -X POST http://127.0.0.1:6060/debug/reload    # 手动触发配置重载
-curl 'http://127.0.0.1:6060/debug/ts?metric=http.requests:/api/v1/hello&minutes=60'
-```
-
-压测：
-
-```bash
-make bench
-./bin/bench -mode jsonrpc -http-addr 127.0.0.1:8080 -c 50 -d 10s
-./bin/bench -mode grpc    -grpc-addr 127.0.0.1:9090 -c 50 -d 10s
-```
+| 四协议同栈 | REST + JSON-RPC 2.0（HTTP 端口）、gRPC、行分隔 JSON-RPC over TCP（netpoll），JSON-RPC 方法注册一次两种传输都可用 |
+| 类型安全 | `Dispatcher.RegisterTyped[Req, Resp]` 与 `Client.Call[Req, Resp]` 让方法两端都带类型；`config.Source.Load[T]` 编译期校验配置类型 |
+| 统一错误模型 | `apierror.Kind` 一处定义，各协议自动映射（HTTP 状态码 / JSON-RPC code / gRPC code），内部错误不泄漏 |
+| 认证 | API Key（constant-time）+ HS256 JWT，HTTP 中间件与 gRPC 拦截器共用；health/reflection 默认放行 |
+| 链路追踪 | OpenTelemetry OTLP/HTTP，W3C TraceContext 传播，Hertz 中间件 + `otelgrpc` StatsHandler |
+| 日志 | 两层：`slogx`（geth 风格 handler，零依赖）+ `logging`（多 sink、轮转、采样、运行期级别） |
+| 可观测性 | Prometheus 指标、pprof、healthz/readyz/version、日志统计、配置查看、时间序列查询，独立 admin 端口 |
+| 时间序列存储 | Redis 分钟桶 + 内存聚合批量写；`state.Snapshot[T]` 提供无锁读的状态快照 |
+| 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 免重启生效，其余字段提示 `restartRequired`；`POST /debug/reload` 手动触发 |
+| 有界并发 | `workerpool`（显式 `ErrFull`/`ErrClosed`）+ netpoll 事件循环 + 每连接写串行化，慢业务不阻塞 IO |
+| 压测器 | `examples/app/cmd/bench` 支持 rest / jsonrpc / grpc |
 
 ## 目录结构
 
 ```
 .
-├── api/
-│   ├── greeter/v1/            # protobuf IDL 与生成代码（gRPC）
-│   └── kitex/                 # Thrift IDL 与 Kitex 生成代码（示例）
-├── cmd/
-│   ├── gosvc/                 # 服务入口（含 -healthcheck 模式）
-│   └── bench/                 # 多协议压测器
-├── configs/                   # 配置示例
-├── deploy/                    # Dockerfile / docker-compose
-├── examples/kitex/            # Kitex 可选层示例 + README
-├── internal/
-│   ├── app/                   # 组件装配 + 生命周期
-│   ├── config/                # 配置加载、合并、校验
-│   ├── logging/               # 日志装配（读配置、多 sink、轮转、级别）
-│   ├── slogx/                 # geth 风格 slog handlers（零项目依赖，可独立复用）
-│   ├── auth/                  # API Key + JWT
-│   ├── telemetry/             # OpenTelemetry 初始化
-│   ├── reqid/                 # request id
-│   ├── apierror/              # 传输无关错误
-│   ├── health/                # readiness
-│   ├── observability/         # Prometheus 指标
-│   ├── ratelimit/             # 按 key 的 token bucket（支持运行期调参）
-│   ├── reload/                # 配置文件监听与热更新
-│   ├── workerpool/            # 有界 goroutine 池（背压）
-│   ├── store/                 # 存储接口
-│   │   └── redisx/            # Redis 分钟桶 + 聚合写入
-│   ├── service/greeter/       # 领域服务（与传输无关）
-│   ├── transport/
-│   │   ├── http/              # Hertz：REST + JSON-RPC + 中间件
-│   │   ├── grpc/              # grpc-go：拦截器 + 错误映射
-│   │   └── tcp/               # netpoll：行分隔 JSON-RPC + worker pool
-│   ├── jsonrpc/               # JSON-RPC 2.0 协议实现（与框架无关）
-│   └── admin/                 # metrics / pprof / health / loglevel / ts
-├── test/e2e/                  # 端到端测试
-└── Makefile
+├── app.go                  # package gosvc：运行时门面（New / Register* / Run / Reload）
+├── types.go                # 配置类型别名，方便单 import 使用
+├── config/                 # 基础配置 + 泛型加载器 Source.Load[T]
+├── logging/                # 日志装配（Handle：多 sink、轮转、级别、采样统计、Reload）
+├── slogx/                  # geth 风格 slog handler（terminal/json/logfmt、采样、SwapHandler）
+├── auth/                   # API Key + JWT（支持运行期 Reload）
+├── apierror/               # 传输无关错误
+├── telemetry/              # OpenTelemetry 初始化
+├── observability/          # Prometheus 指标
+├── ratelimit/              # 按 key 的 token bucket（运行期 SetRate）
+├── reload/                 # 配置文件监听（fsnotify + 去抖）
+├── state/                  # 泛型无锁快照 Snapshot[T]
+├── workerpool/             # 有界 goroutine 池
+├── jsonrpc/                # JSON-RPC 2.0：Dispatcher（含 RegisterTyped）+ Client（含 Call）
+├── store/                  # 存储接口；store/redisx 为 Redis 分钟桶实现
+├── transport/http/         # Hertz：REST 基础路由、/rpc、中间件链（认证/限流/追踪/日志）
+├── transport/grpc/         # grpc-go：拦截器、health、reflection、ToStatus
+├── transport/tcp/          # netpoll：行分隔 JSON-RPC + 有界 worker pool
+├── admin/                  # 运维端口：metrics / pprof / health / loglevel / logstats / config / reload / ts
+└── examples/
+    ├── app/                # 示例应用（greeter）：config / bindings / cmd / e2e 测试
+    └── kitex/              # Kitex 服务间 RPC 示例（不进入库依赖）
 ```
 
-## 架构
+## API 速查
 
-```
-   REST/JSON-RPC        gRPC            TCP (netpoll)
-        │                │                    │
-        ▼                ▼                    ▼
- ┌────────────┐   ┌────────────┐   ┌──────────────────┐
- │transport/  │   │transport/  │   │ transport/tcp    │
- │  http      │   │  grpc      │   │ EventLoop + pool │
- └─────┬──────┘   └─────┬──────┘   └────────┬─────────┘
-       │                │                    │
-       └────────────────┼────────────────────┘
-                        ▼
-              ┌──────────────────┐     ┌───────────────┐
-              │ service/greeter  │────▶│ store.Recorder│──▶ Redis 分钟桶
-              └────────┬─────────┘     └───────────────┘
-                       ▼
-              ┌──────────────────┐
-              │ apierror.Kind    │
-              └──────────────────┘
+### 运行时
+
+```go
+app, err := gosvc.New(&cfg.Config, opts...)   // 绑定端口、建好各组件（未开始服务）
+
+// 注册（必须在 Run 之前；Run 之后再注册返回 gosvc.ErrStarted）
+app.RegisterHTTP(func(h *server.Hertz))
+app.RegisterGRPC(func(s *grpc.Server))
+app.RegisterJSONRPC(func(d *jsonrpc.Dispatcher))
+app.RegisterAdmin(func(mux *http.ServeMux))
+
+app.Run(ctx)            // 阻塞直到 ctx 取消或某个 server 失败，随后优雅退出
+
+// 运行时访问器（handler 里常用）
+app.Logger()            // *slog.Logger
+app.Metrics()           // *observability.Metrics
+app.Auth()              // *auth.Authenticator
+app.Recorder()          // store.Recorder（未启用 Redis 时为 nil）
+app.Config()            // 当前生效配置（未脱敏）
+app.CurrentConfig()     // 脱敏快照（admin /debug/config 用）
+app.HTTPAddr() / GRPCAddr() / TCPAddr() / AdminAddr()
+app.Reload()            // 手动重载配置
 ```
 
-### 统一错误映射
+选项：`WithLogger`、`WithVersion`、`WithHotReload(path, envPrefix)`、`WithPublicPaths(...)`、`WithOnReload(fn)`。
+
+### 配置
+
+```go
+// 泛型方法：T 是应用配置类型，*T 必须实现 Configurable（SetDefaults/Validate）
+cfg, err := (gosvc.Source{Path: "config.json", EnvPrefix: "MYAPP"}).Load[Config]()
+
+// 嵌入 gosvc.Config 即自动获得 SetDefaults/Validate/ApplyEnv，按需覆盖
+func (c *Config) SetDefaults() { c.Config.SetDefaults(); /* 应用默认值 */ }
+func (c *Config) Validate() error { /* 应用校验 */ }
+```
+
+环境变量前缀可配（默认 `GOSVC`）：`MYAPP_HTTP_ADDR`、`MYAPP_AUTH_API_KEYS`、`MYAPP_REDIS_ADDR`、`MYAPP_OTLP_ENDPOINT` 等。
+
+### JSON-RPC：注册与调用
+
+```go
+// 服务端：类型从 handler 推断
+d.RegisterTyped("orders.get", svc.Get)   // func(context.Context, GetOrderRequest) (*Order, error)
+
+// 客户端：HTTP 或 TCP，同一套类型
+client := jsonrpc.NewHTTPClient("http://127.0.0.1:8080", jsonrpc.WithHeader("X-API-Key", key))
+defer client.Close()
+order, err := client.Call[GetOrderRequest, *Order](ctx, "orders.get", GetOrderRequest{ID: 1})
+```
+
+### 错误映射
+
+```go
+return nil, apierror.New(apierror.KindNotFound, "order 1 not found")
+```
 
 | Kind | HTTP | JSON-RPC | gRPC |
 |---|---|---|---|
@@ -152,170 +213,96 @@ make bench
 | `unavailable` | 503 | -32004 | `Unavailable` |
 | `internal` / 未知 | 500 | -32603 | `Internal` |
 
-内部错误消息不会泄漏给客户端。
+gRPC handler 里用 `grpctransport.ToStatus(err)`；HTTP 用 `httptransport.WriteError(ctx, c, err)`。
 
-### HTTP 中间件顺序
+### 无锁状态
 
+```go
+var config state.Snapshot[*RouteTable]
+config.Store(table)                    // 写：整体替换
+table := config.Load()                 // 读：无锁
+config.Update(func(cur *RouteTable) *RouteTable { ... })  // CAS 循环
 ```
-RequestID → Tracing → AccessLog → Recovery → CORS → RateLimit → [Auth] → handler
-```
 
-`Auth` 通过路由组挂在 `/api/v1/*` 与 `/rpc` 上，`/healthz`、`/readyz` 保持公开。
+## Go 1.27 与泛型用法
+
+本库要求 **Go 1.27+**，刻意用上了这些新能力：
+
+| 特性 | 用在哪 |
+|---|---|
+| **泛型方法**（1.27 新增） | `config.Source.Load[T, PT]`、`jsonrpc.Dispatcher.RegisterTyped[Req, Resp]`、`jsonrpc.Client.Call[Req, Resp]` |
+| 泛型类型 | `state.Snapshot[T]`、`jsonrpc.Client.Call` 的返回值 |
+| `errors.AsType[E]` | `apierror.KindOf` / `Wrap` / `ClientMessage`，去掉 `var target *T; errors.As(...)` 样板 |
+| `sync.WaitGroup.Go` | `workerpool` 的 worker 启动与等待 |
+| `testing/synctest` | 日志采样窗口测试用虚拟时钟，去掉真实 sleep |
+| 函数类型推断改进 | `RegisterTyped` 的 handler 实参直接推断类型参数，无需显式写 |
+
+`encoding/json/v2`、`uuid`、实验性 `simd` 在 1.27 已可用，本库暂未使用（配置解析仍在冷路径，
+热路径 JSON 用 sonic）。需要时可以按包逐步切换。
+
+## 配置参考
+
+```json
+{
+  "service": { "name": "myapp", "env": "dev" },
+  "http": { "host": "0.0.0.0", "port": 8080, "readTimeout": "10s", "writeTimeout": "10s",
+            "idleTimeout": "60s", "shutdownTimeout": "10s", "maxBodyBytes": 1048576 },
+  "grpc": { "host": "0.0.0.0", "port": 9090, "shutdownTimeout": "10s" },
+  "tcp": { "enabled": false, "host": "0.0.0.0", "port": 7070, "workers": 4, "queueSize": 1024,
+           "maxFrameBytes": 1048576, "readTimeout": "60s", "shutdownTimeout": "5s" },
+  "admin": { "host": "127.0.0.1", "port": 6060 },
+  "log": {
+    "level": "info", "format": "terminal", "output": "stdout", "color": "auto", "addSource": false,
+    "file": { "path": "logs/app.log", "maxSizeMB": 100, "maxBackups": 5, "maxAgeDays": 7, "compress": true },
+    "sampling": { "enabled": false, "initial": 100, "thereafter": 100, "tick": "1s" }
+  },
+  "limiter": { "rps": 0, "burst": 0 },
+  "auth": { "enabled": false, "apiKeys": [], "jwt": { "secret": "", "issuer": "myapp", "audience": "" } },
+  "telemetry": { "enabled": false, "otlpEndpoint": "127.0.0.1:4318", "insecure": true, "sampleRatio": 1.0 },
+  "storage": { "redis": { "enabled": false, "addr": "127.0.0.1:6379", "password": "", "db": 0,
+                          "prefix": "myapp", "bucketTtl": "25h", "queueSize": 4096 } },
+
+  "database": { "dsn": "postgres://localhost/app" }
+}
+```
 
 ## 日志
 
-日志分两层：`internal/slogx` 是**展示层**（slog handler 与格式化，只依赖标准库，可整包复制到其它服务），
-`internal/logging` 是**装配层**（读配置、选 sink、轮转、级别、request-scoped logger），业务代码只 import `logging`。
-
-`slogx` 是 not-only-mining-pool 日志库的移植（其本身是 go-ethereum `log` 包的 slog 版），
-输出形如：
+两层结构：`slogx`（一行长什么样，零依赖）与 `logging`（写到哪、什么级别、带什么字段）。
 
 ```
-INFO  2026-09-27T01:31:46.481Z middleware.go:47  - http request    service=gosvc env=dev version=... request_id=... method=GET route=/api/v1/hello status=200
+INFO  2026-09-27T01:31:46.481Z middleware.go:47   - http request   service=myapp env=dev request_id=... method=GET route=/api/v1/orders status=200
 ```
 
-**结构化日志怎么落盘？** 推荐默认 **stdout 输出 JSON，由平台收集**（Docker/k8s/systemd 负责轮转），
-进程自己写文件只适合裸机部署。本模板两种都支持：
+- `format`: `auto`（dev→terminal，其它→json）| `terminal` | `json` | `logfmt`；
+- `output`: `stdout`（推荐，交给平台收集）| `file` | `both`（终端彩色、文件固定 JSON + lumberjack 轮转）；
+- **采样**：按 `(级别, 消息)` 计数，每窗口前 `initial` 条必出、之后每 `thereafter` 条抽 1 条，`warn`/`error` 豁免；
+- 运行期改级别 `PUT /debug/loglevel`，采样计数 `GET /debug/logstats`。
 
-```json
-"log": {
-  "level": "info",          // trace|debug|info|warn|error
-  "format": "terminal",     // auto|terminal|json|logfmt（auto：dev→terminal，其它→json）
-  "output": "stdout",       // stdout|file|both
-  "color": "auto",          // auto|always|never
-  "addSource": false,       // JSON sink 是否带源码位置
-  "file": {
-    "path": "logs/gosvc.log",
-    "maxSizeMB": 100,
-    "maxBackups": 5,
-    "maxAgeDays": 7,
-    "compress": true
-  },
-  "sampling": {
-    "enabled": false,
-    "initial": 100,
-    "thereafter": 100,
-    "tick": "1s"
-  }
-}
-```
+## 运维端点（admin 端口）
 
-- `output: "both"` 时，**终端用彩色 terminal 格式，文件固定 JSON**（便于采集与检索），由 lumberjack 轮转；
-- 运行期改级别：`PUT /debug/loglevel {"level":"debug"}`（终端与文件 sink 同步生效）；
-- **高 QPS 降噪（采样）**：按 `(级别, 消息)` 计数，每个 `tick` 窗口内前 `initial` 条必出，之后每 `thereafter` 条抽 1 条；
-  `warn`/`error` 永不采样。计数看 `GET /debug/logstats`，例如：
-  ```json
-  {"enabled":true,"emitted":2,"dropped":6,"droppedByLevel":{"INFO":6}}
-  ```
-  它和 tracing 的 `sampleRatio` 互补：日志采样按消息去重、保留完整请求上下文，tracing 按请求采样；
-- 所有请求日志带 `request_id`（HTTP 响应头回写 `X-Request-ID`，gRPC 通过 metadata 传播）；
-- Hertz 内部日志通过 `hlog.FullLogger` 适配器汇入同一 logger。
-
-> 说明：`internal/slogx` 只移植了 handler/format 部分（未包含原项目的 glog verbosity 与
-> `Crit=os.Exit` 行为），级别控制改由 `slog.LevelVar` + admin 接口提供。
-
-## 认证
-
-```json
-"auth": {
-  "enabled": true,
-  "apiKeys": ["key-1", "key-2"],
-  "jwt": { "secret": "at-least-16-chars", "issuer": "gosvc", "audience": "" }
-}
-```
-
-```bash
-# API Key
-curl -H 'X-API-Key: key-1' http://127.0.0.1:8080/api/v1/info
-# JWT（HS256）
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/info
-# gRPC
-grpcurl -plaintext -H 'x-api-key: key-1' -d '{"name":"x"}' 127.0.0.1:9090 greeter.v1.Greeter/SayHello
-```
-
-密钥可用环境变量注入，避免写进配置文件：`GOSVC_AUTH_API_KEYS=key-1,key-2`（自动开启认证）。
-
-## 链路追踪
-
-```json
-"telemetry": { "enabled": true, "otlpEndpoint": "127.0.0.1:4318", "insecure": true, "sampleRatio": 1.0 }
-```
-
-或 `GOSVC_OTLP_ENDPOINT=127.0.0.1:4318`。启用后：HTTP 每个请求一个 server span（W3C TraceContext
-提取/注入），gRPC 使用 `otelgrpc` StatsHandler，服务名/版本/环境写入 resource。
-
-## TCP 传输（netpoll）
-
-```json
-"tcp": { "enabled": true, "host": "0.0.0.0", "port": 7070, "workers": 4, "queueSize": 1024, "maxFrameBytes": 1048576, "readTimeout": "60s", "shutdownTimeout": "5s" }
-```
-
-- 协议：**行分隔 JSON-RPC 2.0**，与 HTTP 的 `/rpc` 完全同一套方法；
-- 读取在 netpoll EventLoop（每连接串行 OnRequest），业务投递到**有界 worker pool**：
-  队列满立即返回 `-32004 server busy`，不会无限堆积；
-- 写路径按连接加锁（netpoll 要求同一连接写串行化），帧超限直接断开；
-- **不做 TLS**：请在网关（nginx/HAProxy）终止 TLS 与 PROXY protocol，内网明文；
-- 该传输也写入 JSON-RPC 指标与 `tcp.requests` 时间序列。
-
-## 时间序列存储（Redis）
-
-```json
-"storage": { "redis": { "enabled": true, "addr": "127.0.0.1:6379", "prefix": "gosvc", "bucketTtl": "25h", "queueSize": 4096 } }
-```
-
-或 `GOSVC_REDIS_ADDR=127.0.0.1:6379`。
-
-- 请求路径只做 `recorder.Incr`（非阻塞入队），后台单写者聚合后按**分钟桶**批量写 Redis：
-  `{prefix}:ts:{metric}:{yyyyMMddHHmm}`，带 TTL；
-- 查询：`GET /debug/ts?metric=http.requests:/api/v1/hello&minutes=60`；
-- 为什么不用 ZSET 全量扫描？见 `internal/store/redisx/store.go` 的注释——这是从原挖矿池项目
-  吸取的教训（大时间窗全量拉取会拖垮 Redis）。
-
-## 配置热更新
-
-启动时传入 `-c config.json` 即自动开启：fsnotify 监听文件所在目录（300ms 去抖），
-编辑器与 Kubernetes ConfigMap 的原子替换（rename）也能捕获。
-
-| 变更 | 行为 |
+| 端点 | 说明 |
 |---|---|
-| `log.*`（级别、格式、sink、轮转、采样） | 热生效，通过 `slogx.SwapHandler` 替换 handler 链 |
-| `auth.*`（API Key / JWT） | 热生效，凭据原子替换（校验失败保留旧值） |
-| `limiter.*`（rps/burst） | 热生效，重建桶并清空旧计数 |
-| `service` / `http` / `grpc` / `tcp` / `admin` / `telemetry` / `storage` | 不热更，重载日志中以 `restartRequired` 列出 |
+| `GET /healthz` / `GET /readyz` | 存活 / 就绪（k8s 探针可用 `app -healthcheck <url>`） |
+| `GET /metrics` | Prometheus（HTTP / JSON-RPC / gRPC / Go runtime） |
+| `GET /debug/pprof/*` | CPU、heap、goroutine |
+| `GET/PUT /debug/loglevel` | 查看/修改日志级别 |
+| `GET /debug/logstats` | 采样计数 |
+| `GET /debug/config` | 当前生效配置（密钥脱敏） |
+| `POST /debug/reload` | 手动触发配置重载（ConfigMap 场景） |
+| `GET /debug/ts?metric=...&minutes=60` | Redis 分钟桶查询 |
+
+## 示例应用
 
 ```bash
-curl -X POST http://127.0.0.1:6060/debug/reload   # 手动触发（ConfigMap 挂载场景）
-curl http://127.0.0.1:6060/debug/config           # 当前生效配置（密钥脱敏为 ***）
+make run          # 启动 examples/app（四协议 + 可观测性）
+make bench        # rest 压测
+go test ./...     # 单元 + 端到端（含热更新、采样、认证）
+go run ./examples/kitex/cmd -mode server   # Kitex 示例
 ```
 
-重载走与启动完全相同的加载链路（默认值 < 文件 < 环境变量）并重新校验；
-校验失败时保留当前配置并记录错误，不会让服务处于半更新状态。日志形如：
-
-```
-INFO  2026-09-26T19:08:56.141Z app.go:278 - configuration reloaded  changed="[log auth]" restartRequired=[]
-```
-
-## 测试与压测
-
-```bash
-make test      # 单元测试
-make race      # -race 全量（CI 同款）
-make lint      # gofmt + go vet
-make proto     # 重新生成 protobuf
-make kitex     # 重新生成 Kitex 示例代码
-```
-
-- `internal/jsonrpc`：协议层单测（批量、通知、错误码、参数校验）；
-- `internal/auth`：API Key / JWT（含错误密钥、错误算法、过期）与运行期 `Reload`；
-- `internal/slogx`：terminal 格式、级别过滤、格式/级别解析，以及采样（首 N/每 N、豁免 warn/error、
-  派生 logger 共享计数、窗口重置）与 `SwapHandler`；
-- `internal/ratelimit`：启停、限流与运行期 `SetRate`；
-- `internal/workerpool`：执行、背压、关闭、panic 恢复；
-- `internal/store/redisx`：基于 miniredis 的桶读写与聚合刷新；
-- `test/e2e`：真实启动全部端口，覆盖 REST、JSON-RPC、TCP、gRPC、认证（HTTP+gRPC）、
-  metrics、运行期日志级别、采样统计、**配置热更新**（改文件 → 认证/级别生效、密钥脱敏、手动 reload）、
-  优雅关闭；
-- `examples/kitex`：真实起 Kitex server，client 分别用 host-ports 与静态 resolver 调用。
+`examples/app` 演示了推荐的分层：`config.go`（嵌入配置）、`bindings.go`（三协议绑定）、
+`greeter/`（领域服务）、`cmd/`（入口与压测器）、`e2e_test.go`（端到端测试）。
 
 ## 部署
 
@@ -324,38 +311,27 @@ make docker
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-- distroless + 非 root；健康检查复用二进制：`gosvc -healthcheck http://127.0.0.1:6060/healthz`；
-- **admin 端口只应暴露在内网**（默认绑定 `127.0.0.1`）；
-- 生产建议：网关终止 TLS；Redis 使用独立实例或 Sentinel/Cluster（当前为单机客户端，替换
-  `redis.NewClient` 即可接入集群客户端）。
+distroless + 非 root；admin 端口默认只绑 `127.0.0.1`；TCP 传输不做 TLS，请在网关终止。
 
 ## 设计取舍
 
-- **Hertz** 作为 HTTP 层：性能好、中间件生态完整，业务通过 `internal/transport/http` 隔离；
-- **sonic** 作为 JSON 编解码：热路径零拷贝/JIT，非 amd64/arm64 自动退化；
-- **gRPC 用 grpc-go 而不是 Kitex**：对外契约只需服务端 + 拦截器，grpc-go 生态最稳；
-  服务间 RPC 场景见 `examples/kitex`（可选层，核心不依赖）；
-- **标准库 `slog`** 作为日志门面：Hertz `hlog`、Kitex `klog` 都能通过适配器接入；
-- **JSON-RPC 只支持具名参数**：定位参数明确拒绝（-32602）；
-- **netpoll 只在 TCP 传输使用**：HTTP/gRPC 不需要为连接数优化，保持生态兼容。
+- **框架类型出现在 API 里**（`*server.Hertz`、`*grpc.Server`）：换取零额外抽象和完整的框架能力；
+  想换框架时只需替换 transport 包；
+- **一个共享 Dispatcher**：HTTP `/rpc` 与 TCP 方法只注册一次，指标也只记一份；
+- **认证默认全局开启**（healthz/readyz 白名单）：避免应用忘记给业务路由加鉴权；
+- **热更新只覆盖库拥有的字段**：应用自己的段通过 `WithOnReload` 处理；
+- **配置加载用泛型方法**：编译期保证 `*T` 可配置，避免运行时类型断言。
 
 ## Roadmap
 
-- [x] 认证与鉴权中间件（API Key / JWT）
-- [x] OpenTelemetry tracing
-- [x] Kitex 可选层示例（服务间 RPC + 服务发现扩展点）
-- [x] 自定义 TCP 协议示例（netpoll EventLoop + 有界 worker pool）
-- [x] Redis 存储与时间序列指标
-- [x] geth 风格日志（terminal/JSON/logfmt + 轮转文件 + 运行期级别）
-- [x] 配置热更新（fsnotify + 可热替换 handler）
-- [x] 日志采样（高 QPS 下 debug/info 降噪，warn/error 豁免）
 - [ ] Redis Cluster / Sentinel 客户端
-- [ ] 前端静态资源 embed 示例
+- [ ] 前端静态资源 embed 辅助（Hertz StaticFS + 构建产物）
+- [ ] OpenTelemetry 日志桥接（trace_id 注入日志）
+- [ ] 可选的结构化访问日志（access log 单独 sink）
 
 ## 重命名模块
 
 ```bash
-scripts/rename-module.sh github.com/you/your-service
-# 然后更新 api/greeter/v1/greeter.proto 与 api/kitex/echo.thrift 的包路径并重新生成：
-make proto kitex
+scripts/rename-module.sh github.com/you/gosvc
+make proto kitex     # 重新生成示例的 protobuf / Kitex 代码
 ```

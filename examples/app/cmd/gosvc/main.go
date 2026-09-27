@@ -1,0 +1,82 @@
+// Command gosvc runs the example application.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"example.com/gosvc/examples/app"
+	"example.com/gosvc/logging"
+	"example.com/gosvc/version"
+)
+
+const (
+	defaultConfigFile = "configs/config.example.json"
+	envPrefix         = "GOSVC"
+)
+
+func main() {
+	configPath := flag.String("c", defaultConfigFile, "path to the JSON config file")
+	healthcheck := flag.String("healthcheck", "", "GET the given URL and exit 0 when it returns 200 (for container health checks)")
+	flag.Parse()
+
+	if *healthcheck != "" {
+		os.Exit(runHealthcheck(*healthcheck))
+	}
+
+	if err := run(*configPath); err != nil {
+		slog.Error("fatal", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(configPath string) error {
+	cfg, err := app.Load(configPath, envPrefix)
+	if err != nil {
+		return err
+	}
+
+	logHandle, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, version.Version)
+	if err != nil {
+		return err
+	}
+	slog.SetDefault(logHandle.Logger())
+
+	application, err := app.Build(app.Options{
+		Config:     cfg,
+		Log:        logHandle,
+		ConfigPath: configPath,
+		EnvPrefix:  envPrefix,
+		Version:    version.Version,
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	return application.Run(ctx)
+}
+
+func runHealthcheck(url string) int {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck failed:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "healthcheck status:", resp.StatusCode)
+		return 1
+	}
+	return 0
+}

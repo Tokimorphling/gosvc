@@ -13,7 +13,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/server"
 
-	"example.com/gosvc/api/kitex/echo/echoservice"
+	"example.com/gosvc/examples/kitex/api/echo/echoservice"
 )
 
 func TestKitexEchoService(t *testing.T) {
