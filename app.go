@@ -81,6 +81,7 @@ type options struct {
 
 	tcpCodec          tcptransport.Codec
 	tcpCallbacks      tcptransport.Callbacks
+	tcpDispatcher     *jsonrpc.Dispatcher
 	jsonrpcMiddleware []jsonrpc.Middleware
 }
 
@@ -140,6 +141,18 @@ func WithTCPCallbacks(cb tcptransport.Callbacks) Option {
 // RegisterJSONRPC.
 func WithJSONRPCMiddleware(mw ...jsonrpc.Middleware) Option {
 	return func(o *options) { o.jsonrpcMiddleware = append(o.jsonrpcMiddleware, mw...) }
+}
+
+// WithTCPDispatcher gives the TCP transport a dedicated method table. The
+// shared dispatcher stays with the HTTP /rpc endpoint; the TCP transport
+// dispatches only on the given dispatcher, which the application builds and
+// populates before gosvc.New. Use it to keep a wire-specific protocol (for
+// example stratum mining.*) off HTTP /rpc, to isolate per-transport metrics
+// (set its own observer) or to apply different middleware. The runtime never
+// touches it otherwise: RegisterJSONRPC still registers on the shared
+// dispatcher.
+func WithTCPDispatcher(d *jsonrpc.Dispatcher) Option {
+	return func(o *options) { o.tcpDispatcher = d }
 }
 
 // App owns every transport, the shared dependencies and the lifecycle.
@@ -288,6 +301,10 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 	a.grpc = grpcServer
 
 	if cfg.TCP.Enabled {
+		tcpDispatcher := dispatcher
+		if o.tcpDispatcher != nil {
+			tcpDispatcher = o.tcpDispatcher
+		}
 		tcpServer, err := tcptransport.New(tcptransport.Options{
 			Config:     cfg,
 			Logger:     logger,
@@ -295,7 +312,7 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 			Limiter:    a.limiter,
 			Recorder:   a.recorders,
 			Ready:      a.ready,
-			Dispatcher: dispatcher,
+			Dispatcher: tcpDispatcher,
 			Tracer:     tracer.Tracer,
 			Codec:      o.tcpCodec,
 			Callbacks:  o.tcpCallbacks,

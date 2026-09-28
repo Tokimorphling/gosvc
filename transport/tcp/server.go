@@ -41,6 +41,7 @@ import (
 	"github.com/Tokimorphling/gosvc/jsonrpc"
 	"github.com/Tokimorphling/gosvc/logging"
 	"github.com/Tokimorphling/gosvc/observability"
+	"github.com/Tokimorphling/gosvc/push"
 	"github.com/Tokimorphling/gosvc/ratelimit"
 	"github.com/Tokimorphling/gosvc/store"
 )
@@ -91,6 +92,9 @@ type Server struct {
 
 	codec     Codec
 	callbacks Callbacks
+	// serialPerConn is resolved once at construction from the codec's
+	// optional Serial capability.
+	serialPerConn bool
 
 	// shutdownFrame is the going-away frame rendered in the active dialect.
 	shutdownFrame []byte
@@ -122,6 +126,12 @@ type connState struct {
 	// disconnects, so OnDisconnect can report the cause. Peer-initiated
 	// closes leave it nil.
 	closeReason atomic.Pointer[error]
+
+	// prevDone is the completion signal of the previous in-flight frame of
+	// this connection. It is only read and written on the event loop
+	// goroutine (netpoll serialises OnRequest per connection), so it needs
+	// no lock; worker goroutines only close the channels they own.
+	prevDone chan struct{}
 }
 
 type connStateKey struct{}
@@ -159,6 +169,9 @@ func New(opts Options) (*Server, error) {
 	if opts.Codec != nil {
 		if frame, err := opts.Codec.EncodeNotification(MethodShutdown, nil); err == nil {
 			s.shutdownFrame = frame
+		}
+		if serial, ok := opts.Codec.(Serial); ok {
+			s.serialPerConn = serial.SerialPerConn()
 		}
 	}
 	s.pool.SetPanicHandler(func(recovered any) {
@@ -286,10 +299,44 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 	copy(body, line)
 	_ = connection.Reader().Release()
 
-	if err := s.pool.Submit(func() { s.process(connection, ctx, body) }); err != nil {
+	if err := s.dispatch(connection, ctx, body); err != nil {
 		s.reject(ctx, connection, busyError(), busyFrame)
 	}
 	return nil
+}
+
+// dispatch hands one frame to the worker pool. Under a serial codec the
+// frame also waits for the previous frame of the same connection, which
+// turns the pool into a per-connection FIFO without extra goroutines: the
+// chain state lives on the event loop, and each worker closes the done
+// channel it was handed.
+func (s *Server) dispatch(connection netpoll.Connection, ctx context.Context, body []byte) error {
+	task := func() { s.process(connection, ctx, body) }
+	if !s.serialPerConn {
+		return s.pool.Submit(task)
+	}
+
+	state, _ := ctx.Value(connStateKey{}).(*connState)
+	if state == nil {
+		return s.pool.Submit(task)
+	}
+
+	prev := state.prevDone
+	done := make(chan struct{})
+	state.prevDone = done
+	err := s.pool.Submit(func() {
+		if prev != nil {
+			<-prev
+		}
+		defer close(done)
+		s.process(connection, ctx, body)
+	})
+	if err != nil {
+		// The task never ran: roll the chain back so the next frame does not
+		// wait on a completion that will never happen.
+		state.prevDone = prev
+	}
+	return err
 }
 
 // reject writes a protocol-level error frame: through the codec when one is
@@ -326,6 +373,12 @@ func (s *Server) process(connection netpoll.Connection, parent context.Context, 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), s.cfg.HandlerTimeout.D())
 	defer cancel()
 	ctx = logging.WithRequestID(ctx, logging.NewRequestID())
+	// Transport identity (for middleware branching) and the push sink (for
+	// subscribe-style handlers) are part of every TCP request context.
+	ctx = jsonrpc.WithTransport(ctx, "tcp")
+	if state, ok := parent.Value(connStateKey{}).(*connState); ok {
+		ctx = push.WithSink(ctx, connSink{state: state})
+	}
 
 	var span trace.Span
 	if s.tracer != nil {

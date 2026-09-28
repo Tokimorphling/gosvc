@@ -7,6 +7,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app/server"
 
 	"github.com/Tokimorphling/gosvc/apierror"
+	"github.com/Tokimorphling/gosvc/jsonrpc"
 )
 
 // registerRoutes wires the endpoints owned by the runtime. Application routes
@@ -37,6 +38,7 @@ func (s *Server) handleReadyz(_ context.Context, c *app.RequestContext) {
 }
 
 func (s *Server) handleJSONRPC(ctx context.Context, c *app.RequestContext) {
+	ctx = jsonrpc.WithTransport(ctx, "http")
 	resp, ok := s.dispatcher.Serve(ctx, c.Request.Body())
 	if !ok {
 		c.SetStatusCode(204)

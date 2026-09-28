@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/Tokimorphling/gosvc/config"
 	"github.com/Tokimorphling/gosvc/health"
 	"github.com/Tokimorphling/gosvc/jsonrpc"
+	"github.com/Tokimorphling/gosvc/push"
 )
 
 // textCodec is a deliberately non-JSON-RPC dialect used to exercise the codec
@@ -84,6 +86,105 @@ func (textCodec) EncodeNotification(method string, params any) ([]byte, error) {
 		return nil, err
 	}
 	return []byte(fmt.Sprintf("PUSH %s %s", method, raw)), nil
+}
+
+// serialTextCodec is the text dialect with per-connection serial dispatch
+// requested, the way an order-dependent protocol like stratum would.
+type serialTextCodec struct{ textCodec }
+
+func (serialTextCodec) SerialPerConn() bool { return true }
+
+// TestCodecSerialPerConn verifies that a serial codec's frames are executed
+// strictly in arrival order even when the client pipelines them: the slow
+// first call completes before the fast second one starts.
+func TestCodecSerialPerConn(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+
+	dispatcher := jsonrpc.NewDispatcher()
+	slow := func(_ context.Context, _ json.RawMessage) (any, error) {
+		time.Sleep(150 * time.Millisecond)
+		mu.Lock()
+		order = append(order, "slow")
+		mu.Unlock()
+		return "slow", nil
+	}
+	fast := func(_ context.Context, _ json.RawMessage) (any, error) {
+		mu.Lock()
+		order = append(order, "fast")
+		mu.Unlock()
+		return "fast", nil
+	}
+	dispatcher.Register("slow", slow)
+	dispatcher.Register("fast", fast)
+
+	h := startHarness(t, func(o *Options) {
+		o.Codec = serialTextCodec{}
+		o.Dispatcher = dispatcher
+	})
+	defer h.stop()
+
+	conn, reader := dial(t, h.addr)
+	defer conn.Close()
+
+	// Pipeline both calls back to back.
+	if _, err := conn.Write([]byte("CALL 1 slow\nCALL 2 fast\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	first, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read first: %v", err)
+	}
+	second, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read second: %v", err)
+	}
+
+	if first != "RESULT 1 \"slow\"\n" || second != "RESULT 2 \"fast\"\n" {
+		t.Fatalf("first = %q, second = %q", first, second)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] != "slow" || order[1] != "fast" {
+		t.Fatalf("execution order = %v, want [slow fast]", order)
+	}
+}
+
+// TestSinkInjectedIntoDispatchContext verifies that TCP requests carry a
+// push.Sink resolvable through push.SinkFromContext, usable by generic
+// subscribe handlers.
+func TestSinkInjectedIntoDispatchContext(t *testing.T) {
+	var sinkSeen atomic.Bool
+	dispatcher := jsonrpc.NewDispatcher()
+	dispatcher.Register("probe", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if _, ok := push.SinkFromContext(ctx); ok {
+			sinkSeen.Store(true)
+		}
+		if jsonrpc.TransportFromContext(ctx) != "tcp" {
+			return nil, errors.New("transport identity not injected")
+		}
+		return "ok", nil
+	})
+
+	h := startHarness(t, func(o *Options) {
+		o.Dispatcher = dispatcher
+	})
+	defer h.stop()
+
+	conn, reader := dial(t, h.addr)
+	defer conn.Close()
+	send(t, conn, `{"jsonrpc":"2.0","id":1,"method":"probe"}`)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(line, `"result":"ok"`) {
+		t.Fatalf("line = %q", line)
+	}
+	if !sinkSeen.Load() {
+		t.Fatal("the dispatch context must carry a push sink")
+	}
 }
 
 // harness runs a Server on an ephemeral port with the given options and

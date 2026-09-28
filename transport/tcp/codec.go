@@ -57,6 +57,17 @@ type Codec interface {
 	EncodeNotification(method string, params any) ([]byte, error)
 }
 
+// Serial is the optional capability a codec can implement to request
+// per-connection serial dispatch: frames on the same connection are executed
+// strictly in arrival order. Order-dependent protocols (stratum's
+// authorize-before-submit invariant) need it; the default JSON-RPC path
+// stays concurrent, since JSON-RPC clients must tolerate out-of-order
+// responses anyway.
+type Serial interface {
+	// SerialPerConn reports whether the dialect's calls are order-dependent.
+	SerialPerConn() bool
+}
+
 // Protocol-level errors behind the server frames; codecs map these onto
 // their own error shapes through apierror.KindOf.
 func notReadyError() error { return apierror.New(apierror.KindUnavailable, "service not ready") }

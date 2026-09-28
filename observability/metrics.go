@@ -23,6 +23,10 @@ type Metrics struct {
 	grpcDuration  *prometheus.HistogramVec
 	notifySent    *prometheus.CounterVec
 	notifyDropped *prometheus.CounterVec
+
+	brokerSubscribers *prometheus.GaugeVec
+	brokerDelivered   *prometheus.CounterVec
+	brokerDropped     *prometheus.CounterVec
 }
 
 // New builds the registry and registers all collectors.
@@ -72,6 +76,18 @@ func New(service string) *Metrics {
 			Namespace: namespace, Name: "notify_dropped_total",
 			Help: "Total number of outbound notifications dropped (queue full or session closed).", ConstLabels: labels,
 		}, []string{"transport", "codec", "reason"}),
+		brokerSubscribers: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "broker_subscribers",
+			Help: "Current number of live broker subscribers.", ConstLabels: labels,
+		}, []string{"broker"}),
+		brokerDelivered: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "broker_delivered_total",
+			Help: "Total number of broker events handed to a subscriber sink.", ConstLabels: labels,
+		}, []string{"broker"}),
+		brokerDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "broker_dropped_total",
+			Help: "Total number of broker events dropped (queue full, sink error or closed).", ConstLabels: labels,
+		}, []string{"broker", "reason"}),
 	}
 
 	registry.MustRegister(
@@ -79,6 +95,7 @@ func New(service string) *Metrics {
 		m.rpcRequests, m.rpcDuration,
 		m.grpcRequests, m.grpcDuration,
 		m.notifySent, m.notifyDropped,
+		m.brokerSubscribers, m.brokerDelivered, m.brokerDropped,
 	)
 	return m
 }
@@ -124,4 +141,31 @@ func (m *Metrics) ObserveNotifyDropped(transport, codec, reason string) {
 		return
 	}
 	m.notifyDropped.WithLabelValues(transport, codec, reason).Inc()
+}
+
+// SetBrokerSubscribers sets the live subscriber gauge of one broker. A nil
+// Metrics records nothing.
+func (m *Metrics) SetBrokerSubscribers(broker string, n int) {
+	if m == nil {
+		return
+	}
+	m.brokerSubscribers.WithLabelValues(broker).Set(float64(n))
+}
+
+// ObserveBrokerDelivered records one event handed to a subscriber sink. A
+// nil Metrics records nothing.
+func (m *Metrics) ObserveBrokerDelivered(broker string) {
+	if m == nil {
+		return
+	}
+	m.brokerDelivered.WithLabelValues(broker).Inc()
+}
+
+// ObserveBrokerDropped records one dropped broker event. reason is
+// "queue_full", "sink_error" or "closed". A nil Metrics records nothing.
+func (m *Metrics) ObserveBrokerDropped(broker, reason string) {
+	if m == nil {
+		return
+	}
+	m.brokerDropped.WithLabelValues(broker, reason).Inc()
 }

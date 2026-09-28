@@ -125,8 +125,8 @@ func main() {
 | 无锁状态 | `state.Snapshot[T]` 提供读无锁、写替换的共享状态 |
 | 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 热生效，`storage.*` **重建连接**（新连接就绪后切换，失败保留旧连接且有效配置回滚），其余字段提示 `restartRequired` |
 | 有界并发 | `workerpool`（显式 `ErrFull`/`ErrClosed`）+ netpoll 事件循环 + 每连接写串行化，慢业务不阻塞 IO；TCP 帧长在缓冲前强制（防恶意大帧） |
-| 推送（push） | 三种形态按传输显式提供：TCP 出站 JSON-RPC notification（每连接有界队列 + drop/disconnect 背压策略）、SSE（复用现有中间件链）、gRPC streaming（拦截器链全覆盖）；不做 WebSocket、不做 HTTP/2 server push |
-| 扩展点 | TCP 帧方言 `tcp.Codec`（stratum 等非 JSON-RPC 协议可直接落 gosvc TCP）、连接生命周期 `tcp.Callbacks`（OnConnect/OnDisconnect 恰好一次）、逐方法 `jsonrpc.Middleware`（覆盖 HTTP /rpc + TCP 全部路径）；三者对默认行为零侵入 |
+| 推送（push） | `push.Broker[T]` 统一 fan-out：订阅登记/背压/死连接剪枝/shutdown 排空全归框架；`Sink` 适配 TCP session / SSE / gRPC stream 三种形态，`SinkFromContext` 让 "subscribe" 方法零胶水 |
+| 扩展点 | TCP 帧方言 `tcp.Codec`（stratum 等非 JSON-RPC 协议可直接落 gosvc TCP）、连接生命周期 `tcp.Callbacks`（OnConnect/OnDisconnect 恰好一次）、逐方法 `jsonrpc.Middleware`（覆盖 HTTP /rpc + TCP 全部路径）、串行派发 `Serial` 能力、按传输方法表 `WithTCPDispatcher`；默认行为零侵入 |
 | 真正的优雅退出 | 四个传输的 `Serve` 都会 join 自己的 drain：`Run` 返回时，在途请求已处理完（受各 `shutdownTimeout` 约束），不会随进程退出被掐断 |
 | 压测器 | `examples/app/cmd/bench` 支持 rest / jsonrpc / grpc |
 
@@ -197,7 +197,7 @@ app.HTTPAddr() / GRPCAddr() / TCPAddr() / AdminAddr()
 app.Reload()            // 手动重载配置
 ```
 
-选项：`WithLogger`、`WithVersion`、`WithHotReload(path, envPrefix)`、`WithPublicPaths(...)`、`WithOnReload(fn)`、`WithTCPCodec(codec)`、`WithTCPCallbacks(cb)`、`WithJSONRPCMiddleware(mw...)`。
+选项：`WithLogger`、`WithVersion`、`WithHotReload(path, envPrefix)`、`WithPublicPaths(...)`、`WithOnReload(fn)`、`WithTCPCodec(codec)`、`WithTCPCallbacks(cb)`、`WithJSONRPCMiddleware(mw...)`、`WithTCPDispatcher(d)`。
 
 ### 配置
 
@@ -234,6 +234,32 @@ order, err := client.Call[GetOrderRequest, *Order](ctx, "orders.get", GetOrderRe
 ## 推送（push）
 
 推送不是 Dispatcher 的通用能力，而是**按传输、显式声明**的一等能力：`RegisterTyped` 的请求/响应模型保持不动。三种形态：
+
+### Broker：fan-out 一处收口
+
+订阅登记、逐订阅者背压、死连接剪枝、shutdown 排空——这些每应用都要抄一遍的胶水由
+`push.Broker[T]` 统一提供。`Publish` 永不阻塞：每个订阅者一条有界队列 + 一个 pump
+goroutine，慢客户端只拖慢自己；队列满按策略 `drop`（默认，计数）或 `disconnect`
+（终结慢消费者，重连重订阅）。指标：`gosvc_broker_subscribers/delivered_total/dropped_total`。
+
+```go
+events := push.NewBroker[Event]("events", push.WithQueueSize(256), push.WithPolicy(push.Drop))
+
+// subscribe 型 handler：从 ctx 拿当前传输的 sink（TCP 有，HTTP /rpc 没有）
+d.RegisterTyped("events.subscribe", func(ctx context.Context, _ struct{}) (map[string]any, error) {
+    sink, ok := push.SinkFromContext(ctx)
+    if !ok {
+        return nil, apierror.New(apierror.KindInvalidArgument, "requires the TCP transport")
+    }
+    events.Subscribe(sink)
+    return map[string]any{"subscribers": events.Len()}, nil
+})
+
+// 业务触发：一次 Publish，全部订阅者收到
+events.Publish("events.pong", Event{At: time.Now()})
+
+// 传输适配：session.AsSink()（TCP）/ stream.AsSink()（SSE）/ push.StreamSink{Stream: serverStream}
+```
 
 ### TCP：出站 JSON-RPC notification
 
@@ -360,6 +386,18 @@ d.UseFor("mining.submit", func(next jsonrpc.HandlerFunc) jsonrpc.HandlerFunc {
 error、日志字段可用。TCP 默认不鉴权——per-method middleware 正是补 TCP 鉴权的自然位置。
 `SetObserver`（指标缝）与 middleware 并存：收敛成内置 middleware 会丢掉默认路径上
 malformed 请求的指标覆盖，违背零变化约束，故保留。
+
+### 派发控制与传输身份
+
+- **串行派发**：协议有「同一连接内先后依赖」（stratum 的 `authorize` → `submit`）时，
+  codec 实现可选接口 `tcp.Serial`（`SerialPerConn() bool`）——该连接的帧严格按到达顺序
+  执行（每连接 done-channel 链实现，零额外 goroutine）；默认路径保持并发，因为 JSON-RPC
+  客户端本就必须容忍响应乱序。
+- **传输身份**：`jsonrpc.TransportFromContext(ctx)` 返回 `"tcp"` / `"http"`，中间件可按
+  传输分支（例如 TCP 无传输层鉴权 → 严格模式）。
+- **按传输方法表**：`gosvc.WithTCPDispatcher(d)` 给 TCP 一张独立方法表（app 自建并注册），
+  把 `mining.*` 这类方言方法挡在 HTTP `/rpc` 之外，也让两个表各自 `SetObserver` /
+  `Use`，实现按传输的观测与中间件隔离。默认仍共享。
 
 ### 错误映射
 

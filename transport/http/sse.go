@@ -10,6 +10,7 @@ import (
 	hertzsse "github.com/cloudwego/hertz/pkg/protocol/sse"
 
 	"github.com/Tokimorphling/gosvc/observability"
+	"github.com/Tokimorphling/gosvc/push"
 )
 
 // Server-sent events.
@@ -42,6 +43,7 @@ const SSEHeartbeat = sseHeartbeat
 // SSEStream writes server-sent events to one connected client.
 type SSEStream struct {
 	ctx     context.Context
+	cancel  context.CancelFunc
 	writer  *hertzsse.Writer
 	metrics *observability.Metrics
 }
@@ -69,6 +71,33 @@ func (s *SSEStream) Ping() error {
 // Done is closed when the client disconnects or the runtime shuts down; the
 // handler should return promptly afterwards.
 func (s *SSEStream) Done() <-chan struct{} { return s.ctx.Done() }
+
+// Close terminates the stream end to end: the handler's context cancels, so
+// Done fires and the request finishes. It is the sink termination for the
+// broker's Disconnect policy.
+func (s *SSEStream) Close() error {
+	s.cancel()
+	return nil
+}
+
+// AsSink adapts the stream to a push.Sink, so a push.Broker can fan events
+// out to browsers through the same API it uses for TCP sessions. The broker
+// owns the writes; the handler subscribes and then waits on Done.
+func (s *SSEStream) AsSink() push.Sink {
+	if s == nil {
+		return nil
+	}
+	return sseSink{s}
+}
+
+type sseSink struct {
+	stream *SSEStream
+}
+
+func (x sseSink) Send(event string, data any) error { return x.stream.Send(event, data) }
+func (x sseSink) Done() <-chan struct{}             { return x.stream.Done() }
+func (x sseSink) Close() error                      { return x.stream.Close() }
+func (x sseSink) ID() string                        { return "sse" }
 
 // RegisterSSE serves server-sent events at path. handler runs for the whole
 // lifetime of the streaming response, on the request's goroutine, and should
@@ -101,12 +130,17 @@ func (s *SSEStream) Done() <-chan struct{} { return s.ctx.Done() }
 // log entry is written when the stream ends.
 func RegisterSSE(h *server.Hertz, path string, metrics *observability.Metrics, handler func(ctx context.Context, stream *SSEStream)) {
 	h.GET(path, func(ctx context.Context, c *app.RequestContext) {
+		// The cancellable context is what Close() triggers, so broker-driven
+		// disconnects end the handler exactly like a client hangup.
+		streamCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
 		stream := &SSEStream{
-			ctx:     ctx,
+			ctx:     streamCtx,
+			cancel:  cancel,
 			writer:  hertzsse.NewWriter(c),
 			metrics: metrics,
 		}
-		handler(ctx, stream)
+		handler(streamCtx, stream)
 		_ = stream.writer.Close()
 	})
 }

@@ -66,6 +66,12 @@ func (s *Server) onPrepare(connection netpoll.Connection) context.Context {
 	state := &connState{server: s, conn: connection, remote: connection.RemoteAddr().String()}
 	ctx := context.WithValue(context.Background(), connStateKey{}, state)
 
+	// The serial-dispatch chain starts "previous already completed" so the
+	// first frame never waits on a zero-value channel.
+	firstDone := make(chan struct{})
+	close(firstDone)
+	state.prevDone = firstDone
+
 	if s.callbacks != nil {
 		state.ensureSession()
 		conn := &Conn{

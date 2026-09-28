@@ -9,6 +9,7 @@ import (
 	"github.com/Tokimorphling/gosvc/examples/app/greeter"
 	"github.com/Tokimorphling/gosvc/jsonrpc"
 	"github.com/Tokimorphling/gosvc/logging"
+	"github.com/Tokimorphling/gosvc/push"
 )
 
 // Options wires the example application.
@@ -29,7 +30,7 @@ type Options struct {
 func Build(opts Options) (*gosvc.App, error) {
 	cfg := opts.Config
 	service := greeter.New(cfg.Service.Name, opts.Version, cfg.Greeting.Prefix, cfg.Greeting.MaxNameLen)
-	events := newEventsBroadcaster()
+	events := push.NewBroker[Event]("events")
 
 	runtimeOptions := []gosvc.Option{
 		gosvc.WithLogger(opts.Log),
