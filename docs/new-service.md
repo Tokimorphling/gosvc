@@ -422,6 +422,7 @@ gosvc.WithOnReload(func(cfg *gosvc.Config) error {
 - [ ] admin 端口只绑内网（默认 `127.0.0.1`），要暴露就设置 `admin.token`
 - [ ] TCP 传输（如启用）在网关终止 TLS
 - [ ] 需要推送时按传输选型：TCP `Session.Notify`（内部）/ SSE `RegisterSSE`（浏览器）/ gRPC `stream` RPC；订阅端点鉴权随现有中间件链
+- [ ] 自定义 TCP 协议（非 JSON-RPC 2.0）用 `gosvc.WithTCPCodec` 实现帧方言；按连接建注册表用 `WithTCPCallbacks`；逐方法鉴权/校验用 `WithJSONRPCMiddleware`（TCP 传输默认不鉴权，鉴权放 middleware）
 - [ ] 容器探针用 `myservice -healthcheck http://127.0.0.1:6060/healthz`
 
 ## 11. 常见坑

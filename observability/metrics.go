@@ -67,11 +67,11 @@ func New(service string) *Metrics {
 		notifySent: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "notify_sent_total",
 			Help: "Total number of outbound notifications accepted for delivery.", ConstLabels: labels,
-		}, []string{"transport"}),
+		}, []string{"transport", "codec"}),
 		notifyDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "notify_dropped_total",
 			Help: "Total number of outbound notifications dropped (queue full or session closed).", ConstLabels: labels,
-		}, []string{"transport", "reason"}),
+		}, []string{"transport", "codec", "reason"}),
 	}
 
 	registry.MustRegister(
@@ -105,22 +105,23 @@ func (m *Metrics) ObserveGRPC(method, code string, d time.Duration) {
 }
 
 // ObserveNotifySent records one outbound notification accepted for delivery
-// (it is queued for the client; actual delivery is asynchronous). A nil
-// Metrics records nothing.
-func (m *Metrics) ObserveNotifySent(transport string) {
+// (it is queued for the client; actual delivery is asynchronous). codec
+// identifies the wire dialect on TCP transports. A nil Metrics records
+// nothing.
+func (m *Metrics) ObserveNotifySent(transport, codec string) {
 	if m == nil {
 		return
 	}
-	m.notifySent.WithLabelValues(transport).Inc()
+	m.notifySent.WithLabelValues(transport, codec).Inc()
 }
 
-// ObserveNotifyDropped records one outbound notification that was dropped,
-// for example because the per-connection send queue was full (reason
-// "queue_full") or the session was already closed (reason "closed"). A nil
-// Metrics records nothing.
-func (m *Metrics) ObserveNotifyDropped(transport, reason string) {
+// ObserveNotifyDropped records one outbound notification that was dropped:
+// reason is "queue_full" (slow consumer) or "closed" (session gone) on TCP,
+// "write_error" on SSE. codec identifies the wire dialect. A nil Metrics
+// records nothing.
+func (m *Metrics) ObserveNotifyDropped(transport, codec, reason string) {
 	if m == nil {
 		return
 	}
-	m.notifyDropped.WithLabelValues(transport, reason).Inc()
+	m.notifyDropped.WithLabelValues(transport, codec, reason).Inc()
 }

@@ -78,6 +78,10 @@ type options struct {
 	source      config.Source
 	publicPaths []string
 	onReload    func(*config.Config) error
+
+	tcpCodec          tcptransport.Codec
+	tcpCallbacks      tcptransport.Callbacks
+	jsonrpcMiddleware []jsonrpc.Middleware
 }
 
 // WithLogger supplies the logging handle. When omitted, the runtime builds one
@@ -112,6 +116,30 @@ func WithPublicPaths(paths ...string) Option {
 // its own reloadable sections. Use it to reload application-specific settings.
 func WithOnReload(fn func(*config.Config) error) Option {
 	return func(o *options) { o.onReload = fn }
+}
+
+// WithTCPCodec installs a custom frame dialect on the TCP transport (see
+// transport/tcp.Codec). Nil keeps the strict JSON-RPC 2.0 behaviour.
+func WithTCPCodec(codec tcptransport.Codec) Option {
+	return func(o *options) { o.tcpCodec = codec }
+}
+
+// WithTCPCallbacks installs connection lifecycle callbacks on the TCP
+// transport: OnConnect runs when a connection is established (and eagerly
+// creates its push Session), OnDisconnect exactly once when it ends. Use it
+// for reliable connection-keyed registry cleanup.
+func WithTCPCallbacks(cb tcptransport.Callbacks) Option {
+	return func(o *options) { o.tcpCallbacks = cb }
+}
+
+// WithJSONRPCMiddleware appends middlewares to the shared JSON-RPC
+// dispatcher. They apply to every method on every transport that dispatches
+// through it (HTTP /rpc, TCP default path and custom codecs), which makes
+// them the natural place for per-method authorisation, validation or
+// feature switches. Equivalent to calling Dispatcher.Use inside
+// RegisterJSONRPC.
+func WithJSONRPCMiddleware(mw ...jsonrpc.Middleware) Option {
+	return func(o *options) { o.jsonrpcMiddleware = append(o.jsonrpcMiddleware, mw...) }
 }
 
 // App owns every transport, the shared dependencies and the lifecycle.
@@ -212,8 +240,12 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 	}
 
 	// One dispatcher shared by the HTTP /rpc endpoint and the TCP transport, so
-	// methods are registered once.
+	// methods are registered once. Middlewares from WithJSONRPCMiddleware wrap
+	// every method, including the built-ins registered below.
 	dispatcher := jsonrpc.NewDispatcher()
+	if len(o.jsonrpcMiddleware) > 0 {
+		dispatcher.Use(o.jsonrpcMiddleware...)
+	}
 	dispatcher.SetObserver(a.metrics.ObserveJSONRPC)
 	dispatcher.Register("system.methods", func(_ context.Context, _ json.RawMessage) (any, error) {
 		return dispatcher.Methods(), nil
@@ -265,6 +297,8 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 			Ready:      a.ready,
 			Dispatcher: dispatcher,
 			Tracer:     tracer.Tracer,
+			Codec:      o.tcpCodec,
+			Callbacks:  o.tcpCallbacks,
 		})
 		if err != nil {
 			return nil, err

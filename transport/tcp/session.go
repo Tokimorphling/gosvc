@@ -51,6 +51,23 @@ const sessionReapInterval = 2 * time.Second
 // before the event loop closes the listeners' connections.
 const shutdownGrace = 100 * time.Millisecond
 
+// codecName returns the metric label for the active dialect.
+func (s *Server) codecName() string {
+	if s.codec != nil {
+		return s.codec.Name()
+	}
+	return "jsonrpc"
+}
+
+// encodeNotification renders a server push in the active dialect: through the
+// codec when one is installed, JSON-RPC 2.0 otherwise.
+func (s *Server) encodeNotification(method string, params any) ([]byte, error) {
+	if s.codec != nil {
+		return s.codec.EncodeNotification(method, params)
+	}
+	return jsonrpc.EncodeNotification(method, params)
+}
+
 // Session sends JSON-RPC notifications to one TCP client. It is safe for
 // concurrent use and cheap to keep beyond the request that created it.
 type Session struct {
@@ -83,16 +100,17 @@ func SessionFromContext(ctx context.Context) *Session {
 	return state.ensureSession()
 }
 
-// Notify encodes params and queues a JSON-RPC notification for this client.
-// It never blocks: when the queue is full the configured policy applies
-// (drop: ErrNotifyDropped and the metric increments; disconnect: the
+// Notify encodes params and queues a JSON-RPC notification for this client,
+// in the dialect of the transport (the active codec, or JSON-RPC 2.0 by
+// default). It never blocks: when the queue is full the configured policy
+// applies (drop: ErrNotifyDropped and the metric increments; disconnect: the
 // connection is closed and ErrSessionClosed is returned). When the connection
 // is gone it returns ErrSessionClosed. Use NotifyTyped for the typed form.
 func (s *Session) Notify(method string, params any) error {
 	if s == nil {
 		return ErrSessionClosed
 	}
-	frame, err := jsonrpc.EncodeNotification(method, params)
+	frame, err := s.server.encodeNotification(method, params)
 	if err != nil {
 		return err
 	}
@@ -126,16 +144,16 @@ func (s *Session) Close() error {
 
 func (s *Session) enqueue(frame []byte) error {
 	if s.closed.Load() {
-		s.server.metrics.ObserveNotifyDropped("tcp", "closed")
+		s.server.metrics.ObserveNotifyDropped("tcp", s.server.codecName(), "closed")
 		return ErrSessionClosed
 	}
 	select {
 	case s.queue <- frame:
-		s.server.metrics.ObserveNotifySent("tcp")
+		s.server.metrics.ObserveNotifySent("tcp", s.server.codecName())
 		return nil
 	default:
 		// Queue full: apply the configured slow-consumer policy.
-		s.server.metrics.ObserveNotifyDropped("tcp", "queue_full")
+		s.server.metrics.ObserveNotifyDropped("tcp", s.server.codecName(), "queue_full")
 		if s.server.cfg.NotifyPolicy == "disconnect" {
 			_ = s.Close()
 			return ErrSessionClosed
@@ -240,7 +258,8 @@ func (state *connState) ensureSession() *Session {
 }
 
 // encodeShuttingDownFrame is precomputed so the shutdown broadcast stays
-// allocation-light across many sessions.
+// allocation-light across many sessions; servers with a custom codec render
+// their own version at construction.
 var shuttingDownFrame = func() []byte {
 	raw, err := jsonrpc.EncodeNotification(MethodShutdown, nil)
 	if err != nil {

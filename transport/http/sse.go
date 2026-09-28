@@ -53,10 +53,10 @@ func (s *SSEStream) Send(event string, data any) error {
 		return err
 	}
 	if err := s.writer.WriteEvent("", event, raw); err != nil {
-		s.metrics.ObserveNotifyDropped("sse", "write_error")
+		s.metrics.ObserveNotifyDropped("sse", "", "write_error")
 		return err
 	}
-	s.metrics.ObserveNotifySent("sse")
+	s.metrics.ObserveNotifySent("sse", "")
 	return nil
 }
 

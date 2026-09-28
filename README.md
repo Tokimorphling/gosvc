@@ -126,6 +126,7 @@ func main() {
 | 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 热生效，`storage.*` **重建连接**（新连接就绪后切换，失败保留旧连接且有效配置回滚），其余字段提示 `restartRequired` |
 | 有界并发 | `workerpool`（显式 `ErrFull`/`ErrClosed`）+ netpoll 事件循环 + 每连接写串行化，慢业务不阻塞 IO；TCP 帧长在缓冲前强制（防恶意大帧） |
 | 推送（push） | 三种形态按传输显式提供：TCP 出站 JSON-RPC notification（每连接有界队列 + drop/disconnect 背压策略）、SSE（复用现有中间件链）、gRPC streaming（拦截器链全覆盖）；不做 WebSocket、不做 HTTP/2 server push |
+| 扩展点 | TCP 帧方言 `tcp.Codec`（stratum 等非 JSON-RPC 协议可直接落 gosvc TCP）、连接生命周期 `tcp.Callbacks`（OnConnect/OnDisconnect 恰好一次）、逐方法 `jsonrpc.Middleware`（覆盖 HTTP /rpc + TCP 全部路径）；三者对默认行为零侵入 |
 | 真正的优雅退出 | 四个传输的 `Serve` 都会 join 自己的 drain：`Run` 返回时，在途请求已处理完（受各 `shutdownTimeout` 约束），不会随进程退出被掐断 |
 | 压测器 | `examples/app/cmd/bench` 支持 rest / jsonrpc / grpc |
 
@@ -196,7 +197,7 @@ app.HTTPAddr() / GRPCAddr() / TCPAddr() / AdminAddr()
 app.Reload()            // 手动重载配置
 ```
 
-选项：`WithLogger`、`WithVersion`、`WithHotReload(path, envPrefix)`、`WithPublicPaths(...)`、`WithOnReload(fn)`。
+选项：`WithLogger`、`WithVersion`、`WithHotReload(path, envPrefix)`、`WithPublicPaths(...)`、`WithOnReload(fn)`、`WithTCPCodec(codec)`、`WithTCPCallbacks(cb)`、`WithJSONRPCMiddleware(mw...)`。
 
 ### 配置
 
@@ -294,6 +295,71 @@ application.RegisterHTTP(func(h *server.Hertz) {
 - **WebSocket**：双向交互才需要，握手鉴权/子协议/心跳是一整套新面，等真实需求出现再说；
 - **HTTP/2 server push**：已废弃的浏览器特性，与业务推送无关；
 - JSON-RPC over HTTP 保持无状态请求-响应，不提供推送（要推送用 SSE 或 TCP）。
+
+## 扩展点：Codec / 连接 Callback / Dispatcher 中间件
+
+三者是同一模式——「库内留缝」，但层级不同：**Codec 管字节怎么变成调用**（传输内）、
+**Callbacks 管连接何时生/死**（传输内）、**Middleware 管方法怎么被拦截**（Dispatcher 层，
+天然覆盖 HTTP `/rpc` 与 TCP 全部路径）。全部默认关闭，不设时行为逐字节不变。
+
+### TCP 帧方言：`tcp.Codec`
+
+连接管理/背压/会话/优雅退出与线上方言解耦。自定义协议（如 stratum：无 `jsonrpc` 字段、
+位置参数、错误是 `[code,msg,data]` 数组、通知 `id:null`）只需实现四个方法：
+
+```go
+type Codec interface {
+    Name() string
+    Decode(body []byte) (Call, error)                            // 一帧一调用（batch 留在默认路径）
+    Encode(call Call, result any, callErr error) ([]byte, error) // 零 Call + 非空 callErr = 协议级错误
+    EncodeNotification(method string, params any) ([]byte, error)
+}
+
+application, _ := gosvc.New(cfg, gosvc.WithTCPCodec(stratum.Codec{}))
+```
+
+接线面：`busy/notReady/tooLarge/internal` 服务端错误帧、`Session.Notify`、shutdown 广播
+全部走 codec 输出方言；派发走 `Dispatcher.Invoke`（同一张方法表 + 中间件 + observer +
+指标）。handler 返回的非 apierror 错误先被包装成 `internal`（防方言外漏内部文本），
+未注册方法原样透传 `jsonrpc.ErrMethodNotFound` 哨兵由 codec 映射。注意 `Encode` 会在
+事件循环上为协议级错误帧调用，必须快且非阻塞。
+
+### 连接生命周期：`tcp.Callbacks`
+
+惰性 Session + reaper 适合「可能订阅」的连接；按连接建注册表（如矿机表）需要可靠的
+生/死事件。`OnDisconnect` 对端 EOF、服务端 reject、推送策略、shutdown 一律**恰好一次**
+（基于 netpoll `AddCloseCallback`，覆盖自关闭路径——event-loop 级 OnDisconnect 只管对端
+关闭，不够）：
+
+```go
+gosvc.WithTCPCallbacks(callbacks) // OnConnect 后连接的请求 ctx 以其返回值为父
+```
+
+- `OnConnect` panic → recover + 断开连接；`OnDisconnect` panic → 仅记日志；
+- 有 Callbacks 时 Session **急建**（OnConnect 即可拿到推送句柄），无 Callbacks 保持惰性；
+- `OnDisconnect` 的 reason：对端关闭 = nil；服务端关闭 = 对应 apierror；draining 中 =
+  `tcp.ErrServerShutdown`。
+
+### 逐方法拦截：`jsonrpc.Middleware`
+
+```go
+// 等价于在 RegisterJSONRPC 里调用 d.UseFor(...)
+gosvc.WithJSONRPCMiddleware(myMiddleware...)
+d.Use(func(next jsonrpc.HandlerFunc) jsonrpc.HandlerFunc { ... })      // 全局
+d.UseFor("mining.submit", func(next jsonrpc.HandlerFunc) jsonrpc.HandlerFunc {
+    return func(ctx context.Context, params json.RawMessage) (any, error) {
+        if s := tcp.SessionFromContext(ctx); s == nil || !authorized(s) {
+            return nil, apierror.New(apierror.KindPermissionDenied, "authorize first")
+        }
+        return next(ctx, params) // params 原样透传，不假设命名参数
+    }
+})
+```
+
+中间件运行在传输 recover 之内、ctx 增强（request_id/trace）之后：panic 变 internal
+error、日志字段可用。TCP 默认不鉴权——per-method middleware 正是补 TCP 鉴权的自然位置。
+`SetObserver`（指标缝）与 middleware 并存：收敛成内置 middleware 会丢掉默认路径上
+malformed 请求的指标覆盖，违背零变化约束，故保留。
 
 ### 错误映射
 

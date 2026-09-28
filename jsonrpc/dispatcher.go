@@ -24,8 +24,26 @@ const defaultMaxBatch = 128
 // already bound.
 var ErrDuplicateMethod = errors.New("jsonrpc: duplicate method")
 
+// ErrMethodNotFound is returned by Invoke when the method is not registered.
+// Envelope-level entry points (Handle/Serve) map it onto the JSON-RPC
+// not-found code themselves; a codec renders its own error shape.
+var ErrMethodNotFound = errors.New("jsonrpc: method not found")
+
 // Observer is called once per handled method for metrics and tracing.
 type Observer func(method string, code int, d time.Duration)
+
+// Middleware wraps the invocation of one method. It may short-circuit (return
+// without calling next), rewrite params, or replace the result, and it runs
+// inside the transport's recover and after ctx enrichment (request id, trace),
+// so panics become internal errors and log fields are available.
+//
+// Middleware applies to every entry point that dispatches a method — Handle,
+// Serve (HTTP /rpc and TCP default path) and Invoke (custom codecs) — so one
+// hook covers all transports that share the Dispatcher. params is passed
+// through verbatim: it is a JSON-RPC params object on the envelope paths and
+// whatever the codec produced on the Invoke path, so middlewares must not
+// assume named parameters.
+type Middleware func(next HandlerFunc) HandlerFunc
 
 // Dispatcher routes JSON-RPC methods to handlers.
 type Dispatcher struct {
@@ -33,6 +51,10 @@ type Dispatcher struct {
 	methods  map[string]HandlerFunc
 	observer Observer
 	maxBatch int
+
+	middlewares []Middleware
+	perMethod   map[string][]Middleware
+	chains      map[string]HandlerFunc // memoised handler chains
 }
 
 // NewDispatcher creates an empty dispatcher.
@@ -61,6 +83,7 @@ func (d *Dispatcher) TryRegister(method string, handler HandlerFunc) error {
 		return fmt.Errorf("%w: %s", ErrDuplicateMethod, method)
 	}
 	d.methods[method] = handler
+	d.chains = nil // the cached chain for this method would wrap the old handler
 	return nil
 }
 
@@ -100,6 +123,68 @@ func (d *Dispatcher) SetMaxBatch(n int) {
 	d.mu.Unlock()
 }
 
+// Use appends global middlewares applied to every method, in the order given
+// (the first middleware is the outermost). Middlewares apply to all dispatch
+// entry points: Handle/Serve and Invoke. Existing chains are rebuilt lazily.
+func (d *Dispatcher) Use(mw ...Middleware) {
+	if len(mw) == 0 {
+		return
+	}
+	d.mu.Lock()
+	d.middlewares = append(d.middlewares, mw...)
+	d.chains = nil
+	d.mu.Unlock()
+}
+
+// UseFor appends a middleware that only wraps the named method. Method-specific
+// middlewares run inside the global ones, directly around the handler.
+func (d *Dispatcher) UseFor(method string, mw Middleware) {
+	if mw == nil {
+		return
+	}
+	d.mu.Lock()
+	if d.perMethod == nil {
+		d.perMethod = make(map[string][]Middleware)
+	}
+	d.perMethod[method] = append(d.perMethod[method], mw)
+	d.chains = nil
+	d.mu.Unlock()
+}
+
+// chain returns the handler for method wrapped by the registered middleware.
+// Chains are memoised per method and invalidated by Use/UseFor/Register.
+func (d *Dispatcher) chain(method string) HandlerFunc {
+	d.mu.RLock()
+	chain, ok := d.chains[method]
+	d.mu.RUnlock()
+	if ok {
+		return chain
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if chain, ok := d.chains[method]; ok {
+		return chain
+	}
+	handler, ok := d.methods[method]
+	if !ok {
+		return nil
+	}
+	// Wrap innermost-out: method-specific middleware first, then global ones,
+	// so globals run outermost in the order they were registered.
+	for i := len(d.perMethod[method]) - 1; i >= 0; i-- {
+		handler = d.perMethod[method][i](handler)
+	}
+	for i := len(d.middlewares) - 1; i >= 0; i-- {
+		handler = d.middlewares[i](handler)
+	}
+	if d.chains == nil {
+		d.chains = make(map[string]HandlerFunc)
+	}
+	d.chains[method] = handler
+	return handler
+}
+
 // Methods returns the registered method names in sorted order.
 func (d *Dispatcher) Methods() []string {
 	d.mu.RLock()
@@ -131,14 +216,10 @@ func (d *Dispatcher) Handle(ctx context.Context, req *Request) *Response {
 }
 
 func (d *Dispatcher) handle(ctx context.Context, req *Request) (*Response, Observer) {
-	// Read the observer and handler under one lock so SetObserver can be
-	// called at any time without racing Handle.
+	// Read the observer under one lock so SetObserver can be called at any
+	// time without racing Handle; the handler chain is memoised separately.
 	d.mu.RLock()
 	observer := d.observer
-	var handler HandlerFunc
-	if req != nil {
-		handler = d.methods[req.Method]
-	}
 	d.mu.RUnlock()
 
 	if req == nil {
@@ -151,6 +232,7 @@ func (d *Dispatcher) handle(ctx context.Context, req *Request) (*Response, Obser
 		return errorResponse(req.ID, CodeInvalidRequest, "method must not be empty"), observer
 	}
 
+	handler := d.chain(req.Method)
 	if handler == nil {
 		return errorResponse(req.ID, CodeMethodNotFound, "method not found: "+req.Method), observer
 	}
@@ -161,6 +243,43 @@ func (d *Dispatcher) handle(ctx context.Context, req *Request) (*Response, Obser
 		return errorResponse(req.ID, code, message), observer
 	}
 	return &Response{JSONRPC: "2.0", ID: normalizeID(req.ID), Result: result}, observer
+}
+
+// Invoke dispatches a method without the JSON-RPC 2.0 envelope: no
+// "jsonrpc"=="2.0" validation, no params decoding and no batching. It is the
+// entry point for custom transport codecs (see transport/tcp Codec), which own
+// the wire shape and use Invoke to reach the same method table, middleware and
+// observer.
+//
+// When the method is not registered, Invoke returns a wrapped ErrMethodNotFound
+// that the codec maps onto its own error shape; the observer is called with the
+// JSON-RPC not-found code so metrics stay comparable across entry points.
+func (d *Dispatcher) Invoke(ctx context.Context, method string, params json.RawMessage) (any, error) {
+	start := time.Now()
+	handler := d.chain(method)
+	if handler == nil {
+		d.mu.RLock()
+		observer := d.observer
+		d.mu.RUnlock()
+		if observer != nil {
+			observer(method, CodeMethodNotFound, time.Since(start))
+		}
+		return nil, fmt.Errorf("%w: %s", ErrMethodNotFound, method)
+	}
+
+	result, err := handler(ctx, params)
+
+	d.mu.RLock()
+	observer := d.observer
+	d.mu.RUnlock()
+	if observer != nil {
+		code := 0
+		if err != nil {
+			code, _ = codeOf(err)
+		}
+		observer(method, code, time.Since(start))
+	}
+	return result, err
 }
 
 // Serve handles one request body, which may be a single request or a batch.

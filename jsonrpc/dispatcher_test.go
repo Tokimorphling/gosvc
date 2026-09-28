@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -232,5 +233,152 @@ func TestTryRegisterReportsDuplicates(t *testing.T) {
 	}
 	if len(d.Methods()) != 1 {
 		t.Fatalf("the duplicate must not overwrite: %v", d.Methods())
+	}
+}
+
+// TestMiddlewareShortCircuit verifies UseFor with an authorisation-shaped
+// middleware: the wrapped method is rejected without invoking its handler,
+// while other methods are unaffected.
+func TestMiddlewareShortCircuit(t *testing.T) {
+	d := NewDispatcher()
+	invoked := map[string]bool{}
+
+	d.Register("restricted", func(_ context.Context, _ json.RawMessage) (any, error) {
+		invoked["restricted"] = true
+		return "secret", nil
+	})
+	d.Register("open", func(_ context.Context, _ json.RawMessage) (any, error) {
+		invoked["open"] = true
+		return "fine", nil
+	})
+	d.UseFor("restricted", func(next HandlerFunc) HandlerFunc {
+		return func(ctx context.Context, params json.RawMessage) (any, error) {
+			if v := ctx.Value(authedKey{}); v == nil {
+				return nil, apierror.New(apierror.KindPermissionDenied, "authorize first")
+			}
+			return next(ctx, params)
+		}
+	})
+
+	raw, _ := d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"restricted"}`))
+	if resp := decodeResponse(t, raw); resp.Error == nil || resp.Error.Code != CodePermissionDenied {
+		t.Fatalf("restricted must be denied: %+v", resp)
+	}
+	if invoked["restricted"] {
+		t.Fatal("the handler must not run when the middleware short-circuits")
+	}
+
+	raw, _ = d.Serve(context.WithValue(context.Background(), authedKey{}, true),
+		[]byte(`{"jsonrpc":"2.0","id":2,"method":"restricted"}`))
+	if resp := decodeResponse(t, raw); resp.Error != nil {
+		t.Fatalf("authorized call must pass: %+v", resp)
+	}
+	if !invoked["restricted"] {
+		t.Fatal("the handler must run after the middleware passes")
+	}
+
+	// Other methods do not run the method-specific middleware.
+	raw, _ = d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","id":3,"method":"open"}`))
+	if resp := decodeResponse(t, raw); resp.Error != nil || !invoked["open"] {
+		t.Fatalf("UseFor must not affect other methods: %+v", resp)
+	}
+}
+
+type authedKey struct{}
+
+// TestMiddlewareOrderAndContext verifies that Use middlewares run in the
+// order they were registered (first is outermost) and that ctx survives the
+// whole chain.
+func TestMiddlewareOrderAndContext(t *testing.T) {
+	d := NewDispatcher()
+	var order []string
+
+	d.Register("echo", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if ctx.Value(traceKey{}) == nil {
+			return nil, errors.New("context lost in middleware chain")
+		}
+		order = append(order, "handler")
+		return "ok", nil
+	})
+	for _, name := range []string{"first", "second", "third"} {
+		name := name
+		d.Use(func(next HandlerFunc) HandlerFunc {
+			return func(ctx context.Context, params json.RawMessage) (any, error) {
+				order = append(order, name)
+				return next(context.WithValue(ctx, traceKey{}, name), params)
+			}
+		})
+	}
+
+	raw, _ := d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"echo"}`))
+	if resp := decodeResponse(t, raw); resp.Error != nil {
+		t.Fatalf("resp = %+v", resp)
+	}
+	want := []string{"first", "second", "third", "handler"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("order = %v, want %v", order, want)
+	}
+}
+
+type traceKey struct{}
+
+// TestMiddlewareAppliesToInvoke verifies the codec entry point runs the same
+// middleware chain as the envelope path: without the required context value
+// the middleware rejects, with it the call passes and params arrive verbatim.
+func TestMiddlewareAppliesToInvoke(t *testing.T) {
+	d := NewDispatcher()
+	seen := ""
+	d.Register("probe", func(_ context.Context, params json.RawMessage) (any, error) {
+		seen = string(params)
+		return "done", nil
+	})
+	d.Use(func(next HandlerFunc) HandlerFunc {
+		return func(ctx context.Context, params json.RawMessage) (any, error) {
+			if ctx.Value(traceKey{}) == nil {
+				return nil, apierror.New(apierror.KindPermissionDenied, "ctx missing")
+			}
+			return next(ctx, params)
+		}
+	})
+
+	// Without the required context value the middleware short-circuits Invoke.
+	if _, err := d.Invoke(context.Background(), "probe", json.RawMessage(`"raw"`)); apierror.KindOf(err) != apierror.KindPermissionDenied {
+		t.Fatalf("err = %v, want the middleware to run on Invoke", err)
+	}
+
+	// With it, params pass through verbatim (no params decoding on this path).
+	if _, err := d.Invoke(context.WithValue(context.Background(), traceKey{}, "x"), "probe", json.RawMessage(`"raw"`)); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if seen != `"raw"` {
+		t.Fatalf("params = %s, want verbatim pass-through", seen)
+	}
+
+	if _, err := d.Invoke(context.Background(), "missing", nil); !errors.Is(err, ErrMethodNotFound) {
+		t.Fatalf("err = %v, want ErrMethodNotFound", err)
+	}
+}
+
+// TestMiddlewareLateRegistration verifies that middleware registered after
+// methods applies to the existing handlers too (chains are rebuilt).
+func TestMiddlewareLateRegistration(t *testing.T) {
+	d := NewDispatcher()
+	d.Register("echo", func(context.Context, json.RawMessage) (any, error) { return "ok", nil })
+
+	d.Use(func(next HandlerFunc) HandlerFunc {
+		return func(ctx context.Context, params json.RawMessage) (any, error) {
+			return "blocked", nil
+		}
+	})
+
+	raw, _ := d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"echo"}`))
+	var resp struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "blocked" {
+		t.Fatalf("result = %q, want the middleware to take effect after registration", resp.Result)
 	}
 }

@@ -21,10 +21,12 @@ package tcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudwego/netpoll"
@@ -32,6 +34,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Tokimorphling/gosvc/apierror"
 	"github.com/Tokimorphling/gosvc/config"
 	"github.com/Tokimorphling/gosvc/health"
 	"github.com/Tokimorphling/gosvc/internal/workerpool"
@@ -62,6 +65,14 @@ type Options struct {
 	Dispatcher *jsonrpc.Dispatcher
 	// Tracer records one span per request. Optional.
 	Tracer trace.Tracer
+	// Codec owns the frame dialect. Nil keeps the strict JSON-RPC 2.0
+	// behaviour (dispatcher.Serve: envelope validation, batches, params
+	// decoding) byte for byte.
+	Codec Codec
+	// Callbacks observes connection lifecycle events. When set, every
+	// connection gets its push Session eagerly and OnConnect/OnDisconnect
+	// fire; nil keeps the lazy, callback-free behaviour.
+	Callbacks Callbacks
 }
 
 // Server is the netpoll based JSON-RPC server.
@@ -78,6 +89,15 @@ type Server struct {
 	ready      *health.Ready
 	tracer     trace.Tracer
 
+	codec     Codec
+	callbacks Callbacks
+
+	// shutdownFrame is the going-away frame rendered in the active dialect.
+	shutdownFrame []byte
+	// draining marks the shutdown phase, so OnDisconnect reports
+	// ErrServerShutdown for connections closed during the drain.
+	draining atomic.Bool
+
 	// sessions tracks live push sessions for the shutdown broadcast.
 	sessions sync.Map
 }
@@ -93,6 +113,15 @@ type connState struct {
 	writeMu   sync.Mutex
 	sessionMu sync.Mutex
 	session   *Session
+
+	// connInfo is the lifecycle-callback view of the connection; it is only
+	// set when callbacks are installed, so OnDisconnect can distinguish
+	// prepared connections.
+	connInfo *Conn
+	// closeReason is set (before the close) for server-initiated
+	// disconnects, so OnDisconnect can report the cause. Peer-initiated
+	// closes leave it nil.
+	closeReason atomic.Pointer[error]
 }
 
 type connStateKey struct{}
@@ -120,22 +149,27 @@ func New(opts Options) (*Server, error) {
 		recorder:   opts.Recorder,
 		ready:      opts.Ready,
 		tracer:     opts.Tracer,
+		codec:      opts.Codec,
+		callbacks:  opts.Callbacks,
 	}
 	if s.metrics == nil {
 		s.metrics = observability.New("gosvc")
+	}
+	s.shutdownFrame = shuttingDownFrame
+	if opts.Codec != nil {
+		if frame, err := opts.Codec.EncodeNotification(MethodShutdown, nil); err == nil {
+			s.shutdownFrame = frame
+		}
 	}
 	s.pool.SetPanicHandler(func(recovered any) {
 		opts.Logger.Error("tcp worker panic", "panic", recovered)
 	})
 
-	eventLoop, err := netpoll.NewEventLoop(
-		s.handleRequest,
-		netpoll.WithOnPrepare(func(connection netpoll.Connection) context.Context {
-			state := &connState{server: s, conn: connection, remote: connection.RemoteAddr().String()}
-			return context.WithValue(context.Background(), connStateKey{}, state)
-		}),
+	loopOptions := []netpoll.Option{
+		netpoll.WithOnPrepare(s.onPrepare),
 		netpoll.WithReadTimeout(opts.Config.TCP.ReadTimeout.D()),
-	)
+	}
+	eventLoop, err := netpoll.NewEventLoop(s.handleRequest, loopOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("netpoll event loop: %w", err)
 	}
@@ -159,6 +193,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	go func() {
 		defer close(done)
 		<-ctx.Done()
+		s.draining.Store(true)
 		s.notifyShutdown()
 		time.Sleep(shutdownGrace) // let pumps flush the going-away frames
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.D())
@@ -185,7 +220,7 @@ func (s *Server) Serve(ctx context.Context) error {
 func (s *Server) notifyShutdown() {
 	s.sessions.Range(func(key, value any) bool {
 		if session, ok := value.(*Session); ok {
-			_ = session.enqueue(shuttingDownFrame)
+			_ = session.enqueue(s.shutdownFrame)
 		}
 		return true
 	})
@@ -213,12 +248,12 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 		// Answer once, then close: leaving the input unread would spin the
 		// event loop (netpoll is level-triggered) and flood the client with
 		// busy frames. The client reconnects when the service is ready.
-		s.write(ctx, connection, notReadyFrame)
+		s.reject(ctx, connection, notReadyError(), notReadyFrame)
 		_ = connection.Close()
 		return nil
 	}
 	if s.limiter != nil && !s.limiter.Allow(clientKey(connection)) {
-		s.write(ctx, connection, busyFrame)
+		s.reject(ctx, connection, busyError(), busyFrame)
 		_ = connection.Close()
 		return nil
 	}
@@ -228,7 +263,7 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 	// buffered, not only on the completed line. The line includes the
 	// trailing newline, so a frame of exactly MaxFrameBytes still passes.
 	if connection.Reader().Len() > s.cfg.MaxFrameBytes {
-		s.write(ctx, connection, tooLargeFrame)
+		s.reject(ctx, connection, tooLargeError(), tooLargeFrame)
 		_ = connection.Close()
 		return nil
 	}
@@ -241,7 +276,7 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 	}
 
 	if len(line) > s.cfg.MaxFrameBytes {
-		s.write(ctx, connection, tooLargeFrame)
+		s.reject(ctx, connection, tooLargeError(), tooLargeFrame)
 		_ = connection.Close()
 		return nil
 	}
@@ -252,9 +287,29 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 	_ = connection.Reader().Release()
 
 	if err := s.pool.Submit(func() { s.process(connection, ctx, body) }); err != nil {
-		s.write(ctx, connection, busyFrame)
+		s.reject(ctx, connection, busyError(), busyFrame)
 	}
 	return nil
+}
+
+// reject writes a protocol-level error frame: through the codec when one is
+// installed, else the JSON-RPC constant. It also records the cause so
+// OnDisconnect can report it. It runs on the event loop for the server-level
+// frames; codec.Encode must be fast and non-blocking.
+func (s *Server) reject(ctx context.Context, connection netpoll.Connection, cause error, fallback []byte) {
+	if state, _ := ctx.Value(connStateKey{}).(*connState); state != nil {
+		state.closeReason.Store(&cause)
+	}
+	if s.codec != nil {
+		frame, err := s.codec.Encode(Call{}, nil, cause)
+		if err != nil {
+			s.logger.Warn("tcp codec failed to encode protocol error", "error", err, "remote", connection.RemoteAddr().String())
+			return
+		}
+		s.write(ctx, connection, frame)
+		return
+	}
+	s.write(ctx, connection, fallback)
 }
 
 // clientKey returns the remote address without the ephemeral port so the rate
@@ -302,9 +357,14 @@ func (s *Server) process(connection netpoll.Connection, parent context.Context, 
 			if span != nil {
 				span.SetStatus(codes.Error, "panic")
 			}
-			s.write(ctx, connection, internalFrame)
+			s.reject(ctx, connection, internalError(), internalFrame)
 		}
 	}()
+
+	if s.codec != nil {
+		s.processCoded(ctx, connection, body)
+		return
+	}
 
 	response, ok := s.dispatcher.Serve(ctx, body)
 	if s.recorder != nil {
@@ -314,6 +374,58 @@ func (s *Server) process(connection netpoll.Connection, parent context.Context, 
 		return
 	}
 	s.write(ctx, connection, response)
+}
+
+// processCoded is the custom-codec path: decode the frame, dispatch without
+// the JSON-RPC envelope, render the reply in the dialect. Custom codecs are
+// single frame, single call; batching stays on the default path.
+func (s *Server) processCoded(ctx context.Context, connection netpoll.Connection, body []byte) {
+	if s.recorder != nil {
+		_ = s.recorder.Incr(ctx, "tcp.requests", 1)
+	}
+
+	call, err := s.codec.Decode(body)
+	if err != nil {
+		// A decode failure is protocol-level: the codec authored the error,
+		// so it also renders it.
+		s.writeCodedError(ctx, connection, Call{}, err)
+		return
+	}
+
+	result, invokeErr := s.dispatcher.Invoke(ctx, call.Method, call.Params)
+	if call.Notification {
+		// Dispatched, never answered.
+		return
+	}
+	if invokeErr != nil && !errors.Is(invokeErr, jsonrpc.ErrMethodNotFound) {
+		// Unknown errors are internal: codecs render apierror messages, so
+		// wrap raw handler errors to keep internal details off the wire.
+		if _, ok := errors.AsType[*apierror.Error](invokeErr); !ok {
+			invokeErr = apierror.New(apierror.KindInternal, apierror.ClientMessage(invokeErr))
+		}
+	}
+	if invokeErr != nil {
+		s.writeCodedError(ctx, connection, call, invokeErr)
+		return
+	}
+
+	frame, err := s.codec.Encode(call, result, nil)
+	if err != nil {
+		s.logger.Warn("tcp codec failed to encode response", "error", err, "remote", connection.RemoteAddr().String())
+		return
+	}
+	s.write(ctx, connection, frame)
+}
+
+// writeCodedError renders callErr through the codec; it never uses the
+// JSON-RPC constants, because the dialect owns its error shape.
+func (s *Server) writeCodedError(ctx context.Context, connection netpoll.Connection, call Call, callErr error) {
+	frame, err := s.codec.Encode(call, nil, callErr)
+	if err != nil {
+		s.logger.Warn("tcp codec failed to encode error", "error", err, "remote", connection.RemoteAddr().String())
+		return
+	}
+	s.write(ctx, connection, frame)
 }
 
 // write serializes writes per connection, as required by netpoll.
