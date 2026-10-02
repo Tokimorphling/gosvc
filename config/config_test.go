@@ -83,6 +83,25 @@ enabled = true
 	}
 }
 
+func TestStrictRuntimeRejectsRuntimeTyposButAllowsAppSections(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := "[auth]\nenabld = true\n[greeting]\nprefix = \"hi\"\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Source{Path: path, StrictRuntime: true}).Load[Config](); err == nil || !strings.Contains(err.Error(), "auth.enabld") {
+		t.Fatalf("runtime typo should be rejected, got %v", err)
+	}
+	content = "[auth]\nenabled = true\napiKeys = [\"key\"]\n[greeting]\nprefix = \"hi\"\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, meta, err := (Source{Path: path, StrictRuntime: true}).LoadWithMetadata[Config]()
+	if err != nil || !cfg.Auth.Enabled || !meta.IsDefined("auth", "enabled") {
+		t.Fatalf("valid runtime and app sections should load with key metadata: cfg=%+v err=%v", cfg, err)
+	}
+}
+
 func TestEnvOverrides(t *testing.T) {
 	t.Setenv("GOSVC_SERVICE_NAME", "from-env")
 	t.Setenv("GOSVC_HTTP_ADDR", "127.0.0.1:9999")

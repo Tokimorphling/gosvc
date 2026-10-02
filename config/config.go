@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -360,6 +361,10 @@ type Source struct {
 	// typically leaves it off so application sections can coexist with the
 	// runtime config.
 	Strict bool
+	// StrictRuntime rejects unknown keys under any built-in runtime section,
+	// while allowing top-level application sections in the same file. This is
+	// appropriate when the runtime reloads a file owned by an embedding app.
+	StrictRuntime bool
 }
 
 const defaultEnvPrefix = "GOSVC"
@@ -376,35 +381,74 @@ func (s Source) Load[T any, PT interface {
 	*T
 	Configurable
 }]() (*T, error) {
+	target, _, err := s.LoadWithMetadata[T, PT]()
+	return target, err
+}
+
+// LoadWithMetadata also returns TOML key metadata, allowing a caller to
+// distinguish an explicitly disabled security setting from a missing key.
+func (s Source) LoadWithMetadata[T any, PT interface {
+	*T
+	Configurable
+}]() (*T, toml.MetaData, error) {
 	target := PT(new(T))
 	target.SetDefaults()
+	var meta toml.MetaData
 
 	if s.Path != "" {
-		meta, err := toml.DecodeFile(s.Path, target)
+		var err error
+		meta, err = toml.DecodeFile(s.Path, target)
 		if err != nil {
-			return nil, fmt.Errorf("parse config %s: %w", s.Path, err)
+			return nil, meta, fmt.Errorf("parse config %s: %w", s.Path, err)
 		}
-		if s.Strict {
-			if undecoded := meta.Undecoded(); len(undecoded) > 0 {
-				keys := make([]string, 0, len(undecoded))
-				for _, key := range undecoded {
+		if s.Strict || s.StrictRuntime {
+			keys := make([]string, 0, len(meta.Undecoded()))
+			for _, key := range meta.Undecoded() {
+				if s.Strict || runtimeSection(key[0]) {
 					keys = append(keys, key.String())
 				}
-				return nil, fmt.Errorf("config %s: unknown keys: %s", s.Path, strings.Join(keys, ", "))
+			}
+			if len(keys) > 0 {
+				return nil, meta, fmt.Errorf("config %s: unknown keys: %s", s.Path, strings.Join(keys, ", "))
 			}
 		}
 	}
 
 	if applier, ok := any(target).(EnvApplier); ok {
 		if err := applier.ApplyEnv(s.EnvPrefix); err != nil {
-			return nil, err
+			return nil, meta, err
 		}
 	}
 
 	if err := target.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
+		return nil, meta, fmt.Errorf("invalid config: %w", err)
 	}
-	return (*T)(target), nil
+	return (*T)(target), meta, nil
+}
+
+// runtimeSection derives built-in section names from Config's TOML tags so
+// new runtime sections automatically receive the same typo protection.
+func runtimeSection(name string) bool {
+	t := reflect.TypeFor[Config]()
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).Tag.Get("toml") == name {
+			return true
+		}
+	}
+	return false
+}
+
+// Clone returns an independent configuration snapshot. It copies slices that
+// callers may mutate after passing a config to the runtime.
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return nil
+	}
+	clone := *c
+	clone.HTTP.CORS.AllowOrigins = append([]string(nil), c.HTTP.CORS.AllowOrigins...)
+	clone.Auth.APIKeys = append([]string(nil), c.Auth.APIKeys...)
+	clone.Storage.Redis.Addrs = append([]string(nil), c.Storage.Redis.Addrs...)
+	return &clone
 }
 
 // SetDefaults resets the configuration to the built-in defaults.
@@ -703,10 +747,10 @@ func (c PostgresConfig) Validate() error {
 	return nil
 }
 
-// Redacted returns a shallow copy that is safe to expose over an API or to log:
+// Redacted returns a copy that is safe to expose over an API or to log:
 // secrets are replaced with "***".
 func (c *Config) Redacted() *Config {
-	clone := *c
+	clone := *c.Clone()
 
 	clone.Auth.APIKeys = make([]string, len(c.Auth.APIKeys))
 	for i := range clone.Auth.APIKeys {

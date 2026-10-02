@@ -23,6 +23,7 @@
 package logging
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -84,11 +85,12 @@ func New(cfg config.LogConfig, service, env, serviceVersion string) (*Handle, er
 	if cfg.Access.Enabled {
 		accessLevel := new(slog.LevelVar)
 		if err := SetLevel(accessLevel, cfg.Access.Level); err != nil {
+			closeIfPresent(closer)
 			return nil, fmt.Errorf("log.access.level: %w", err)
 		}
 		accessHandler, accessCloser, err := buildAccessHandler(cfg.Access, accessLevel, service, env, serviceVersion)
 		if err != nil {
-			_ = closer.Close()
+			closeIfPresent(closer)
 			return nil, err
 		}
 		h.closers = append(h.closers, accessCloser)
@@ -132,8 +134,15 @@ func (h *Handle) SamplingStats() *slogx.SamplingStats {
 // the access sink is not toggled here. File sinks replaced by the reload are
 // closed so their file descriptors do not accumulate.
 func (h *Handle) Reload(cfg config.LogConfig) error {
-	if err := SetLevel(h.level, cfg.Level); err != nil {
+	var nextLevel slog.LevelVar
+	if err := SetLevel(&nextLevel, cfg.Level); err != nil {
 		return err
+	}
+	var nextAccessLevel slog.LevelVar
+	if h.accessOnInit {
+		if err := SetLevel(&nextAccessLevel, cfg.Access.Level); err != nil {
+			return fmt.Errorf("log.access.level: %w", err)
+		}
 	}
 
 	handler, sampler, closer, err := buildMainHandler(cfg, h.env, h.level, h.service, h.version)
@@ -148,28 +157,27 @@ func (h *Handle) Reload(cfg config.LogConfig) error {
 		if accessLevel == nil {
 			accessLevel = h.level
 		}
-		if err := SetLevel(accessLevel, cfg.Access.Level); err != nil {
-			_ = closer.Close()
-			return fmt.Errorf("log.access.level: %w", err)
-		}
 		accessHandler, accessCloser, err = buildAccessHandler(cfg.Access, accessLevel, h.service, h.env, h.version)
 		if err != nil {
-			_ = closer.Close()
+			closeIfPresent(closer)
 			return err
 		}
 	}
 
 	h.mu.Lock()
+	h.level.Set(nextLevel.Level())
+	if h.accessLevel != nil {
+		h.accessLevel.Set(nextAccessLevel.Level())
+	}
 	h.sampler = sampler
 	prevClosers := h.closers
 	h.closers = []io.Closer{closer, accessCloser}
-	h.mu.Unlock()
-
 	h.swap.Swap(handler)
 
 	if h.accessOnInit && accessHandler != nil && h.accessSwap != nil {
 		h.accessSwap.Swap(accessHandler)
 	}
+	h.mu.Unlock()
 
 	// Close the file sinks the reload replaced so their file descriptors do
 	// not accumulate. Request-scoped loggers derived before the swap may
@@ -182,6 +190,31 @@ func (h *Handle) Reload(cfg config.LogConfig) error {
 		}
 	}
 	return nil
+}
+
+// Close releases file sinks owned by this handle. It is safe to call more
+// than once; an externally supplied handle remains owned by its caller.
+func (h *Handle) Close() error {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	closers := h.closers
+	h.closers = nil
+	h.mu.Unlock()
+	var errs []error
+	for _, closer := range closers {
+		if closer != nil {
+			errs = append(errs, closer.Close())
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func closeIfPresent(closer io.Closer) {
+	if closer != nil {
+		_ = closer.Close()
+	}
 }
 
 // SetLevel applies a textual level ("trace", "debug", "info", "warn", "error").

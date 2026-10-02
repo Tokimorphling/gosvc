@@ -46,6 +46,7 @@ type SSEStream struct {
 	cancel  context.CancelFunc
 	writer  *hertzsse.Writer
 	metrics *observability.Metrics
+	remote  string
 }
 
 // Send writes one event with the given event type and JSON-encoded data.
@@ -68,8 +69,19 @@ func (s *SSEStream) Ping() error {
 	return s.writer.WriteKeepAlive()
 }
 
+// RemoteAddr returns the client address of the stream.
+func (s *SSEStream) RemoteAddr() string {
+	if s == nil {
+		return ""
+	}
+	return s.remote
+}
+
 // Done is closed when the client disconnects or the runtime shuts down; the
-// handler should return promptly afterwards.
+// handler should return promptly afterwards. A client that vanishes without
+// closing the TCP connection (half-open link, network partition) is not
+// distinguishable from a silent one: only the next failed Send or Ping
+// detects it, so heartbeats bound that delay.
 func (s *SSEStream) Done() <-chan struct{} { return s.ctx.Done() }
 
 // Close terminates the stream end to end: the handler's context cancels, so
@@ -97,11 +109,13 @@ type sseSink struct {
 func (x sseSink) Send(event string, data any) error { return x.stream.Send(event, data) }
 func (x sseSink) Done() <-chan struct{}             { return x.stream.Done() }
 func (x sseSink) Close() error                      { return x.stream.Close() }
-func (x sseSink) ID() string                        { return "sse" }
+func (x sseSink) ID() string                        { return "sse/" + x.stream.RemoteAddr() }
 
 // RegisterSSE serves server-sent events at path. handler runs for the whole
 // lifetime of the streaming response, on the request's goroutine, and should
 // loop until Done() or a failed Send/Ping. metrics may be nil.
+// A comment frame is flushed before handler runs, so clients receive the
+// response headers even when the handler has no event to send yet.
 //
 // RegisterSSE is used inside gosvc.App.RegisterHTTP:
 //
@@ -134,13 +148,18 @@ func RegisterSSE(h *server.Hertz, path string, metrics *observability.Metrics, h
 		// disconnects end the handler exactly like a client hangup.
 		streamCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
+		writer := hertzsse.NewWriter(c)
+		defer func() { _ = writer.Close() }()
 		stream := &SSEStream{
 			ctx:     streamCtx,
 			cancel:  cancel,
-			writer:  hertzsse.NewWriter(c),
+			writer:  writer,
 			metrics: metrics,
+			remote:  c.RemoteAddr().String(),
+		}
+		if err := writer.WriteComment("connected"); err != nil {
+			return
 		}
 		handler(streamCtx, stream)
-		_ = stream.writer.Close()
 	})
 }

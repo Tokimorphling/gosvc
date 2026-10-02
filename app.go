@@ -35,7 +35,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"reflect"
 	"sync"
@@ -68,6 +70,13 @@ import (
 // ErrStarted is returned when handlers are registered after Run has been called.
 var ErrStarted = errors.New("gosvc: application already started")
 
+// ErrClosed is returned when an operation is attempted after App.Close.
+var ErrClosed = errors.New("gosvc: application closed")
+
+// ErrStorageDisabled is returned by WithStore and WithPostgres when their
+// respective connection is not currently enabled.
+var ErrStorageDisabled = errors.New("gosvc: storage is disabled")
+
 // Option customises the runtime.
 type Option func(*options)
 
@@ -83,6 +92,8 @@ type options struct {
 	tcpCallbacks      tcptransport.Callbacks
 	tcpDispatcher     *jsonrpc.Dispatcher
 	jsonrpcMiddleware []jsonrpc.Middleware
+
+	onShutdown []func()
 }
 
 // WithLogger supplies the logging handle. When omitted, the runtime builds one
@@ -103,7 +114,7 @@ func WithVersion(v string) Option {
 func WithHotReload(path, envPrefix string) Option {
 	return func(o *options) {
 		o.hotReload = true
-		o.source = config.Source{Path: path, EnvPrefix: envPrefix}
+		o.source = config.Source{Path: path, EnvPrefix: envPrefix, StrictRuntime: true}
 	}
 }
 
@@ -115,6 +126,8 @@ func WithPublicPaths(paths ...string) Option {
 
 // WithOnReload registers an application hook invoked after the runtime applied
 // its own reloadable sections. Use it to reload application-specific settings.
+// The hook runs inside the reload transaction and must not call Reload; before
+// Run, it must not call Close either, as both wait for that transaction.
 func WithOnReload(fn func(*config.Config) error) Option {
 	return func(o *options) { o.onReload = fn }
 }
@@ -147,12 +160,30 @@ func WithJSONRPCMiddleware(mw ...jsonrpc.Middleware) Option {
 // shared dispatcher stays with the HTTP /rpc endpoint; the TCP transport
 // dispatches only on the given dispatcher, which the application builds and
 // populates before gosvc.New. Use it to keep a wire-specific protocol (for
-// example stratum mining.*) off HTTP /rpc, to isolate per-transport metrics
-// (set its own observer) or to apply different middleware. The runtime never
-// touches it otherwise: RegisterJSONRPC still registers on the shared
-// dispatcher.
+// example stratum mining.*) off HTTP /rpc or to apply different middleware.
+// The runtime installs its default metrics observer unless the dispatcher
+// already has one, so per-method RPC metrics are recorded without wiring;
+// call SetObserver first to substitute a different observer. RegisterJSONRPC
+// still registers on the shared dispatcher.
 func WithTCPDispatcher(d *jsonrpc.Dispatcher) Option {
 	return func(o *options) { o.tcpDispatcher = d }
+}
+
+// WithOnShutdown registers hooks that run when a started application shuts
+// down, after serving has been asked to stop and before the transports close
+// their connections: queues can still be drained to live clients there, which
+// is the right phase for push.Broker.Shutdown, flushing producers or closing
+// registries. The hooks run once, in the order given, and must return
+// promptly — a blocked hook delays the shutdown of every transport until its
+// own timeout. They do not run when the application is closed before Run.
+func WithOnShutdown(fn ...func()) Option {
+	return func(o *options) {
+		for _, hook := range fn {
+			if hook != nil {
+				o.onShutdown = append(o.onShutdown, hook)
+			}
+		}
+	}
 }
 
 // App owns every transport, the shared dependencies and the lifecycle.
@@ -160,6 +191,7 @@ type App struct {
 	cfg        state.Snapshot[*config.Config]
 	opts       options
 	log        *logging.Handle
+	ownsLog    bool
 	metrics    *observability.Metrics
 	auth       *auth.Authenticator
 	limiter    *ratelimit.Limiter
@@ -180,6 +212,10 @@ type App struct {
 	mu        sync.Mutex
 	reloadMu  sync.Mutex
 	started   bool
+	closed    bool
+	runCancel context.CancelFunc
+	closeOnce sync.Once
+	closeErr  error
 	httpRegs  []func(*server.Hertz)
 	grpcRegs  []func(*ggrpc.Server)
 	rpcRegs   []func(*jsonrpc.Dispatcher)
@@ -188,9 +224,19 @@ type App struct {
 
 // New builds all components. Listeners are bound here so their addresses are
 // known before Run starts serving traffic.
-func New(cfg *config.Config, opts ...Option) (*App, error) {
+func New(cfg *config.Config, opts ...Option) (app *App, err error) {
+	if cfg == nil {
+		return nil, errors.New("gosvc: nil config")
+	}
+	cfg = cfg.Clone()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("gosvc: invalid config: %w", err)
+	}
 	o := options{version: version.Version}
 	for _, opt := range opts {
+		if opt == nil {
+			return nil, errors.New("gosvc: nil option")
+		}
 		opt(&o)
 	}
 
@@ -207,10 +253,16 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 	a := &App{
 		opts:    o,
 		log:     logHandle,
+		ownsLog: o.logger == nil,
 		metrics: observability.New(cfg.Service.Name),
 		ready:   &health.Ready{},
 		limiter: ratelimit.New(cfg.Limiter.RPS, cfg.Limiter.Burst),
 	}
+	defer func() {
+		if err != nil {
+			_ = a.closeResources()
+		}
+	}()
 	a.cfg.Store(cfg)
 
 	authenticator, err := auth.New(cfg.Auth)
@@ -237,11 +289,11 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 	// Readiness reflects the database when enabled, and pool metrics are
 	// exported through a provider so a reload can swap the pool.
 	a.ready.AddCheck("postgres", func(ctx context.Context) error {
-		db := a.Postgres()
-		if db == nil {
+		err := a.WithPostgres(func(db *postgres.DB) error { return db.Ping(ctx) })
+		if errors.Is(err, ErrStorageDisabled) {
 			return health.ErrSkipped
 		}
-		return db.Ping(ctx)
+		return err
 	})
 	if err := a.metrics.RegisterDBPoolProvider("postgres", func() *sql.DB {
 		if db := a.Postgres(); db != nil {
@@ -304,6 +356,10 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 		tcpDispatcher := dispatcher
 		if o.tcpDispatcher != nil {
 			tcpDispatcher = o.tcpDispatcher
+			// The dedicated table gets the default observability unless the
+			// application installed its own observer before gosvc.New;
+			// middlewares stay per-table by design.
+			tcpDispatcher.SetObserverIfAbsent(a.metrics.ObserveJSONRPC)
 		}
 		tcpServer, err := tcptransport.New(tcptransport.Options{
 			Config:     cfg,
@@ -323,20 +379,16 @@ func New(cfg *config.Config, opts ...Option) (*App, error) {
 		a.tcp = tcpServer
 	}
 
-	var timeSeries store.TimeSeries
-	if current := a.currentStorage(); current != nil && current.store != nil {
-		timeSeries = current.store
-	}
 	adminServer, err := admin.New(admin.Options{
-		Config:        cfg,
-		Logger:        logger,
-		Log:           logHandle,
-		Metrics:       a.metrics,
-		Ready:         a.ready,
-		TimeSeries:    timeSeries,
-		Reload:        a.Reload,
-		CurrentConfig: a.CurrentConfig,
-		Version:       o.version,
+		Config:          cfg,
+		Logger:          logger,
+		Log:             logHandle,
+		Metrics:         a.metrics,
+		Ready:           a.ready,
+		TimeSeriesQuery: a.queryTimeSeries,
+		Reload:          a.Reload,
+		CurrentConfig:   a.CurrentConfig,
+		Version:         o.version,
 	})
 	if err != nil {
 		return nil, err
@@ -353,6 +405,9 @@ func (a *App) RegisterHTTP(fn func(*server.Hertz)) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.closed {
+		return ErrClosed
+	}
 	if a.started {
 		return ErrStarted
 	}
@@ -367,6 +422,9 @@ func (a *App) RegisterGRPC(fn func(*ggrpc.Server)) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.closed {
+		return ErrClosed
+	}
 	if a.started {
 		return ErrStarted
 	}
@@ -383,6 +441,9 @@ func (a *App) RegisterJSONRPC(fn func(*jsonrpc.Dispatcher)) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.closed {
+		return ErrClosed
+	}
 	if a.started {
 		return ErrStarted
 	}
@@ -397,6 +458,9 @@ func (a *App) RegisterAdmin(fn func(*http.ServeMux)) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.closed {
+		return ErrClosed
+	}
 	if a.started {
 		return ErrStarted
 	}
@@ -407,30 +471,50 @@ func (a *App) RegisterAdmin(fn func(*http.ServeMux)) error {
 // Run applies pending registrations, serves until ctx is cancelled or a server
 // fails, then shuts down gracefully. It returns nil on a clean shutdown.
 func (a *App) Run(ctx context.Context) error {
-	cfg := a.current()
+	if ctx == nil {
+		return errors.New("gosvc: nil run context")
+	}
 	logger := a.log.Logger()
 
 	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return ErrClosed
+	}
 	if a.started {
 		a.mu.Unlock()
 		return errors.New("gosvc: Run called twice")
 	}
+	runCtx, cancel := context.WithCancel(ctx)
+	a.runCancel = cancel
 	a.started = true
-	for _, fn := range a.httpRegs {
+	httpRegs := append([]func(*server.Hertz){}, a.httpRegs...)
+	grpcRegs := append([]func(*ggrpc.Server){}, a.grpcRegs...)
+	rpcRegs := append([]func(*jsonrpc.Dispatcher){}, a.rpcRegs...)
+	adminRegs := append([]func(*http.ServeMux){}, a.adminRegs...)
+	a.mu.Unlock()
+	defer func() {
+		cancel()
+		_ = a.closeResources()
+	}()
+	for _, fn := range httpRegs {
 		fn(a.http.Engine())
 	}
-	for _, fn := range a.grpcRegs {
+	for _, fn := range grpcRegs {
 		fn(a.grpc.Server())
 	}
-	for _, fn := range a.rpcRegs {
+	for _, fn := range rpcRegs {
 		fn(a.dispatcher)
 	}
 	if mux := a.admin.Mux(); mux != nil {
-		for _, fn := range a.adminRegs {
+		for _, fn := range adminRegs {
 			fn(mux)
 		}
 	}
-	a.mu.Unlock()
+	if runCtx.Err() != nil {
+		return a.closeResources()
+	}
+	cfg := a.current()
 
 	logger.Info("service starting",
 		"http", a.http.Addr(),
@@ -445,36 +529,114 @@ func (a *App) Run(ctx context.Context) error {
 	a.ready.Set(true)
 	defer a.ready.Set(false)
 
-	group, ctx := errgroup.WithContext(ctx)
-	group.Go(func() error { return a.http.Serve(ctx) })
-	group.Go(func() error { return a.grpc.Serve(ctx) })
-	group.Go(func() error { return a.admin.Serve(ctx) })
+	// Shutdown runs in two phases. The errgroup context fires when serving
+	// has been asked to stop (parent context cancelled, Close called) or a
+	// transport failed. The WithOnShutdown hooks then run while the
+	// transports still serve, so a drain (push.Broker.Shutdown) still
+	// reaches live clients; only afterwards do the transports stop.
+	group, groupCtx := errgroup.WithContext(runCtx)
+	serveCtx, stopServing := context.WithCancel(context.WithoutCancel(groupCtx))
+	go func() {
+		<-groupCtx.Done()
+		for _, hook := range a.opts.onShutdown {
+			hook()
+		}
+		stopServing()
+	}()
+	group.Go(func() error { return a.http.Serve(serveCtx) })
+	group.Go(func() error { return a.grpc.Serve(serveCtx) })
+	group.Go(func() error { return a.admin.Serve(serveCtx) })
 	if a.tcp != nil {
-		group.Go(func() error { return a.tcp.Serve(ctx) })
+		group.Go(func() error { return a.tcp.Serve(serveCtx) })
 	}
 	if a.opts.hotReload && a.opts.source.Path != "" {
 		group.Go(func() error {
-			return reload.New(a.opts.source.Path, logger, a.loadConfig, a.applyConfig).Run(ctx)
+			return reload.New(a.opts.source.Path, logger, a.Reload).Run(serveCtx)
 		})
 	}
 	group.Go(func() error {
-		a.limiter.Cleanup(ctx)
+		a.limiter.Cleanup(serveCtx)
 		return nil
 	})
 
 	err := group.Wait()
 
-	if a.telemetry.Enabled() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if shutdownErr := a.telemetry.Shutdown(shutdownCtx); shutdownErr != nil {
-			logger.Warn("telemetry shutdown returned error", "error", shutdownErr)
-		}
-	}
-	a.stopStorage(a.currentStorage())
-
 	logger.Info("service stopped")
-	return err
+	return errors.Join(err, a.closeResources())
+}
+
+// Close releases resources allocated by New. Before Run it closes the bound
+// listeners, storage, tracing and internally created log sinks. During Run it
+// requests a graceful shutdown; Run completes the drain and releases resources.
+// Close is idempotent and safe to call from a handler. A Handle supplied
+// through WithLogger stays caller-owned. A pre-Run WithOnReload hook must not
+// call Close because the hook itself holds the reload transaction lock.
+func (a *App) Close() error {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	a.closed = true
+	cancel := a.runCancel
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		return nil
+	}
+	return a.closeResources()
+}
+
+func (a *App) closeResources() error {
+	a.closeOnce.Do(func() {
+		a.mu.Lock()
+		a.closed = true
+		a.mu.Unlock()
+		a.reloadMu.Lock()
+		defer a.reloadMu.Unlock()
+		if a.ready != nil {
+			a.ready.Set(false)
+		}
+		var errs []error
+		closeListener := func(err error) {
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				errs = append(errs, err)
+			}
+		}
+		if a.admin != nil {
+			closeListener(a.admin.Close())
+		}
+		if a.tcp != nil {
+			closeListener(a.tcp.Close())
+		}
+		if a.grpc != nil {
+			closeListener(a.grpc.Close())
+		}
+		if a.http != nil {
+			closeListener(a.http.Close())
+		}
+		if a.telemetry != nil && a.telemetry.Enabled() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			errs = append(errs, a.telemetry.Shutdown(shutdownCtx))
+			cancel()
+		}
+		a.storageMu.Lock()
+		state := a.storage
+		a.storage = nil
+		if a.recorders != nil {
+			a.recorders.Set(nil)
+		}
+		idle := retireStorage(state)
+		a.storageMu.Unlock()
+		if idle != nil {
+			<-idle
+		}
+		a.stopStorage(state)
+		if a.ownsLog {
+			errs = append(errs, a.log.Close())
+		}
+		a.closeErr = errors.Join(errs...)
+	})
+	return a.closeErr
 }
 
 // Reload re-reads the configuration file and applies the reloadable sections
@@ -484,18 +646,34 @@ func (a *App) Reload() error {
 	if !a.opts.hotReload || a.opts.source.Path == "" {
 		return errors.New("gosvc: hot reload is disabled")
 	}
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+	a.mu.Lock()
+	closed := a.closed
+	a.mu.Unlock()
+	if closed {
+		return ErrClosed
+	}
 	next, err := a.loadConfig()
 	if err != nil {
 		return err
 	}
-	a.applyConfig(next)
-	return nil
+	return a.applyConfigLocked(next)
 }
 
 // loadConfig re-reads the configuration source using the generic loader, which
 // keeps the same defaults < file < environment precedence as startup.
 func (a *App) loadConfig() (*config.Config, error) {
-	return a.opts.source.Load[config.Config]()
+	next, meta, err := a.opts.source.LoadWithMetadata[config.Config]()
+	if err != nil {
+		return nil, err
+	}
+	// A removed or misspelled [auth] section must not silently disable an
+	// authenticator that was active. An intentional disable is explicit.
+	if prev := a.current(); prev != nil && prev.Auth.Enabled && !next.Auth.Enabled && !meta.IsDefined("auth", "enabled") {
+		return nil, errors.New("gosvc: disabling auth requires explicit auth.enabled = false")
+	}
+	return next, nil
 }
 
 // CurrentConfig returns a redacted snapshot for the admin API.
@@ -507,8 +685,8 @@ func (a *App) CurrentConfig() *config.Config {
 	return cfg.Redacted()
 }
 
-// Config returns the live configuration owned by the application.
-func (a *App) Config() *config.Config { return a.current() }
+// Config returns an independent snapshot of settings currently in effect.
+func (a *App) Config() *config.Config { return a.current().Clone() }
 
 // Logger returns the root application logger.
 func (a *App) Logger() *slog.Logger { return a.log.Logger() }
@@ -527,10 +705,17 @@ func (a *App) Auth() *auth.Authenticator { return a.auth }
 // methods in the same place they wire routes.
 func (a *App) JSONRPCDispatcher() *jsonrpc.Dispatcher { return a.dispatcher }
 
-// Recorder returns the time-series recorder, or nil when Redis is disabled.
+// Recorder returns a snapshot of the time-series recorder, or nil when Redis
+// is disabled. Use StableRecorder when retaining the recorder across reloads.
 func (a *App) Recorder() store.Recorder { return a.recorders.Current() }
 
-// Store returns the Redis store, or nil when Redis is disabled.
+// StableRecorder returns a recorder whose target follows storage reloads. It
+// is a no-op while Redis is disabled, and is safe to cache for App's lifetime.
+func (a *App) StableRecorder() store.Recorder { return a.recorders }
+
+// Store returns a snapshot of the active Redis store, or nil when disabled.
+// A reload may close it immediately after return. Use WithStore for operations
+// that must remain safe while storage is reloaded.
 func (a *App) Store() *redis.Store {
 	if current := a.currentStorage(); current != nil {
 		return current.store
@@ -538,12 +723,77 @@ func (a *App) Store() *redis.Store {
 	return nil
 }
 
-// Postgres returns the PostgreSQL pool, or nil when it is disabled.
+// Postgres returns a snapshot of the active pool, or nil when disabled. A
+// reload may close it immediately after return. Use WithPostgres for operations
+// that must remain safe while storage is reloaded.
 func (a *App) Postgres() *postgres.DB {
 	if current := a.currentStorage(); current != nil {
 		return current.postgres
 	}
 	return nil
+}
+
+// WithStore leases the active Redis store for fn. A reload waits for that
+// generation's callbacks to finish before closing it. Nested WithStore and
+// WithPostgres calls are safe. The callback must not call Reload or Close,
+// since these operations wait for its lease to finish. Disabled storage
+// returns ErrStorageDisabled without invoking fn.
+func (a *App) WithStore(fn func(*redis.Store) error) error {
+	if fn == nil {
+		return errors.New("gosvc: nil storage callback")
+	}
+	a.storageMu.Lock()
+	state := a.storage
+	if state == nil || state.store == nil {
+		a.storageMu.Unlock()
+		return ErrStorageDisabled
+	}
+	state.leases++
+	a.storageMu.Unlock()
+	defer a.releaseStorage(state)
+	return fn(state.store)
+}
+
+// WithPostgres leases the active PostgreSQL pool for fn. A reload waits for
+// that generation's callbacks to finish before closing it. Nested storage
+// leases are safe; callbacks must not call Reload or Close.
+func (a *App) WithPostgres(fn func(*postgres.DB) error) error {
+	if fn == nil {
+		return errors.New("gosvc: nil storage callback")
+	}
+	a.storageMu.Lock()
+	state := a.storage
+	if state == nil || state.postgres == nil {
+		a.storageMu.Unlock()
+		return ErrStorageDisabled
+	}
+	state.leases++
+	a.storageMu.Unlock()
+	defer a.releaseStorage(state)
+	return fn(state.postgres)
+}
+
+func (a *App) releaseStorage(state *storageState) {
+	a.storageMu.Lock()
+	state.leases--
+	if state.leases == 0 && state.idle != nil {
+		close(state.idle)
+		state.idle = nil
+	}
+	a.storageMu.Unlock()
+}
+
+func (a *App) queryTimeSeries(ctx context.Context, metric string, from, to time.Time) ([]store.Bucket, error) {
+	var buckets []store.Bucket
+	err := a.WithStore(func(redisStore *redis.Store) error {
+		var queryErr error
+		buckets, queryErr = redisStore.Range(ctx, metric, from, to)
+		return queryErr
+	})
+	if errors.Is(err, ErrStorageDisabled) {
+		return nil, admin.ErrTimeSeriesDisabled
+	}
+	return buckets, err
 }
 
 func (a *App) currentStorage() *storageState {
@@ -576,66 +826,97 @@ func (a *App) AdminAddr() string { return a.admin.Addr() }
 
 func (a *App) current() *config.Config { return a.cfg.Load() }
 
-// applyConfig applies a reloaded configuration. Log, auth and limiter are hot
-// reloadable; everything else is reported as requiring a restart. The reload
-// is serialised so the config watcher and the admin POST /debug/reload
-// endpoint cannot interleave two reloads.
-func (a *App) applyConfig(next *config.Config) {
+// applyConfig applies reloadable sections and publishes only values that took
+// effect. A failed section remains at its previous value so future reloads
+// retry it. The watcher and manual reload are serialized.
+func (a *App) applyConfig(next *config.Config) error {
 	a.reloadMu.Lock()
 	defer a.reloadMu.Unlock()
+	return a.applyConfigLocked(next)
+}
+
+// applyConfigLocked requires reloadMu. Reload holds it across loading,
+// security checks and application so concurrent triggers cannot bypass the
+// explicit-auth-disable guard using a stale effective config.
+func (a *App) applyConfigLocked(next *config.Config) error {
+	if next == nil {
+		return errors.New("gosvc: nil reload config")
+	}
+	a.mu.Lock()
+	closed := a.closed
+	a.mu.Unlock()
+	if closed {
+		return ErrClosed
+	}
 
 	prev := a.current()
 	logger := a.log.Logger()
 	if prev == nil {
-		a.cfg.Store(next)
-		return
+		return errors.New("gosvc: no active config")
 	}
 
 	changed := make([]string, 0, 4)
+	effective := prev.Clone()
+	var failures []error
+	restart := restartRequiredFields(prev, next)
+	if len(restart) > 0 {
+		failures = append(failures, fmt.Errorf("restart required for: %v", restart))
+	}
+	// Access logging is wired at construction. Its enabled state cannot be
+	// changed by Reload, even when other log settings can be applied.
+	logConfig := next.Log
+	logConfig.Access.Enabled = prev.Log.Access.Enabled
+	if !prev.Log.Access.Enabled {
+		logConfig.Access = prev.Log.Access
+	}
 
-	if !reflect.DeepEqual(prev.Log, next.Log) {
-		if err := a.log.Reload(next.Log); err != nil {
+	if !reflect.DeepEqual(prev.Log, logConfig) {
+		if err := a.log.Reload(logConfig); err != nil {
 			logger.Error("failed to apply log configuration", "error", err)
+			failures = append(failures, fmt.Errorf("log: %w", err))
 		} else {
 			changed = append(changed, "log")
+			effective.Log = logConfig
 		}
 	}
 
 	if !reflect.DeepEqual(prev.Auth, next.Auth) {
 		if err := a.auth.Reload(next.Auth); err != nil {
 			logger.Error("failed to apply auth configuration", "error", err)
+			failures = append(failures, fmt.Errorf("auth: %w", err))
 		} else {
 			changed = append(changed, "auth")
+			effective.Auth = next.Auth
 		}
 	}
 
 	if prev.Limiter != next.Limiter {
 		a.limiter.SetRate(next.Limiter.RPS, next.Limiter.Burst)
 		changed = append(changed, "limiter")
+		effective.Limiter = next.Limiter
 	}
 
 	if !reflect.DeepEqual(prev.Storage, next.Storage) {
 		if err := a.reloadStorage(next.Storage); err != nil {
 			logger.Error("failed to rebuild storage, keeping the current connections", "error", err)
-			// Keep the previous storage section in the effective config so
-			// Config() and /debug/config describe the connections actually in
-			// use. The next reload attempts the change again.
-			next.Storage = prev.Storage
+			failures = append(failures, fmt.Errorf("storage: %w", err))
 		} else {
 			changed = append(changed, "storage")
+			effective.Storage = next.Storage
 		}
 	}
 
-	restart := restartRequiredFields(prev, next)
-	a.cfg.Store(next)
+	a.cfg.Store(effective.Clone())
 
 	if a.opts.onReload != nil {
-		if err := a.opts.onReload(next); err != nil {
+		if err := a.opts.onReload(effective.Clone()); err != nil {
 			logger.Error("application reload hook failed", "error", err)
+			failures = append(failures, fmt.Errorf("reload hook: %w", err))
 		}
 	}
 
 	logger.Info("configuration reloaded", "changed", changed, "restartRequired", restart)
+	return errors.Join(failures...)
 }
 
 // restartRequiredFields lists the changed sections that cannot be applied
@@ -663,6 +944,8 @@ func restartRequiredFields(prev, next *config.Config) []string {
 	}
 	if prev.Log.Access.Enabled != next.Log.Access.Enabled {
 		fields = append(fields, "log.access.enabled")
+	} else if !prev.Log.Access.Enabled && !reflect.DeepEqual(prev.Log.Access, next.Log.Access) {
+		fields = append(fields, "log.access")
 	}
 	return fields
 }
@@ -674,6 +957,20 @@ type storageState struct {
 	recorder *redis.Recorder
 	postgres *postgres.DB
 	cancel   context.CancelFunc
+	// leases and idle are protected by App.storageMu. A retired generation
+	// stays open until every callback that acquired it has returned.
+	leases int
+	idle   chan struct{}
+}
+
+// retireStorage is called with storageMu held. A non-nil channel signals
+// when callbacks using the old generation have all returned.
+func retireStorage(state *storageState) <-chan struct{} {
+	if state == nil || state.leases == 0 {
+		return nil
+	}
+	state.idle = make(chan struct{})
+	return state.idle
 }
 
 // startStorage opens the configured storage connections. On failure nothing is
@@ -731,15 +1028,17 @@ func (a *App) reloadStorage(cfg config.StorageConfig) error {
 		return err
 	}
 
-	// Swap the recorder first so transports never record into a closed store,
-	// then publish the new storage state.
-	a.recorders.Set(store.Nilable(next.recorder))
-
 	a.storageMu.Lock()
 	previous := a.storage
+	// Holder.Set waits for in-flight recordings before old recorder shutdown.
+	a.recorders.Set(store.Nilable(next.recorder))
 	a.storage = next
+	idle := retireStorage(previous)
 	a.storageMu.Unlock()
 
+	if idle != nil {
+		<-idle
+	}
 	a.stopStorage(previous)
 	return nil
 }

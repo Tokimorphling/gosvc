@@ -21,10 +21,11 @@ type Request struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 }
 
-// IsNotification reports whether the request omits the id field (or sets it to
-// null), in which case no response must be sent.
+// IsNotification reports whether the request omits the id field. An explicit
+// null id is a request and must receive a response. Callers must validate the
+// request before suppressing its response: invalid objects are not notifications.
 func (r *Request) IsNotification() bool {
-	return len(r.ID) == 0 || string(r.ID) == "null"
+	return len(r.ID) == 0
 }
 
 // Response is a JSON-RPC 2.0 response.

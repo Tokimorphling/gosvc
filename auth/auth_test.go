@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +24,52 @@ func TestDisabledAllowsAnonymous(t *testing.T) {
 	if identity.Method != MethodAnonymous {
 		t.Fatalf("method = %q", identity.Method)
 	}
+}
+
+func TestNilAuthenticatorAllowsAnonymous(t *testing.T) {
+	var a *Authenticator
+	identity, err := a.Authenticate("", "")
+	if err != nil || identity.Method != MethodAnonymous {
+		t.Fatalf("nil authenticator: identity=%+v err=%v", identity, err)
+	}
+}
+
+func TestAuthenticateAcrossConcurrentReloads(t *testing.T) {
+	a, err := New(config.AuthConfig{Enabled: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				identity, err := a.Authenticate("", "")
+				if err == nil {
+					if identity == nil || identity.Method != MethodAnonymous {
+						t.Errorf("unexpected successful identity: %+v", identity)
+						return
+					}
+				} else if apierror.KindOf(err) != apierror.KindUnauthenticated {
+					t.Errorf("unexpected auth error: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < 200; i++ {
+		if err := a.Reload(config.AuthConfig{Enabled: true, APIKeys: []string{"key"}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.Authenticate("", ""); apierror.KindOf(err) != apierror.KindUnauthenticated {
+			t.Fatalf("enabled authenticator allowed missing key: %v", err)
+		}
+		if err := a.Reload(config.AuthConfig{Enabled: false}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wg.Wait()
 }
 
 func TestAPIKey(t *testing.T) {

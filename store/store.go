@@ -83,7 +83,9 @@ func (h *Holder) Incr(ctx context.Context, metric string, delta float64) error {
 	if h == nil {
 		return nil
 	}
-	recorder := h.Current()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	recorder := h.recorder
 	if recorder == nil {
 		return nil
 	}

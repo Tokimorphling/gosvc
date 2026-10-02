@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/hertz/pkg/app/server"
 	"github.com/cloudwego/hertz/pkg/common/hlog"
@@ -129,15 +130,36 @@ func (s *Server) Dispatcher() *jsonrpc.Dispatcher { return s.dispatcher }
 // Addr returns the effective listen address.
 func (s *Server) Addr() string { return s.listener.Addr().String() }
 
+// Close releases a listener bound by New before Serve is started.
+func (s *Server) Close() error { return s.listener.Close() }
+
 // Serve blocks until ctx is cancelled or the server fails. When ctx is
 // cancelled it waits for the graceful drain to finish before returning, so
 // callers (gosvc.App.Run) do not exit the process while in-flight requests
 // are still being served.
 func (s *Server) Serve(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	done := make(chan struct{})
+	runReturned := make(chan struct{})
 	go func() {
 		defer close(done)
-		<-ctx.Done()
+		<-serveCtx.Done()
+		// Hertz ignores Shutdown until Run marks the engine as running.
+		// Cancellation during startup must wait for that transition or for
+		// Run to fail, otherwise Run may start serving after Shutdown returned.
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for !s.engine.IsRunning() {
+			select {
+			case <-runReturned:
+				return
+			case <-ticker.C:
+			}
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.D())
 		defer cancel()
 		if err := s.engine.Shutdown(shutdownCtx); err != nil {
@@ -148,9 +170,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	// engine.Run returns as soon as the listener is closed, which happens at
 	// the beginning of engine.Shutdown; the drain continues afterwards.
 	err := s.engine.Run()
+	close(runReturned)
+	cancel()
+	<-done
 	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("http serve: %w", err)
 	}
-	<-done
 	return nil
 }

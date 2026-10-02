@@ -35,6 +35,10 @@ func Build(opts Options) (*gosvc.App, error) {
 	runtimeOptions := []gosvc.Option{
 		gosvc.WithLogger(opts.Log),
 		gosvc.WithVersion(FullVersion()),
+		// Drain the push broker during the shutdown phase, while the
+		// transports still serve: queued events reach live clients before
+		// their connections close.
+		gosvc.WithOnShutdown(events.Shutdown),
 	}
 	if len(opts.PublicPaths) > 0 {
 		runtimeOptions = append(runtimeOptions, gosvc.WithPublicPaths(opts.PublicPaths...))

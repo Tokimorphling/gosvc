@@ -134,12 +134,14 @@ func (a *Authenticator) Enabled() bool {
 
 // Authenticate resolves credentials, preferring the bearer token.
 func (a *Authenticator) Authenticate(bearerToken, apiKey string) (*Identity, error) {
-	if !a.Enabled() {
+	if a == nil {
 		return &Identity{Subject: "anonymous", Method: MethodAnonymous}, nil
 	}
-
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	if !a.enabled {
+		return &Identity{Subject: "anonymous", Method: MethodAnonymous}, nil
+	}
 
 	if bearerToken != "" {
 		return a.authenticateJWTLocked(bearerToken)
