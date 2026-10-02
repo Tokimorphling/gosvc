@@ -20,7 +20,8 @@
 // Backpressure is uniform: a full subscription queue applies the configured
 // policy — Drop (count and continue) or Disconnect (terminate the slow
 // subscriber; it reconnects and resubscribes). Delivery and drops are counted
-// on gosvc_broker_* metrics when a *observability.Metrics is wired.
+// on gosvc_broker_* metrics when a *observability.Metrics is wired. A sink can
+// also return ErrDropped to discard one event without ending its subscription.
 //
 // Broker[T] is generic over the payload type for compile-time safety at the
 // Publish/Subscribe boundary; delivery boxes the payload once per
@@ -29,6 +30,7 @@ package push
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 
@@ -38,7 +40,9 @@ import (
 // Sink is one pushable destination.
 type Sink interface {
 	// Send delivers one event to the destination. It may block briefly (an
-	// SSE write under the HTTP write timeout); broker pumps absorb that.
+	// SSE write under the HTTP write timeout); broker pumps absorb that. A
+	// sink may return ErrDropped to discard this event without ending its
+	// subscription.
 	Send(event string, data any) error
 	// Done is closed when the destination is gone: the broker prunes the
 	// subscription without the application doing anything.
@@ -49,6 +53,10 @@ type Sink interface {
 	// ID identifies the sink for logs and error messages.
 	ID() string
 }
+
+// ErrDropped tells the broker that a sink discarded one event but remains
+// usable. The broker counts the event as dropped and continues its pump.
+var ErrDropped = errors.New("push: event dropped")
 
 // Policy selects what happens when a subscriber's queue is full.
 type Policy int
@@ -71,13 +79,14 @@ type message[T any] struct {
 type Broker[T any] struct {
 	name string
 
-	mu    sync.RWMutex
-	subs  map[*Subscription[T]]struct{}
-	count int
+	mu      sync.RWMutex
+	subs    map[*Subscription[T]]struct{}
+	count   int
+	stopped bool
 
 	queueSize int
 	policy    Policy
-	metrics   *observability.Metrics
+	metrics   atomic.Pointer[observability.Metrics]
 }
 
 // The option plumbing is declared once and accepted by every Broker[T]
@@ -124,24 +133,33 @@ func WithMetrics(m *observability.Metrics) BrokerOption {
 // metrics.
 func NewBroker[T any](name string, opts ...BrokerOption) *Broker[T] {
 	c := newBrokerConfig(name, opts...)
-	return &Broker[T]{
+	b := &Broker[T]{
 		name:      c.name,
 		queueSize: c.queueSize,
 		policy:    c.policy,
-		metrics:   c.metrics,
 	}
+	b.metrics.Store(c.metrics)
+	return b
 }
 
 // SetMetrics wires the delivery/drop counters after construction, when the
-// metrics bundle only becomes available later in startup.
-func (b *Broker[T]) SetMetrics(m *observability.Metrics) { b.metrics = m }
+// metrics bundle only becomes available later in startup. It is safe to call
+// while events are being delivered and initializes the new subscriber gauge
+// to the current count.
+func (b *Broker[T]) SetMetrics(m *observability.Metrics) {
+	b.mu.Lock()
+	b.metrics.Store(m)
+	m.SetBrokerSubscribers(b.name, b.count)
+	b.mu.Unlock()
+}
 
 // Name returns the broker's metric name.
 func (b *Broker[T]) Name() string { return b.name }
 
 // Subscribe registers sink and starts its delivery pump. The returned
 // subscription is the handle for Unsubscribe; it is also closed
-// automatically when the sink dies.
+// automatically when the sink dies. After Shutdown, it returns an already
+// completed subscription without registering the sink.
 func (b *Broker[T]) Subscribe(sink Sink) *Subscription[T] {
 	sub := &Subscription[T]{
 		broker: b,
@@ -150,6 +168,12 @@ func (b *Broker[T]) Subscribe(sink Sink) *Subscription[T] {
 		done:   make(chan struct{}),
 	}
 	b.mu.Lock()
+	if b.stopped {
+		sub.closeQueue()
+		close(sub.done)
+		b.mu.Unlock()
+		return sub
+	}
 	if b.subs == nil {
 		b.subs = make(map[*Subscription[T]]struct{})
 	}
@@ -167,6 +191,9 @@ func (b *Broker[T]) Subscribe(sink Sink) *Subscription[T] {
 func (b *Broker[T]) Publish(event string, payload T) int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	if b.stopped {
+		return 0
+	}
 	accepted := 0
 	for sub := range b.subs {
 		if sub.closed.Load() {
@@ -193,7 +220,8 @@ func (b *Broker[T]) overflow(sub *Subscription[T]) {
 	}
 }
 
-// Len returns the number of live subscriptions.
+// Len returns the number of registered subscriptions. During Shutdown it may
+// include subscriptions whose pumps are still draining queued events.
 func (b *Broker[T]) Len() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -204,6 +232,7 @@ func (b *Broker[T]) Len() int {
 // and then exits. Publish after Shutdown delivers nothing.
 func (b *Broker[T]) Shutdown() {
 	b.mu.Lock()
+	b.stopped = true
 	for sub := range b.subs {
 		sub.closeQueue()
 	}
@@ -221,17 +250,17 @@ func (b *Broker[T]) remove(sub *Subscription[T]) {
 }
 
 func (b *Broker[T]) reportSubscribers() {
-	b.metrics.SetBrokerSubscribers(b.name, b.count)
+	b.metrics.Load().SetBrokerSubscribers(b.name, b.count)
 }
 
-func (b *Broker[T]) observeDelivered() { b.metrics.ObserveBrokerDelivered(b.name) }
+func (b *Broker[T]) observeDelivered() { b.metrics.Load().ObserveBrokerDelivered(b.name) }
 func (b *Broker[T]) observeDropped(reason string) {
-	b.metrics.ObserveBrokerDropped(b.name, reason)
+	b.metrics.Load().ObserveBrokerDropped(b.name, reason)
 }
 
 // Subscription is the handle of one subscriber. Unsubscribe is idempotent;
 // Done is closed after the pump exits (unsubscribed, sink gone or shutdown
-// drain finished).
+// drain finished), or immediately if Subscribe was called after Shutdown.
 type Subscription[T any] struct {
 	broker *Broker[T]
 	sink   Sink
@@ -248,7 +277,8 @@ func (s *Subscription[T]) Unsubscribe() {
 	s.broker.mu.Unlock()
 }
 
-// Done is closed once the delivery pump has exited.
+// Done is closed once the delivery pump has exited, or immediately when the
+// subscription was rejected because the broker was shut down.
 func (s *Subscription[T]) Done() <-chan struct{} { return s.done }
 
 // closeQueue marks the subscription closed and closes its queue. It requires
@@ -261,7 +291,8 @@ func (s *Subscription[T]) closeQueue() {
 }
 
 // pump delivers queued events until the queue is closed and drained, the
-// sink reports it is done, or a delivery fails.
+// sink reports it is done, or a delivery fails with an error other than
+// ErrDropped.
 func (s *Subscription[T]) pump() {
 	defer close(s.done)
 	defer s.broker.remove(s)
@@ -275,6 +306,10 @@ func (s *Subscription[T]) pump() {
 				return
 			}
 			if err := s.sink.Send(msg.event, msg.data); err != nil {
+				if errors.Is(err, ErrDropped) {
+					s.broker.observeDropped("dropped")
+					continue
+				}
 				s.broker.observeDropped("sink_error")
 				return
 			}

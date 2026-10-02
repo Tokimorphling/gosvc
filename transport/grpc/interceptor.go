@@ -66,13 +66,16 @@ func traceInterceptor() ggrpc.UnaryServerInterceptor {
 
 func authInterceptor(authenticator *auth.Authenticator) ggrpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *ggrpc.UnaryServerInfo, handler ggrpc.UnaryHandler) (any, error) {
-		if !authenticator.Enabled() || isPublicMethod(info.FullMethod) {
+		if isPublicMethod(info.FullMethod) {
 			return handler(ctx, req)
 		}
 
 		identity, err := authenticator.Authenticate(credentialsFromMetadata(ctx))
 		if err != nil {
 			return nil, ToStatus(err)
+		}
+		if identity.Method == auth.MethodAnonymous {
+			return handler(ctx, req)
 		}
 
 		ctx = auth.WithIdentity(ctx, identity)
@@ -222,13 +225,16 @@ func traceStreamInterceptor() ggrpc.StreamServerInterceptor {
 
 func authStreamInterceptor(authenticator *auth.Authenticator) ggrpc.StreamServerInterceptor {
 	return func(srv any, ss ggrpc.ServerStream, info *ggrpc.StreamServerInfo, handler ggrpc.StreamHandler) error {
-		if !authenticator.Enabled() || isPublicMethod(info.FullMethod) {
+		if isPublicMethod(info.FullMethod) {
 			return handler(srv, ss)
 		}
 
 		identity, err := authenticator.Authenticate(credentialsFromMetadata(ss.Context()))
 		if err != nil {
 			return ToStatus(err)
+		}
+		if identity.Method == auth.MethodAnonymous {
+			return handler(srv, ss)
 		}
 
 		ctx := auth.WithIdentity(ss.Context(), identity)

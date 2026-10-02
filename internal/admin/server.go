@@ -24,16 +24,22 @@ import (
 	"github.com/Tokimorphling/gosvc/store"
 )
 
+// ErrTimeSeriesDisabled tells the query endpoint that storage is unavailable.
+var ErrTimeSeriesDisabled = errors.New("admin: time-series store is disabled")
+
 // Options wires the admin server.
 type Options struct {
-	Config        *config.Config
-	Logger        *slog.Logger
-	Log           *logging.Handle
-	Metrics       *observability.Metrics
-	Ready         *health.Ready
-	TimeSeries    store.TimeSeries
-	Reload        func() error
-	CurrentConfig func() *config.Config
+	Config     *config.Config
+	Logger     *slog.Logger
+	Log        *logging.Handle
+	Metrics    *observability.Metrics
+	Ready      *health.Ready
+	TimeSeries store.TimeSeries
+	// TimeSeriesQuery resolves the active store for each request. It takes
+	// precedence over TimeSeries and can keep a storage lease while querying.
+	TimeSeriesQuery func(context.Context, string, time.Time, time.Time) ([]store.Bucket, error)
+	Reload          func() error
+	CurrentConfig   func() *config.Config
 	// Version is reported by GET /version.
 	Version string
 }
@@ -221,7 +227,7 @@ func registerConfigEndpoints(mux *http.ServeMux, opts Options) {
 // GET /debug/ts?metric=http.requests:/api/v1/hello&minutes=60
 func registerTimeSeries(mux *http.ServeMux, opts Options) {
 	mux.HandleFunc("/debug/ts", func(w http.ResponseWriter, r *http.Request) {
-		if opts.TimeSeries == nil {
+		if opts.TimeSeries == nil && opts.TimeSeriesQuery == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "time-series store is disabled"})
 			return
 		}
@@ -245,8 +251,18 @@ func registerTimeSeries(mux *http.ServeMux, opts Options) {
 
 		to := time.Now()
 		from := to.Add(-time.Duration(minutes) * time.Minute)
-		buckets, err := opts.TimeSeries.Range(r.Context(), metric, from, to)
+		var buckets []store.Bucket
+		var err error
+		if opts.TimeSeriesQuery != nil {
+			buckets, err = opts.TimeSeriesQuery(r.Context(), metric, from, to)
+		} else {
+			buckets, err = opts.TimeSeries.Range(r.Context(), metric, from, to)
+		}
 		if err != nil {
+			if errors.Is(err, ErrTimeSeriesDisabled) {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "time-series store is disabled"})
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
@@ -266,15 +282,20 @@ func (s *Server) Mux() *http.ServeMux { return s.mux }
 // Addr returns the effective listen address.
 func (s *Server) Addr() string { return s.listener.Addr().String() }
 
+// Close releases a listener bound by New before Serve is started.
+func (s *Server) Close() error { return s.listener.Close() }
+
 // Serve blocks until ctx is cancelled or the server fails. When ctx is
 // cancelled it waits for the graceful drain to finish before returning, so
 // callers (gosvc.App.Run) do not exit the process while scrape or reload
 // requests are still in flight.
 func (s *Server) Serve(ctx context.Context) error {
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		<-ctx.Done()
+		<-serveCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
@@ -285,10 +306,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	// Serve returns as soon as Shutdown closes the listener; the drain
 	// continues afterwards, so join it.
 	err := s.httpServer.Serve(s.listener)
+	cancel()
+	<-done
 	if err != nil && !errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
 		return fmt.Errorf("admin serve: %w", err)
 	}
-	<-done
 	return nil
 }
 

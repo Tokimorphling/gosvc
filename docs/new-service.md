@@ -106,7 +106,7 @@ dsn = "postgres://user:pass@localhost/app?sslmode=disable"
 > admin 端口暴露 pprof / 配置 / reload 等高权限端点：绑在内网或 loopback，或设置
 > `[admin].token`（`Authorization: Bearer <token>`）后再暴露。
 
-> `Strict: true` 会拒绝未知键——启动时抓拼写错误；热更新走非严格模式，好让应用段与运行时配置共存。
+> `Strict: true` 会拒绝未知键——启动时抓拼写错误；热更新校验运行时配置段内的未知键，同时允许应用自定义顶层段共存。运行中关闭已启用的认证须在文件中显式写入 `auth.enabled = false`。
 
 ## 3. 入口：加载 → 组装 → 注册 → Run
 
@@ -157,9 +157,10 @@ func main() {
 		slog.Error("build runtime", "error", err)
 		os.Exit(1)
 	}
+	defer app.Close() // New 已绑定端口；提前返回时也释放资源
 
-	// 运行时已建好连接池：直接拿 app.Postgres() / app.Store() / app.Metrics()
-	svc := service.New(app.Postgres())
+	// 业务每次数据库操作通过 WithPostgres 借用当前池，不缓存旧连接。
+	svc := service.New(app.WithPostgres)
 
 	if err := app.RegisterHTTP(func(h *server.Hertz) {
 		registerHTTP(h, svc)
@@ -332,9 +333,12 @@ prefix = "myservice"
 bucketTtl = "25h"
 ```
 
-- `app.Postgres()` → `*postgres.DB`（`*sql.DB` 包装）；池指标 `gosvc_db_pool_*` 自动导出；
+- `app.Postgres()` → 当前 `*postgres.DB` 快照（`*sql.DB` 包装）；需要跨热重载安全
+  使用时在 `app.WithPostgres(func(db *postgres.DB) error { ... })` 内执行操作；
+  池指标 `gosvc_db_pool_*` 自动导出；
   Postgres 启用时 `/readyz` 自动带该依赖探针；
-- `app.Store()` → Redis（分钟桶时序），`app.Recorder()` 用于自定义指标：
+- `app.Store()` → 当前 Redis 连接快照；业务操作用 `app.WithStore` 保护当前连接。
+  `app.Recorder()` 返回当前 recorder，长期持有则用 `app.StableRecorder()`：
 
   ```go
   if recorder := app.Recorder(); recorder != nil {
@@ -390,7 +394,7 @@ issuer = "myservice"
 | `auth.*` | 热生效（凭据原子替换） |
 | `limiter.*` | 热生效 |
 | `storage.*` | **重建连接**：新连接就绪后切换，旧连接优雅关闭；失败保留旧连接并记错误 |
-| `service` / `http`（含 `http.cors`）/ `grpc` / `tcp`（含 `handlerTimeout`、`notifyQueueSize`、`notifyPolicy`）/ `admin`（含 `token`）/ `telemetry` / `log.access.enabled` | 需要重启，重载日志会列出 |
+| `service` / `http`（含 `http.cors`）/ `grpc` / `tcp`（含 `handlerTimeout`、`notifyQueueSize`、`notifyPolicy`）/ `admin`（含 `token`）/ `telemetry` / `log.access.enabled` | 需要重启，重载日志会列出；当前生效配置保持旧值 |
 
 应用自己的段用 `WithOnReload` 处理：
 
@@ -401,7 +405,7 @@ gosvc.WithOnReload(func(cfg *gosvc.Config) error {
 })
 ```
 
-手动触发：`curl -X POST http://127.0.0.1:6060/debug/reload`；查看生效配置（脱敏）：
+手动触发：`curl -X POST http://127.0.0.1:6060/debug/reload`（有配置未能生效时返回错误）；查看生效配置（脱敏）：
 `curl http://127.0.0.1:6060/debug/config`。
 
 ## 9. 测试

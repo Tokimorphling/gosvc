@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Tokimorphling/gosvc/apierror"
 )
@@ -107,12 +108,135 @@ func TestServeInvalidRequest(t *testing.T) {
 	}
 }
 
+func TestServeInvalidObjectsReturnInvalidRequest(t *testing.T) {
+	d := newTestDispatcher()
+	for _, body := range []string{
+		`{"foo":"boo"}`,
+		`{"jsonrpc":"2.0"}`,
+		`{"jsonrpc":"1.0","method":"echo"}`,
+		`{"jsonrpc":"2.0","method":42}`,
+		`{"jsonrpc":"2.0","method":"echo","params":null}`,
+		`{"jsonrpc":"2.0","method":"echo","id":true}`,
+		`{"jsonrpc":"2.0","method":"echo","id":{}}`,
+		`{"jsonrpc":"2.0","method":"echo","id":[]}`,
+		`null`,
+		`42`,
+	} {
+		raw, ok := d.Serve(context.Background(), []byte(body))
+		if !ok {
+			t.Fatalf("%s: invalid request was treated as a notification", body)
+		}
+		resp := decodeResponse(t, raw)
+		if resp.Error == nil || resp.Error.Code != CodeInvalidRequest || string(resp.ID) != "null" {
+			t.Fatalf("%s: resp = %+v", body, resp)
+		}
+	}
+}
+
+func TestServeExplicitNullIDReceivesResponse(t *testing.T) {
+	d := newTestDispatcher()
+	for _, body := range []string{
+		`{"jsonrpc":"2.0","method":"echo","id":null}`,
+		`{"jsonrpc":"2.0","method":"missing","id":null}`,
+	} {
+		raw, ok := d.Serve(context.Background(), []byte(body))
+		if !ok {
+			t.Fatalf("%s: explicit null id was treated as a notification", body)
+		}
+		resp := decodeResponse(t, raw)
+		if string(resp.ID) != "null" {
+			t.Fatalf("%s: id = %s", body, resp.ID)
+		}
+	}
+	if (&Request{ID: json.RawMessage("null")}).IsNotification() {
+		t.Fatal("explicit null id must not be a notification")
+	}
+	raw, ok := d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","method":"echo","id":"request-1"}`))
+	if !ok || string(decodeResponse(t, raw).ID) != `"request-1"` {
+		t.Fatalf("string id response = %s, ok = %v", raw, ok)
+	}
+}
+
+func TestServeBatchInvalidElementsAndNotifications(t *testing.T) {
+	d := NewDispatcher()
+	called := 0
+	d.Register("record", func(context.Context, json.RawMessage) (any, error) {
+		called++
+		return "ok", nil
+	})
+	body := `[
+		{"jsonrpc":"2.0","method":"record"},
+		{"foo":"boo"},
+		null,
+		42,
+		{"jsonrpc":"2.0","method":"record","id":true},
+		{"jsonrpc":"2.0","method":"record","id":null},
+		{"jsonrpc":"2.0","method":"record","id":2}
+	]`
+	raw, ok := d.Serve(context.Background(), []byte(body))
+	if !ok {
+		t.Fatal("invalid batch elements and requests with ids must receive responses")
+	}
+	var responses []testResponse
+	if err := json.Unmarshal(raw, &responses); err != nil {
+		t.Fatalf("unmarshal batch response %s: %v", raw, err)
+	}
+	if len(responses) != 6 {
+		t.Fatalf("got %d responses, want 6: %s", len(responses), raw)
+	}
+	for i := 0; i < 4; i++ {
+		if responses[i].Error == nil || responses[i].Error.Code != CodeInvalidRequest || string(responses[i].ID) != "null" {
+			t.Fatalf("response %d = %+v, want Invalid Request with null id", i, responses[i])
+		}
+	}
+	if responses[4].Error != nil || string(responses[4].ID) != "null" {
+		t.Fatalf("explicit null id response = %+v", responses[4])
+	}
+	if responses[5].Error != nil || string(responses[5].ID) != "2" {
+		t.Fatalf("numeric id response = %+v", responses[5])
+	}
+	if called != 3 {
+		t.Fatalf("handler called %d times, want notification and two valid requests", called)
+	}
+}
+
 func TestServeMethodNotFound(t *testing.T) {
 	d := newTestDispatcher()
 	raw, _ := d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","id":7,"method":"nope"}`))
 	resp := decodeResponse(t, raw)
 	if resp.Error == nil || resp.Error.Code != CodeMethodNotFound {
 		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestObserverBoundsUnknownMethodNames(t *testing.T) {
+	d := newTestDispatcher()
+	type observation struct {
+		method string
+		code   int
+	}
+	var got []observation
+	d.SetObserver(func(method string, code int, _ time.Duration) {
+		got = append(got, observation{method, code})
+	})
+
+	d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"client.chosen.1"}`))
+	d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","method":"client.chosen.2"}`))
+	d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","method":"echo","id":true}`))
+	d.Handle(context.Background(), &Request{JSONRPC: "2.0", Method: "client.chosen.direct", ID: json.RawMessage("1")})
+	_, _ = d.Invoke(context.Background(), "client.chosen.3", nil)
+	_, _ = d.Invoke(context.Background(), "echo", nil)
+
+	want := []observation{
+		{UnknownMethodLabel, CodeMethodNotFound},
+		{UnknownMethodLabel, CodeMethodNotFound},
+		{UnknownMethodLabel, CodeInvalidRequest},
+		{UnknownMethodLabel, CodeMethodNotFound},
+		{UnknownMethodLabel, CodeMethodNotFound},
+		{"echo", 0},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("observations = %+v, want %+v", got, want)
 	}
 }
 
@@ -380,5 +504,31 @@ func TestMiddlewareLateRegistration(t *testing.T) {
 	}
 	if resp.Result != "blocked" {
 		t.Fatalf("result = %q, want the middleware to take effect after registration", resp.Result)
+	}
+}
+
+// TestSetObserverIfAbsent verifies that a default observer can be wired into
+// an existing dispatcher without overriding an observer that was deliberately
+// installed first.
+func TestSetObserverIfAbsent(t *testing.T) {
+	d := NewDispatcher()
+	d.Register("echo", func(context.Context, json.RawMessage) (any, error) { return "ok", nil })
+
+	var customSeen bool
+	d.SetObserver(func(string, int, time.Duration) { customSeen = true })
+	if d.SetObserverIfAbsent(func(string, int, time.Duration) { t.Fatal("the absent-install overrode a set observer") }) {
+		t.Fatal("SetObserverIfAbsent reported installation over an existing observer")
+	}
+	_, ok := d.Serve(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"echo"}`))
+	if !ok {
+		t.Fatal("expected a response body")
+	}
+	if !customSeen {
+		t.Fatal("the custom observer was not called")
+	}
+
+	empty := NewDispatcher()
+	if !empty.SetObserverIfAbsent(func(string, int, time.Duration) {}) {
+		t.Fatal("SetObserverIfAbsent must install when no observer is set")
 	}
 }

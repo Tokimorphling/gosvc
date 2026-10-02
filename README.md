@@ -124,10 +124,10 @@ func main() {
 | 访问日志独立 sink | `log.access.*`：请求日志走自己的级别/格式/输出/文件，自动带 `request_id`/`trace_id`/`log_type=access` |
 | 无锁状态 | `state.Snapshot[T]` 提供读无锁、写替换的共享状态 |
 | 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 热生效，`storage.*` **重建连接**（新连接就绪后切换，失败保留旧连接且有效配置回滚），其余字段提示 `restartRequired` |
-| 有界并发 | `workerpool`（显式 `ErrFull`/`ErrClosed`）+ netpoll 事件循环 + 每连接写串行化，慢业务不阻塞 IO；TCP 帧长在缓冲前强制（防恶意大帧） |
-| 推送（push） | `push.Broker[T]` 统一 fan-out：订阅登记/背压/死连接剪枝/shutdown 排空全归框架；`Sink` 适配 TCP session / SSE / gRPC stream 三种形态，`SinkFromContext` 让 "subscribe" 方法零胶水 |
+| 有界并发 | `workerpool`（显式 `ErrFull`/`ErrClosed`）+ netpoll 事件循环 + 每连接写串行化，慢业务不阻塞 IO；TCP 逐帧限制解析长度 |
+| 推送（push） | `push.Broker[T]` 统一 fan-out：订阅登记、背压、死连接剪枝及显式 Shutdown 排空；`Sink` 适配 TCP session / SSE / gRPC stream 三种形态，`SinkFromContext` 让 "subscribe" 方法零胶水 |
 | 扩展点 | TCP 帧方言 `tcp.Codec`（stratum 等非 JSON-RPC 协议可直接落 gosvc TCP）、连接生命周期 `tcp.Callbacks`（OnConnect/OnDisconnect 恰好一次）、逐方法 `jsonrpc.Middleware`（覆盖 HTTP /rpc + TCP 全部路径）、串行派发 `Serial` 能力、按传输方法表 `WithTCPDispatcher`；默认行为零侵入 |
-| 真正的优雅退出 | 四个传输的 `Serve` 都会 join 自己的 drain：`Run` 返回时，在途请求已处理完（受各 `shutdownTimeout` 约束），不会随进程退出被掐断 |
+| 优雅退出 | 四个传输的 `Serve` 都会 join 自己的 drain；业务 handler 需响应 `ctx` 取消，否则仍可能阻止 `Run` 返回 |
 | 压测器 | `examples/app/cmd/bench` 支持 rest / jsonrpc / grpc |
 
 ## 目录结构
@@ -182,14 +182,18 @@ err = app.RegisterJSONRPC(func(d *jsonrpc.Dispatcher))
 err = app.RegisterAdmin(func(mux *http.ServeMux))
 
 app.Run(ctx)            // 阻塞直到 ctx 取消或某个 server 失败；返回前等待所有传输的 drain 完成
+app.Close()             // New 成功但不调用 Run 时释放已绑定资源；可重复调用
 
 // 运行时访问器（handler 里常用）
 app.Logger()            // *slog.Logger
 app.Metrics()           // *observability.Metrics
 app.Auth()              // *auth.Authenticator
-app.Recorder()          // store.Recorder（未启用 Redis 时为 nil）
-app.Store()             // *redis.Store（未启用时为 nil）
-app.Postgres()          // *postgres.DB（未启用时为 nil）
+app.Recorder()          // 当前 recorder 快照（未启用 Redis 时为 nil）
+app.StableRecorder()    // 可长期持有，随 Redis 重载自动切换
+app.Store()             // 当前 *redis.Store 快照（未启用时为 nil）
+app.Postgres()          // 当前 *postgres.DB 快照（未启用时为 nil）
+app.WithStore(fn)       // 在 fn 执行期间保持当前 Redis 连接可用
+app.WithPostgres(fn)    // 在 fn 执行期间保持当前 PostgreSQL 连接池可用
 app.Health()            // *health.Ready，可注册自己的依赖探针
 app.Config()            // 当前生效配置（未脱敏）
 app.CurrentConfig()     // 脱敏快照（admin /debug/config 用）
@@ -197,7 +201,7 @@ app.HTTPAddr() / GRPCAddr() / TCPAddr() / AdminAddr()
 app.Reload()            // 手动重载配置
 ```
 
-选项：`WithLogger`、`WithVersion`、`WithHotReload(path, envPrefix)`、`WithPublicPaths(...)`、`WithOnReload(fn)`、`WithTCPCodec(codec)`、`WithTCPCallbacks(cb)`、`WithJSONRPCMiddleware(mw...)`、`WithTCPDispatcher(d)`。
+选项：`WithLogger`、`WithVersion`、`WithHotReload(path, envPrefix)`、`WithPublicPaths(...)`、`WithOnReload(fn)`、`WithOnShutdown(fn...)`、`WithTCPCodec(codec)`、`WithTCPCallbacks(cb)`、`WithJSONRPCMiddleware(mw...)`、`WithTCPDispatcher(d)`。
 
 ### 配置
 
@@ -241,6 +245,11 @@ order, err := client.Call[GetOrderRequest, *Order](ctx, "orders.get", GetOrderRe
 `push.Broker[T]` 统一提供。`Publish` 永不阻塞：每个订阅者一条有界队列 + 一个 pump
 goroutine，慢客户端只拖慢自己；队列满按策略 `drop`（默认，计数）或 `disconnect`
 （终结慢消费者，重连重订阅）。指标：`gosvc_broker_subscribers/delivered_total/dropped_total`。
+TCP 会再经过每连接的发送队列；该队列按 `drop` 策略丢弃一条通知时，broker 将其计为
+`dropped` 并保留订阅。把 `Broker.Shutdown` 注册进生命周期后，排空发生在传输仍在
+服务的窗口内：`gosvc.New(cfg, gosvc.WithOnShutdown(events.Shutdown))`——shutdown 触发
+后、各传输关闭连接前运行，队列里的事件还能送达在线客户端（之后 `Publish` 不再投递，
+`Len()` 在排空期间可能暂时非零）。
 
 ```go
 events := push.NewBroker[Event]("events", push.WithQueueSize(256), push.WithPolicy(push.Drop))
@@ -290,7 +299,7 @@ err := session.Notify("events.pong", map[string]any{"at": time.Now()})
 
 ### SSE：HTTP 单向推送
 
-`httptransport.RegisterSSE` 在普通 GET 路由上输出 `text/event-stream`，wire 处理复用 Hertz 官方 `protocol/sse`。**鉴权、限流、追踪、访问日志全部照旧生效**（就是普通路由）；gosvc 开启了 Hertz 的断连感知，客户端断开时 `stream.Done()` 触发，handler 应尽快返回：
+`httptransport.RegisterSSE` 在普通 GET 路由上输出 `text/event-stream`，wire 处理复用 Hertz 官方 `protocol/sse`。它先发送一条 `:connected` 注释帧，让空闲流也能立即返回响应头。**鉴权、限流、追踪、访问日志全部照旧生效**（就是普通路由）；gosvc 开启了 Hertz 的断连感知，客户端断开时 `stream.Done()` 触发，handler 应尽快返回：
 
 ```go
 application.RegisterHTTP(func(h *server.Hertz) {
@@ -396,8 +405,10 @@ malformed 请求的指标覆盖，违背零变化约束，故保留。
 - **传输身份**：`jsonrpc.TransportFromContext(ctx)` 返回 `"tcp"` / `"http"`，中间件可按
   传输分支（例如 TCP 无传输层鉴权 → 严格模式）。
 - **按传输方法表**：`gosvc.WithTCPDispatcher(d)` 给 TCP 一张独立方法表（app 自建并注册），
-  把 `mining.*` 这类方言方法挡在 HTTP `/rpc` 之外，也让两个表各自 `SetObserver` /
-  `Use`，实现按传输的观测与中间件隔离。默认仍共享。
+  把 `mining.*` 这类方言方法挡在 HTTP `/rpc` 之外，也让两个表各自 `Use` 实现按传输的
+  中间件隔离。观测零配置：`New` 会给独立表装上默认 RPC 指标 observer（`Invoke`/`Serve`
+  都会计入 `gosvc_jsonrpc_requests_total`），除非 app 在 `New` 之前 `SetObserver`
+  换成了自己的。默认仍共享。
 
 ### 错误映射
 
@@ -616,7 +627,8 @@ connMaxLifetime = "1h"
 - 连接池参数在启动时应用；池指标自动注册：`gosvc_db_pool_open_connections`、
   `in_use_connections`、`idle_connections`、`wait_total`、`max_open_connections`；
 - 环境变量：`GOSVC_POSTGRES_DSN`；
-- 使用：`app.Postgres()` 拿到 `*sql.DB` 包装，直接查询即可。
+- 使用：`app.Postgres()` 返回当前池的快照；需要跨热重载安全执行的查询用
+  `app.WithPostgres(func(db *postgres.DB) error { ... })`，运行时会在回调结束后才关闭旧池。
 
 ### 就绪探针
 
@@ -636,9 +648,11 @@ app.Health().AddCheck("redis", func(ctx context.Context) error { return redisCli
 
 `storage.*` 变化时运行时会**新建连接 → 切换 → 优雅关闭旧连接**（recorder 先 flush 再关闭）：
 
-- 新连接建立失败（例如 DSN 写错、数据库不可达）时保留旧连接，日志记录 error，服务不中断；
+- 新连接建立失败（例如 DSN 写错、数据库不可达）时保留旧连接，日志记录 error，手动重载返回错误，服务不中断；
 - **有效配置同步回滚**：`app.Config()` 与 `/debug/config` 始终描述真实在用的连接，不会展示一个从未装上的池；下次重载会再次尝试该变更；
-- 通过 `app.Store()` / `app.Postgres()` / `app.Recorder()` 读到的始终是当前生效的连接；
+- `app.Store()` / `app.Postgres()` 返回调用时的快照，不应长期缓存；在
+  `app.WithStore` / `app.WithPostgres` 回调内使用连接，热重载会等待回调结束；
+- 需要长期持有 recorder 时使用 `app.StableRecorder()`，它会随存储切换；
 - 池指标通过 provider 采集，切换后无需重新注册。
 
 ## 运维端点（admin 端口）
@@ -687,7 +701,8 @@ TCP 传输不做 TLS，请在网关终止。
   想换框架时只需替换 transport 包；
 - **一个共享 Dispatcher**：HTTP `/rpc` 与 TCP 方法只注册一次，指标也只记一份；批量默认上限 128
   防止单个请求无限占用 worker；
-- **认证默认全局开启**（healthz/readyz 白名单）：避免应用忘记给业务路由加鉴权；
+- **认证需显式开启**：默认 `auth.enabled = false`，而 HTTP/gRPC 默认监听所有地址；
+  对外部署应启用认证或在可信网关完成鉴权。启用后 healthz/readyz 为白名单，
   `WithPublicPaths` 既接受字面路径也接受路由模式（`/api/v1/orders/:id`）；
 - **gRPC 同时链 unary 与 stream 拦截器**：recovery / request id / trace / auth / logging / metrics /
   rate limit 对 streaming RPC 同样生效；
@@ -695,9 +710,9 @@ TCP 传输不做 TLS，请在网关终止。
   `X-Forwarded-For` 伪造的 `ClientIP`：直连暴露时无法通过换头绕过；部署在可信代理后面意味着
   共享一个桶（fail-closed），需要按真实客户端限流就在代理层做；
 - **TCP 传输不做认证**：定位是内网高性能通道（网关终止 TLS/做认证）；对外请走 HTTP/gRPC；
-- **TCP 帧长在缓冲前强制**：`maxFrameBytes` 对已缓冲字节数生效，恶意大帧在消耗内存前就被断开；
+- **TCP 帧长逐帧限制**：解析累计长度超过 `maxFrameBytes` 后拒绝并断连；netpoll 仍可能先缓冲已到达的字节，因此它不是 socket 级内存配额；
   not-ready / 限流路径回一帧后立即断连，避免 level-triggered 事件循环自旋；
-- **优雅退出 join 到底**：每个传输的 `Serve` 等自己的 drain 结束才返回，`Run` 返回即可安全退出进程；
+- **优雅退出 join 到底**：每个传输的 `Serve` 等自己的 drain 结束才返回；业务 handler 若长期阻塞且忽略 `ctx`，仍会阻止 `Run` 返回；
 - **进程级全局只碰一次**：Hertz 的 `hlog` 与 OpenTelemetry 的全局 TracerProvider 都是进程级的，
   库在首次构造时安装并动态跟随 `slog.SetDefault`；因此一个进程只应跑一个 `gosvc.App`（测试除外）；
 - **热更新只覆盖库拥有的字段**：应用自己的段通过 `WithOnReload` 处理；storage 重建失败时有效配置回滚，

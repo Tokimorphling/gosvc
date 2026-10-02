@@ -9,14 +9,11 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-
-	"github.com/Tokimorphling/gosvc/config"
 )
 
 const defaultDebounce = 300 * time.Millisecond
 
-// Watcher observes a configuration file and calls OnReload with a freshly
-// validated config whenever the file changes.
+// Watcher observes a configuration file and calls reload whenever it changes.
 //
 // The parent directory is watched rather than the file itself, because editors
 // and Kubernetes ConfigMap updates replace files via rename.
@@ -24,13 +21,12 @@ type Watcher struct {
 	path     string
 	logger   *slog.Logger
 	debounce time.Duration
-	load     func() (*config.Config, error)
-	onReload func(*config.Config)
+	reload   func() error
 }
 
-// New builds a watcher for path. load re-reads and validates the configuration;
-// onReload runs on the watcher goroutine and must not block for long.
-func New(path string, logger *slog.Logger, load func() (*config.Config, error), onReload func(*config.Config)) *Watcher {
+// New builds a watcher for path. reload re-reads, validates and applies the
+// configuration atomically with respect to other reload triggers.
+func New(path string, logger *slog.Logger, reload func() error) *Watcher {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -38,14 +34,13 @@ func New(path string, logger *slog.Logger, load func() (*config.Config, error), 
 		path:     path,
 		logger:   logger,
 		debounce: defaultDebounce,
-		load:     load,
-		onReload: onReload,
+		reload:   reload,
 	}
 }
 
 // Run watches until ctx is done and returns nil on shutdown.
 func (w *Watcher) Run(ctx context.Context) error {
-	if w.path == "" || w.load == nil || w.onReload == nil {
+	if w.path == "" || w.reload == nil {
 		return nil
 	}
 
@@ -97,21 +92,21 @@ func (w *Watcher) Run(ctx context.Context) error {
 			w.logger.Warn("configuration watcher error", "error", err)
 
 		case <-timer.C:
-			cfg, err := w.load()
-			if err != nil {
-				w.logger.Error("configuration reload failed, keeping the current configuration", "error", err)
-				continue
+			if err := w.reload(); err != nil {
+				w.logger.Error("configuration reload failed or only partially applied", "error", err)
 			}
-			w.onReload(cfg)
 		}
 	}
 }
 
 func sameFile(eventName, absPath string) bool {
-	if filepath.Clean(eventName) == filepath.Clean(absPath) {
+	eventName, absPath = filepath.Clean(eventName), filepath.Clean(absPath)
+	if eventName == absPath {
 		return true
 	}
-	return filepath.Base(eventName) == filepath.Base(absPath)
+	// Kubernetes projected ConfigMaps publish a new version by swapping the
+	// parent directory's ..data symlink; the key path itself gets no event.
+	return eventName == filepath.Join(filepath.Dir(absPath), "..data")
 }
 
 func resetTimer(timer *time.Timer, d time.Duration) {

@@ -20,6 +20,11 @@ import (
 // request body could occupy a worker for an unbounded number of invocations.
 const defaultMaxBatch = 128
 
+// UnknownMethodLabel is passed to observers for invalid requests and methods
+// that are not registered. Client supplied method names must not create an
+// unbounded number of metric label values.
+const UnknownMethodLabel = "_unknown"
+
 // ErrDuplicateMethod is returned by TryRegister when the method name is
 // already bound.
 var ErrDuplicateMethod = errors.New("jsonrpc: duplicate method")
@@ -29,7 +34,8 @@ var ErrDuplicateMethod = errors.New("jsonrpc: duplicate method")
 // not-found code themselves; a codec renders its own error shape.
 var ErrMethodNotFound = errors.New("jsonrpc: method not found")
 
-// Observer is called once per handled method for metrics and tracing.
+// Observer is called once per handled method for metrics and tracing. Its
+// method is UnknownMethodLabel for invalid or unregistered requests.
 type Observer func(method string, code int, d time.Duration)
 
 // Middleware wraps the invocation of one method. It may short-circuit (return
@@ -109,6 +115,20 @@ func (d *Dispatcher) SetObserver(observer Observer) {
 	d.mu.Lock()
 	d.observer = observer
 	d.mu.Unlock()
+}
+
+// SetObserverIfAbsent installs observer only when no observer is set, so a
+// runtime can wire its default metrics into an application-built dispatcher
+// without overriding a deliberately custom observer. It reports whether the
+// observer was installed.
+func (d *Dispatcher) SetObserverIfAbsent(observer Observer) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.observer != nil {
+		return false
+	}
+	d.observer = observer
+	return true
 }
 
 // SetMaxBatch caps the number of requests accepted in one batch payload.
@@ -200,49 +220,39 @@ func (d *Dispatcher) Methods() []string {
 // Handle processes a single request and returns its response.
 func (d *Dispatcher) Handle(ctx context.Context, req *Request) *Response {
 	start := time.Now()
-	resp, observer := d.handle(ctx, req)
+	resp, observer, metricMethod := d.handle(ctx, req)
 	if observer != nil {
-		method := ""
-		if req != nil {
-			method = req.Method
-		}
 		code := 0
 		if resp != nil && resp.Error != nil {
 			code = resp.Error.Code
 		}
-		observer(method, code, time.Since(start))
+		observer(metricMethod, code, time.Since(start))
 	}
 	return resp
 }
 
-func (d *Dispatcher) handle(ctx context.Context, req *Request) (*Response, Observer) {
+func (d *Dispatcher) handle(ctx context.Context, req *Request) (*Response, Observer, string) {
 	// Read the observer under one lock so SetObserver can be called at any
 	// time without racing Handle; the handler chain is memoised separately.
 	d.mu.RLock()
 	observer := d.observer
 	d.mu.RUnlock()
 
-	if req == nil {
-		return errorResponse(nil, CodeInvalidRequest, "invalid request"), observer
-	}
-	if req.JSONRPC != "2.0" {
-		return errorResponse(req.ID, CodeInvalidRequest, `jsonrpc must be "2.0"`), observer
-	}
-	if req.Method == "" {
-		return errorResponse(req.ID, CodeInvalidRequest, "method must not be empty"), observer
+	if !validRequest(req) {
+		return errorResponse(nil, CodeInvalidRequest, "invalid request"), observer, UnknownMethodLabel
 	}
 
 	handler := d.chain(req.Method)
 	if handler == nil {
-		return errorResponse(req.ID, CodeMethodNotFound, "method not found: "+req.Method), observer
+		return errorResponse(req.ID, CodeMethodNotFound, "method not found: "+req.Method), observer, UnknownMethodLabel
 	}
 
 	result, err := handler(ctx, req.Params)
 	if err != nil {
 		code, message := codeOf(err)
-		return errorResponse(req.ID, code, message), observer
+		return errorResponse(req.ID, code, message), observer, req.Method
 	}
-	return &Response{JSONRPC: "2.0", ID: normalizeID(req.ID), Result: result}, observer
+	return &Response{JSONRPC: "2.0", ID: normalizeID(req.ID), Result: result}, observer, req.Method
 }
 
 // Invoke dispatches a method without the JSON-RPC 2.0 envelope: no
@@ -262,7 +272,7 @@ func (d *Dispatcher) Invoke(ctx context.Context, method string, params json.RawM
 		observer := d.observer
 		d.mu.RUnlock()
 		if observer != nil {
-			observer(method, CodeMethodNotFound, time.Since(start))
+			observer(UnknownMethodLabel, CodeMethodNotFound, time.Since(start))
 		}
 		return nil, fmt.Errorf("%w: %s", ErrMethodNotFound, method)
 	}
@@ -290,24 +300,27 @@ func (d *Dispatcher) Serve(ctx context.Context, body []byte) (resp []byte, ok bo
 	if len(body) == 0 {
 		return d.marshal(errorResponse(nil, CodeParseError, "empty request body")), true
 	}
+	if !json.Valid(body) {
+		return d.marshal(errorResponse(nil, CodeParseError, "parse error")), true
+	}
 
 	if body[0] == '[' {
 		return d.serveBatch(ctx, body)
 	}
 
-	var req Request
-	if err := sonic.Unmarshal(body, &req); err != nil {
-		return d.marshal(errorResponse(nil, CodeParseError, "parse error")), true
+	req, valid := parseRequest(body)
+	if !valid {
+		return d.marshal(d.Handle(ctx, nil)), true
 	}
+	response := d.Handle(ctx, req)
 	if req.IsNotification() {
-		d.Handle(ctx, &req)
 		return nil, false
 	}
-	return d.marshal(d.Handle(ctx, &req)), true
+	return d.marshal(response), true
 }
 
 func (d *Dispatcher) serveBatch(ctx context.Context, body []byte) ([]byte, bool) {
-	var reqs []*Request
+	var reqs []json.RawMessage
 	if err := sonic.Unmarshal(body, &reqs); err != nil {
 		return d.marshal(errorResponse(nil, CodeParseError, "parse error")), true
 	}
@@ -324,21 +337,74 @@ func (d *Dispatcher) serveBatch(ctx context.Context, body []byte) ([]byte, bool)
 	}
 
 	responses := make([]*Response, 0, len(reqs))
-	for _, req := range reqs {
-		if req == nil {
-			responses = append(responses, errorResponse(nil, CodeInvalidRequest, "invalid request"))
+	for _, raw := range reqs {
+		req, valid := parseRequest(raw)
+		if !valid {
+			responses = append(responses, d.Handle(ctx, nil))
 			continue
 		}
+		response := d.Handle(ctx, req)
 		if req.IsNotification() {
-			d.Handle(ctx, req)
 			continue
 		}
-		responses = append(responses, d.Handle(ctx, req))
+		responses = append(responses, response)
 	}
 	if len(responses) == 0 {
 		return nil, false
 	}
 	return d.marshal(responses), true
+}
+
+// parseRequest validates the envelope before deciding whether its absent id
+// makes it a notification. A syntactically valid non-object is an Invalid
+// Request, including when it is an element of a batch.
+func parseRequest(raw []byte) (*Request, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' {
+		return nil, false
+	}
+	var fields map[string]json.RawMessage
+	if err := sonic.Unmarshal(raw, &fields); err != nil {
+		return nil, false
+	}
+	var req Request
+	if err := sonic.Unmarshal(fields["jsonrpc"], &req.JSONRPC); err != nil {
+		return nil, false
+	}
+	if err := sonic.Unmarshal(fields["method"], &req.Method); err != nil {
+		return nil, false
+	}
+	req.ID = fields["id"]
+	req.Params = fields["params"]
+	return &req, validRequest(&req)
+}
+
+func validRequest(req *Request) bool {
+	if req == nil || req.JSONRPC != "2.0" || req.Method == "" {
+		return false
+	}
+	if id := bytes.TrimSpace(req.ID); len(req.ID) != 0 {
+		if !json.Valid(id) {
+			return false
+		}
+		switch id[0] {
+		case '"':
+		case 'n':
+			if !bytes.Equal(id, []byte("null")) {
+				return false
+			}
+		default:
+			if id[0] != '-' && (id[0] < '0' || id[0] > '9') {
+				return false
+			}
+		}
+	}
+	if params := bytes.TrimSpace(req.Params); len(req.Params) != 0 {
+		if !json.Valid(params) || (params[0] != '{' && params[0] != '[') {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Dispatcher) marshal(v any) []byte {

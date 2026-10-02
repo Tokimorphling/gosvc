@@ -2,9 +2,13 @@ package push
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Tokimorphling/gosvc/observability"
 )
 
 // chanSink records every delivered event without blocking.
@@ -45,6 +49,34 @@ func (s *chanSink) received() []string {
 		}
 	}
 }
+
+// droppedEventSink discards one event. A later event must still reach the
+// same subscription.
+type droppedEventSink struct{ *chanSink }
+
+func (s *droppedEventSink) Send(event string, data any) error {
+	if event == "discard" {
+		return fmt.Errorf("destination queue full: %w", ErrDropped)
+	}
+	return s.chanSink.Send(event, data)
+}
+
+type countingSink struct {
+	delivered atomic.Int64
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func (s *countingSink) Send(string, any) error {
+	s.delivered.Add(1)
+	return nil
+}
+func (s *countingSink) Done() <-chan struct{} { return s.done }
+func (s *countingSink) Close() error {
+	s.closeOnce.Do(func() { close(s.done) })
+	return nil
+}
+func (s *countingSink) ID() string { return "counting" }
 
 // blockingSink parks in Send until released; used to force queue overflow.
 type blockingSink struct {
@@ -111,6 +143,42 @@ func TestBrokerDropPolicy(t *testing.T) {
 	// nothing that was dropped ever reappears.
 	block.release()
 	waitFor(t, func() bool { return block.deliver.Load() == int64(accepted) })
+}
+
+func TestBrokerSinkDropKeepsSubscription(t *testing.T) {
+	metrics := observability.New("push-test")
+	b := NewBroker[struct{}]("test", WithMetrics(metrics))
+	sink := &droppedEventSink{newChanSink("drop")}
+	sub := b.Subscribe(sink)
+
+	if got := b.Publish("discard", struct{}{}); got != 1 {
+		t.Fatalf("accepted = %d, want 1", got)
+	}
+	if got := b.Publish("keep", struct{}{}); got != 1 {
+		t.Fatalf("accepted = %d, want 1", got)
+	}
+	waitFor(t, func() bool {
+		return len(sink.send) == 1 &&
+			brokerMetricValue(t, metrics, "gosvc_broker_dropped_total", map[string]string{"broker": "test", "reason": "dropped"}) == 1 &&
+			brokerMetricValue(t, metrics, "gosvc_broker_delivered_total", map[string]string{"broker": "test"}) == 1
+	})
+	if got := sink.received(); len(got) != 1 || got[0] != "keep" {
+		t.Fatalf("received = %v, want only the kept event", got)
+	}
+	select {
+	case <-sub.Done():
+		t.Fatal("a dropped event must not end the subscription")
+	default:
+	}
+	if b.Len() != 1 {
+		t.Fatalf("subscribers = %d, want 1 after a sink drop", b.Len())
+	}
+	if got := brokerMetricValue(t, metrics, "gosvc_broker_dropped_total", map[string]string{"broker": "test", "reason": "sink_error"}); got != 0 {
+		t.Fatalf("sink_error drops = %g, want 0", got)
+	}
+
+	sub.Unsubscribe()
+	<-sub.Done()
 }
 
 func TestBrokerDisconnectPolicy(t *testing.T) {
@@ -198,6 +266,65 @@ func TestBrokerShutdownDrainsAndStops(t *testing.T) {
 	if got := b.Publish("tick", struct{}{}); got != 0 {
 		t.Fatalf("accepted = %d, want 0 after Shutdown", got)
 	}
+
+	lateSink := newChanSink("late")
+	late := b.Subscribe(lateSink)
+	select {
+	case <-late.Done():
+	default:
+		t.Fatal("a subscription created after Shutdown must already be done")
+	}
+	late.Unsubscribe()
+	late.Unsubscribe()
+	b.Shutdown()
+	if got := b.Publish("tick", struct{}{}); got != 0 {
+		t.Fatalf("accepted = %d, want 0 after a late Subscribe", got)
+	}
+	if got := b.Len(); got != 0 {
+		t.Fatalf("subscribers = %d, want 0 after Shutdown", got)
+	}
+	if got := len(lateSink.send); got != 0 {
+		t.Fatalf("late sink received %d events, want 0", got)
+	}
+}
+
+func TestSetMetricsDuringDelivery(t *testing.T) {
+	const events = 300
+	b := NewBroker[int]("metered", WithQueueSize(events))
+	sink := &countingSink{done: make(chan struct{})}
+	sub := b.Subscribe(sink)
+	first := observability.New("push-test")
+	second := observability.New("push-test")
+	b.SetMetrics(first)
+	if got := brokerMetricValue(t, first, "gosvc_broker_subscribers", map[string]string{"broker": "metered"}); got != 1 {
+		t.Fatalf("new subscriber gauge = %g, want 1", got)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < events; i++ {
+			if i%2 == 0 {
+				b.SetMetrics(second)
+			} else {
+				b.SetMetrics(first)
+			}
+		}
+	}()
+	for i := 0; i < events; i++ {
+		if got := b.Publish("tick", i); got != 1 {
+			t.Fatalf("accepted = %d, want 1", got)
+		}
+	}
+	wg.Wait()
+	waitFor(t, func() bool { return sink.delivered.Load() == events })
+	sub.Unsubscribe()
+	<-sub.Done()
+	b.SetMetrics(second)
+	if got := brokerMetricValue(t, second, "gosvc_broker_subscribers", map[string]string{"broker": "metered"}); got != 0 {
+		t.Fatalf("subscriber gauge after removal = %g, want 0", got)
+	}
 }
 
 func TestSinkFromContext(t *testing.T) {
@@ -242,4 +369,43 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("condition not met before timeout")
+}
+
+func brokerMetricValue(t *testing.T, metrics *observability.Metrics, family string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := metrics.Registry().Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, candidate := range families {
+		if candidate.GetName() != family {
+			continue
+		}
+		for _, metric := range candidate.Metric {
+			matched := true
+			for key, want := range labels {
+				found := false
+				for _, label := range metric.Label {
+					if label.GetName() == key && label.GetValue() == want {
+						found = true
+						break
+					}
+				}
+				if !found {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				if metric.Counter != nil {
+					return metric.Counter.GetValue()
+				}
+				if metric.Gauge != nil {
+					return metric.Gauge.GetValue()
+				}
+				t.Fatalf("metric %s has neither counter nor gauge", family)
+			}
+		}
+	}
+	return 0
 }

@@ -6,9 +6,9 @@
 //     block the event loop and the queue provides explicit backpressure;
 //   - netpoll requires serialized writes per connection, so every connection
 //     carries a write mutex in its context;
-//   - frames are length-limited BEFORE they are buffered: Until accumulates
-//     the whole line in memory, so a length check after the fact would let a
-//     hostile client grow the read buffer without bound;
+//   - frames are length-limited while assembling each line: partial frames
+//     are consumed from netpoll's read buffer and retained only up to the
+//     configured limit, without waiting for an unbounded Until call;
 //   - connections that arrive while the service is not ready, or exceed the
 //     rate limit, are answered once and closed: netpoll is level-triggered
 //     and re-fires OnRequest while input is pending, so leaving unread data
@@ -20,6 +20,7 @@
 package tcp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -103,7 +104,9 @@ type Server struct {
 	draining atomic.Bool
 
 	// sessions tracks live push sessions for the shutdown broadcast.
-	sessions sync.Map
+	sessions  sync.Map
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // connState is created per connection on the event loop and carried in the
@@ -118,6 +121,11 @@ type connState struct {
 	sessionMu sync.Mutex
 	session   *Session
 
+	// disconnectFired keeps OnDisconnect exactly-once: netpoll re-runs the
+	// whole close-callback chain when a second Close path (poller detach,
+	// the shutdown session close) follows the first one.
+	disconnectFired atomic.Bool
+
 	// connInfo is the lifecycle-callback view of the connection; it is only
 	// set when callbacks are installed, so OnDisconnect can distinguish
 	// prepared connections.
@@ -127,11 +135,10 @@ type connState struct {
 	// closes leave it nil.
 	closeReason atomic.Pointer[error]
 
-	// prevDone is the completion signal of the previous in-flight frame of
-	// this connection. It is only read and written on the event loop
-	// goroutine (netpoll serialises OnRequest per connection), so it needs
-	// no lock; worker goroutines only close the channels they own.
-	prevDone chan struct{}
+	// partial is the current unfinished frame. netpoll serialises OnRequest
+	// per connection, so only the connection reader goroutine touches it.
+	partial    []byte
+	frameTimer *time.Timer
 }
 
 type connStateKey struct{}
@@ -184,6 +191,7 @@ func New(opts Options) (*Server, error) {
 	}
 	eventLoop, err := netpoll.NewEventLoop(s.handleRequest, loopOptions...)
 	if err != nil {
+		_ = s.Close()
 		return nil, fmt.Errorf("netpoll event loop: %w", err)
 	}
 	s.eventLoop = eventLoop
@@ -196,35 +204,76 @@ func (s *Server) Dispatcher() *jsonrpc.Dispatcher { return s.dispatcher }
 // Addr returns the effective listen address.
 func (s *Server) Addr() string { return s.listener.Addr().String() }
 
+// Close releases a server that was constructed but never served. It is safe
+// to call more than once. A running server is stopped through Serve's context.
+func (s *Server) Close() error {
+	s.closeOnce.Do(func() {
+		s.closeErr = s.listener.Close()
+		if errors.Is(s.closeErr, net.ErrClosed) {
+			s.closeErr = nil
+		}
+		s.pool.Stop()
+	})
+	return s.closeErr
+}
+
 // Serve blocks until ctx is cancelled or the event loop fails. When ctx is
 // cancelled it broadcasts a going-away notification to live push sessions,
 // waits for the event loop to stop and for queued requests to drain before
 // returning, so callers (gosvc.App.Run) do not exit the process while
 // in-flight requests are still running.
 func (s *Server) Serve(ctx context.Context) error {
+	shutdownSignal, cancelShutdown := context.WithCancel(ctx)
+	defer cancelShutdown()
 	done := make(chan struct{})
+	serveDone := make(chan struct{})
 	go func() {
 		defer close(done)
-		<-ctx.Done()
+		<-shutdownSignal.Done()
 		s.draining.Store(true)
 		s.notifyShutdown()
-		time.Sleep(shutdownGrace) // let pumps flush the going-away frames
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.D())
-		defer cancel()
-		if err := s.eventLoop.Shutdown(shutdownCtx); err != nil {
-			s.logger.Warn("tcp shutdown returned error", "error", err)
+		if ctx.Err() != nil {
+			// Give live sessions a chance to flush going-away frames. When
+			// Serve already failed, there is no reason to wait out the grace.
+			select {
+			case <-time.After(shutdownGrace):
+			case <-serveDone:
+			}
 		}
-		s.pool.Stop()
-		s.closeSessions()
+		// Closing the original listener makes a cancellation that beats
+		// ConvertListener fail promptly. Conversion duplicates the fd, so
+		// Shutdown is still needed for a loop that has already started.
+		_ = s.listener.Close()
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.D())
+			err := s.eventLoop.Shutdown(shutdownCtx)
+			cancel()
+			if err != nil {
+				s.logger.Warn("tcp shutdown returned error", "error", err)
+			}
+			select {
+			case <-serveDone:
+				// Shutdown before Serve installs its internal server is a no-op
+				// in netpoll v0.7.5. Retry until Serve actually exits.
+				s.pool.Stop()
+				s.closeSessions()
+				return
+			case <-ticker.C:
+			}
+		}
 	}()
 
 	err := s.eventLoop.Serve(s.listener)
+	close(serveDone)
+	// A failed (or otherwise early) loop exit must join the shutdown goroutine
+	// before App can release resources owned by in-flight handlers.
+	cancelShutdown()
+	<-done
 	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("tcp serve: %w", err)
 	}
-	// eventLoop.Serve returns when the loop stops; the shutdown goroutine is
-	// still draining the worker pool and pushing sessions, so join it.
-	<-done
 	return nil
 }
 
@@ -255,7 +304,8 @@ func (s *Server) addSession(session *Session) { s.sessions.Store(session, struct
 // removeSession drops a session from the registry.
 func (s *Server) removeSession(session *Session) { s.sessions.Delete(session) }
 
-// handleRequest runs on the netpoll event loop: it must only read and dispatch.
+// handleRequest runs on netpoll's per-connection reader goroutine: it must
+// only read and dispatch, not run business handlers.
 func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connection) error {
 	if s.ready != nil && !s.ready.IsReady() {
 		// Answer once, then close: leaving the input unread would spin the
@@ -271,33 +321,31 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 		return nil
 	}
 
-	// Bound the line before it is buffered. Until accumulates the entire line
-	// in memory, so MaxFrameBytes must be enforced on the amount currently
-	// buffered, not only on the completed line. The line includes the
-	// trailing newline, so a frame of exactly MaxFrameBytes still passes.
-	if connection.Reader().Len() > s.cfg.MaxFrameBytes {
-		s.reject(ctx, connection, tooLargeError(), tooLargeFrame)
+	state, _ := ctx.Value(connStateKey{}).(*connState)
+	if state == nil {
 		_ = connection.Close()
 		return nil
 	}
 
-	line, err := connection.Reader().Until('\n')
+	// Inspect only the current frame. A read buffer may contain many complete
+	// short frames, whose aggregate length can exceed MaxFrameBytes.
+	body, tooLarge, err := s.readFrame(connection, state)
+	if tooLarge {
+		s.reject(ctx, connection, tooLargeError(), tooLargeFrame)
+		_ = connection.Close()
+		return nil
+	}
 	if err != nil {
-		// No newline yet (or the connection died): the partial frame stays
-		// buffered and OnRequest fires again when more data arrives.
+		// The connection died while reading; netpoll will close it.
 		return nil
 	}
-
-	if len(line) > s.cfg.MaxFrameBytes {
-		s.reject(ctx, connection, tooLargeError(), tooLargeFrame)
-		_ = connection.Close()
+	if body == nil {
+		// The currently buffered bytes were consumed into the bounded partial
+		// frame. A future read will resume when more bytes arrive.
+		state.armFrameTimeout(s.cfg.ReadTimeout.D())
 		return nil
 	}
-
-	// The slice is only valid until Release, so copy before handing it off.
-	body := make([]byte, len(line))
-	copy(body, line)
-	_ = connection.Reader().Release()
+	state.stopFrameTimeout()
 
 	if err := s.dispatch(connection, ctx, body); err != nil {
 		s.reject(ctx, connection, busyError(), busyFrame)
@@ -305,11 +353,68 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 	return nil
 }
 
-// dispatch hands one frame to the worker pool. Under a serial codec the
-// frame also waits for the previous frame of the same connection, which
-// turns the pool into a per-connection FIFO without extra goroutines: the
-// chain state lives on the event loop, and each worker closes the done
-// channel it was handed.
+func (state *connState) armFrameTimeout(timeout time.Duration) {
+	if timeout <= 0 {
+		return
+	}
+	if state.frameTimer == nil {
+		state.frameTimer = time.AfterFunc(timeout, func() { _ = state.conn.Close() })
+		return
+	}
+	state.frameTimer.Reset(timeout)
+}
+
+func (state *connState) stopFrameTimeout() {
+	if state.frameTimer != nil {
+		state.frameTimer.Stop()
+	}
+}
+
+// readFrame consumes only bytes from the current line. The returned body is
+// detached from netpoll's buffer and includes the newline. A nil body means
+// that the line is incomplete. At most MaxFrameBytes of a partial frame are
+// retained between calls; a following byte without a newline is rejected.
+func (s *Server) readFrame(connection netpoll.Connection, state *connState) (body []byte, tooLarge bool, err error) {
+	reader := connection.Reader()
+	available := reader.Len()
+	if available == 0 {
+		return nil, false, nil
+	}
+	remaining := s.cfg.MaxFrameBytes - len(state.partial)
+	if remaining <= 0 {
+		return nil, true, nil
+	}
+	inspect := min(available, remaining)
+	chunk, err := reader.Peek(inspect)
+	if err != nil {
+		return nil, false, err
+	}
+	if newline := bytes.IndexByte(chunk, '\n'); newline >= 0 {
+		frameBytes := newline + 1
+		body = make([]byte, len(state.partial)+frameBytes)
+		copy(body, state.partial)
+		copy(body[len(state.partial):], chunk[:frameBytes])
+		if err = reader.Skip(frameBytes); err != nil {
+			return nil, false, err
+		}
+		if err = reader.Release(); err != nil {
+			return nil, false, err
+		}
+		state.partial = nil
+		return body, false, nil
+	}
+	if available > remaining {
+		return nil, true, nil
+	}
+	state.partial = append(state.partial, chunk...)
+	if err = reader.Skip(available); err != nil {
+		return nil, false, err
+	}
+	return nil, false, reader.Release()
+}
+
+// dispatch hands one frame to the worker pool. A serial codec queues later
+// frames for the same connection without occupying workers while they wait.
 func (s *Server) dispatch(connection netpoll.Connection, ctx context.Context, body []byte) error {
 	task := func() { s.process(connection, ctx, body) }
 	if !s.serialPerConn {
@@ -321,22 +426,7 @@ func (s *Server) dispatch(connection netpoll.Connection, ctx context.Context, bo
 		return s.pool.Submit(task)
 	}
 
-	prev := state.prevDone
-	done := make(chan struct{})
-	state.prevDone = done
-	err := s.pool.Submit(func() {
-		if prev != nil {
-			<-prev
-		}
-		defer close(done)
-		s.process(connection, ctx, body)
-	})
-	if err != nil {
-		// The task never ran: roll the chain back so the next frame does not
-		// wait on a completion that will never happen.
-		state.prevDone = prev
-	}
-	return err
+	return s.pool.SubmitSerial(state, task)
 }
 
 // reject writes a protocol-level error frame: through the codec when one is

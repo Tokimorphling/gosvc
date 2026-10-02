@@ -65,12 +65,12 @@ type Callbacks interface {
 func (s *Server) onPrepare(connection netpoll.Connection) context.Context {
 	state := &connState{server: s, conn: connection, remote: connection.RemoteAddr().String()}
 	ctx := context.WithValue(context.Background(), connStateKey{}, state)
-
-	// The serial-dispatch chain starts "previous already completed" so the
-	// first frame never waits on a zero-value channel.
-	firstDone := make(chan struct{})
-	close(firstDone)
-	state.prevDone = firstDone
+	// netpoll runs close callbacks after OnRequest ends, so the frame timer
+	// cannot race its reader-owned state when the connection is torn down.
+	_ = connection.AddCloseCallback(func(netpoll.Connection) error {
+		state.stopFrameTimeout()
+		return nil
+	})
 
 	if s.callbacks != nil {
 		state.ensureSession()
@@ -95,8 +95,13 @@ func (s *Server) onPrepare(connection netpoll.Connection) context.Context {
 		// OnDisconnect fires exactly once when the connection ends, however
 		// it ends. It runs after netpoll's own request processing finished;
 		// handlers submitted to the worker pool may still be in flight.
+		// netpoll may re-run the close-callback chain when a second close
+		// path follows the first (poller detach after an explicit Close, or
+		// the shutdown's session close), so exactly-once is enforced here.
 		_ = connection.AddCloseCallback(func(netpoll.Connection) error {
-			s.safeOnDisconnect(ctx, state)
+			if state.disconnectFired.CompareAndSwap(false, true) {
+				s.safeOnDisconnect(ctx, state)
+			}
 			return nil
 		})
 	}

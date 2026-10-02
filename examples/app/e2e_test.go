@@ -948,15 +948,14 @@ pingTimeout = "300ms"
 	// A failing rebuild (unreachable postgres) keeps the current state: no
 	// broken pool is installed, the effective config keeps the previous
 	// storage section, and the service keeps serving. The manual reload
-	// endpoint is synchronous, so by the time it returns the rebuild has been
-	// attempted; the log level flipped by the same file proves the reload
-	// itself ran and was not aborted by the storage failure.
+	// endpoint is synchronous and reports a partial failure, while the log
+	// level flipped by the same file proves other sections were still applied.
 	writeConfig("warn", "", "postgres://user:pass@127.0.0.1:1/app")
 	resp, err := http.Post(adminBase+"/debug/reload", "application/json", nil)
 	if err != nil {
 		t.Fatalf("manual reload: %v", err)
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("manual reload status = %d, body = %s", resp.StatusCode, readBody(t, resp))
 	}
 	resp.Body.Close()

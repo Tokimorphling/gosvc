@@ -103,17 +103,22 @@ func (s *Server) Server() *ggrpc.Server { return s.server }
 // Addr returns the effective listen address.
 func (s *Server) Addr() string { return s.listener.Addr().String() }
 
+// Close releases a listener bound by New before Serve is started.
+func (s *Server) Close() error { return s.listener.Close() }
+
 // Serve blocks until ctx is cancelled or the server fails. When ctx is
 // cancelled it waits for the graceful drain to finish before returning, so
 // callers (gosvc.App.Run) do not exit the process while in-flight RPCs are
 // still being served.
 func (s *Server) Serve(ctx context.Context) error {
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	s.health.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		<-ctx.Done()
+		<-serveCtx.Done()
 		s.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
 
 		drainDone := make(chan struct{})
@@ -135,9 +140,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	// Serve returns as soon as GracefulStop closes the listener; the drain
 	// continues afterwards, so join it before reporting the server stopped.
 	err := s.server.Serve(s.listener)
+	cancel()
+	<-done
 	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("grpc serve: %w", err)
 	}
-	<-done
 	return nil
 }

@@ -7,6 +7,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+
+	"github.com/Tokimorphling/gosvc/jsonrpc"
 )
 
 const namespace = "gosvc"
@@ -86,7 +88,7 @@ func New(service string) *Metrics {
 		}, []string{"broker"}),
 		brokerDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "broker_dropped_total",
-			Help: "Total number of broker events dropped (queue full, sink error or closed).", ConstLabels: labels,
+			Help: "Total number of broker events dropped (queue full, sink drop, sink error or closed).", ConstLabels: labels,
 		}, []string{"broker", "reason"}),
 	}
 
@@ -111,6 +113,12 @@ func (m *Metrics) ObserveHTTP(method, route string, status int, d time.Duration)
 
 // ObserveJSONRPC records one JSON-RPC call.
 func (m *Metrics) ObserveJSONRPC(method string, code int, d time.Duration) {
+	// Invalid and unregistered requests can contain arbitrary client-supplied
+	// method names. Keep those values out of Prometheus labels even if this
+	// method is called without a Dispatcher observer.
+	if code == jsonrpc.CodeParseError || code == jsonrpc.CodeInvalidRequest || code == jsonrpc.CodeMethodNotFound {
+		method = jsonrpc.UnknownMethodLabel
+	}
 	m.rpcRequests.WithLabelValues(method, strconv.Itoa(code)).Inc()
 	m.rpcDuration.WithLabelValues(method).Observe(d.Seconds())
 }
@@ -162,7 +170,8 @@ func (m *Metrics) ObserveBrokerDelivered(broker string) {
 }
 
 // ObserveBrokerDropped records one dropped broker event. reason is
-// "queue_full", "sink_error" or "closed". A nil Metrics records nothing.
+// "queue_full", "dropped", "sink_error" or "closed". A nil Metrics records
+// nothing.
 func (m *Metrics) ObserveBrokerDropped(broker, reason string) {
 	if m == nil {
 		return

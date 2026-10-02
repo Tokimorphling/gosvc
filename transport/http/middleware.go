@@ -223,10 +223,6 @@ func Auth(authenticator *auth.Authenticator, publicPaths ...string) app.HandlerF
 	}
 
 	return func(ctx context.Context, c *app.RequestContext) {
-		if !authenticator.Enabled() {
-			c.Next(ctx)
-			return
-		}
 		if _, ok := public[string(c.Path())]; ok {
 			c.Next(ctx)
 			return
@@ -245,6 +241,10 @@ func Auth(authenticator *auth.Authenticator, publicPaths ...string) app.HandlerF
 		if err != nil {
 			c.Abort()
 			WriteError(ctx, c, err)
+			return
+		}
+		if identity.Method == auth.MethodAnonymous {
+			c.Next(ctx)
 			return
 		}
 
