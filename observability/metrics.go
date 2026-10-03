@@ -26,6 +26,9 @@ type Metrics struct {
 	notifySent    *prometheus.CounterVec
 	notifyDropped *prometheus.CounterVec
 
+	tcpConnections *prometheus.GaugeVec
+	tcpRejects     *prometheus.CounterVec
+
 	brokerSubscribers *prometheus.GaugeVec
 	brokerDelivered   *prometheus.CounterVec
 	brokerDropped     *prometheus.CounterVec
@@ -78,6 +81,14 @@ func New(service string) *Metrics {
 			Namespace: namespace, Name: "notify_dropped_total",
 			Help: "Total number of outbound notifications dropped (queue full or session closed).", ConstLabels: labels,
 		}, []string{"transport", "codec", "reason"}),
+		tcpConnections: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "tcp_connections",
+			Help: "Current number of live TCP connections.", ConstLabels: labels,
+		}, nil),
+		tcpRejects: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "tcp_rejects_total",
+			Help: "Total number of TCP connections rejected before dispatch (not ready, rate limited, frame too large) plus handler-panic internal errors.", ConstLabels: labels,
+		}, []string{"reason"}),
 		brokerSubscribers: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace, Name: "broker_subscribers",
 			Help: "Current number of live broker subscribers.", ConstLabels: labels,
@@ -97,6 +108,7 @@ func New(service string) *Metrics {
 		m.rpcRequests, m.rpcDuration,
 		m.grpcRequests, m.grpcDuration,
 		m.notifySent, m.notifyDropped,
+		m.tcpConnections, m.tcpRejects,
 		m.brokerSubscribers, m.brokerDelivered, m.brokerDropped,
 	)
 	return m
@@ -149,6 +161,25 @@ func (m *Metrics) ObserveNotifyDropped(transport, codec, reason string) {
 		return
 	}
 	m.notifyDropped.WithLabelValues(transport, codec, reason).Inc()
+}
+
+// SetTCPConnections sets the gauge of currently live TCP connections. A nil
+// Metrics records nothing.
+func (m *Metrics) SetTCPConnections(n int) {
+	if m == nil {
+		return
+	}
+	m.tcpConnections.WithLabelValues().Set(float64(n))
+}
+
+// ObserveTCPReject records one TCP connection rejected before dispatch or one
+// internal error answered to a panicking handler: reason is "not_ready",
+// "busy", "too_large" or "internal". A nil Metrics records nothing.
+func (m *Metrics) ObserveTCPReject(reason string) {
+	if m == nil {
+		return
+	}
+	m.tcpRejects.WithLabelValues(reason).Inc()
 }
 
 // SetBrokerSubscribers sets the live subscriber gauge of one broker. A nil

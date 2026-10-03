@@ -71,6 +71,7 @@ func (s *Server) onPrepare(connection netpoll.Connection) context.Context {
 		state.stopFrameTimeout()
 		return nil
 	})
+	s.trackConnection(state)
 
 	if s.callbacks != nil {
 		state.ensureSession()

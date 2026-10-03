@@ -107,6 +107,10 @@ type Server struct {
 	sessions  sync.Map
 	closeOnce sync.Once
 	closeErr  error
+
+	// connCount is the number of live connections, mirrored onto the
+	// gosvc_tcp_connections gauge.
+	connCount atomic.Int64
 }
 
 // connState is created per connection on the event loop and carried in the
@@ -125,6 +129,10 @@ type connState struct {
 	// whole close-callback chain when a second Close path (poller detach,
 	// the shutdown session close) follows the first one.
 	disconnectFired atomic.Bool
+
+	// counted keeps the live-connection gauge exactly-once for the same
+	// reason as disconnectFired.
+	counted atomic.Bool
 
 	// connInfo is the lifecycle-callback view of the connection; it is only
 	// set when callbacks are installed, so OnDisconnect can distinguish
@@ -311,11 +319,13 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 		// Answer once, then close: leaving the input unread would spin the
 		// event loop (netpoll is level-triggered) and flood the client with
 		// busy frames. The client reconnects when the service is ready.
+		s.metrics.ObserveTCPReject("not_ready")
 		s.reject(ctx, connection, notReadyError(), notReadyFrame)
 		_ = connection.Close()
 		return nil
 	}
 	if s.limiter != nil && !s.limiter.Allow(clientKey(connection)) {
+		s.metrics.ObserveTCPReject("busy")
 		s.reject(ctx, connection, busyError(), busyFrame)
 		_ = connection.Close()
 		return nil
@@ -331,6 +341,7 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 	// short frames, whose aggregate length can exceed MaxFrameBytes.
 	body, tooLarge, err := s.readFrame(connection, state)
 	if tooLarge {
+		s.metrics.ObserveTCPReject("too_large")
 		s.reject(ctx, connection, tooLargeError(), tooLargeFrame)
 		_ = connection.Close()
 		return nil
@@ -348,9 +359,26 @@ func (s *Server) handleRequest(ctx context.Context, connection netpoll.Connectio
 	state.stopFrameTimeout()
 
 	if err := s.dispatch(connection, ctx, body); err != nil {
+		s.metrics.ObserveTCPReject("busy")
 		s.reject(ctx, connection, busyError(), busyFrame)
 	}
 	return nil
+}
+
+// trackConnection registers a live connection on the gauge. It runs once per
+// connection in onPrepare; the close callback is guarded by an atomic CAS
+// because netpoll may re-run the close-callback chain on a second Close path.
+func (s *Server) trackConnection(state *connState) {
+	state.counted.Store(true)
+	s.connCount.Add(1)
+	s.metrics.SetTCPConnections(int(s.connCount.Load()))
+	_ = state.conn.AddCloseCallback(func(netpoll.Connection) error {
+		if state.counted.CompareAndSwap(true, false) {
+			n := s.connCount.Add(-1)
+			s.metrics.SetTCPConnections(int(n))
+		}
+		return nil
+	})
 }
 
 func (state *connState) armFrameTimeout(timeout time.Duration) {
@@ -497,6 +525,7 @@ func (s *Server) process(connection netpoll.Connection, parent context.Context, 
 				"panic", r,
 				"remote", connection.RemoteAddr().String(),
 			)
+			s.metrics.ObserveTCPReject("internal")
 			if span != nil {
 				span.SetStatus(codes.Error, "panic")
 			}
