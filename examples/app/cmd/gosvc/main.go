@@ -6,13 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/Tokimorphling/gosvc/examples/app"
+	"github.com/Tokimorphling/gosvc/health"
 	"github.com/Tokimorphling/gosvc/logging"
 )
 
@@ -66,15 +66,10 @@ func run(configPath string) error {
 }
 
 func runHealthcheck(url string) int {
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := health.Probe(ctx, url); err != nil {
 		fmt.Fprintln(os.Stderr, "healthcheck failed:", err)
-		return 1
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintln(os.Stderr, "healthcheck status:", resp.StatusCode)
 		return 1
 	}
 	return 0

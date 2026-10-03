@@ -313,6 +313,18 @@ func New(cfg *config.Config, opts ...Option) (app *App, err error) {
 	dispatcher.Register("system.methods", func(_ context.Context, _ json.RawMessage) (any, error) {
 		return dispatcher.Methods(), nil
 	})
+	// The JSON-RPC twin of GET /readyz: pure JSON-RPC clients (for example
+	// devices on the TCP transport) can probe readiness without speaking HTTP.
+	// Reachable through HTTP /rpc, it sits behind the HTTP auth middleware like
+	// every other method.
+	dispatcher.Register("system.health", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		ready, checks := a.ready.Check(ctx)
+		result := map[string]any{"ready": ready}
+		if len(checks) > 0 {
+			result["checks"] = checks
+		}
+		return result, nil
+	})
 	a.dispatcher = dispatcher
 
 	httpServer, err := httptransport.New(httptransport.Options{

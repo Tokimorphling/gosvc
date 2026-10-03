@@ -524,3 +524,55 @@ func TestOnShutdownHooksDrainWhileTransportsServe(t *testing.T) {
 	// closeResources already ran inside Run; the deferred Close stays a no-op.
 	_ = app.Close()
 }
+
+func TestSystemHealthReportsReadiness(t *testing.T) {
+	app, err := New(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	call := func() map[string]any {
+		t.Helper()
+		resp := app.JSONRPCDispatcher().Handle(t.Context(), &jsonrpc.Request{
+			JSONRPC: "2.0",
+			ID:      json.RawMessage("1"),
+			Method:  "system.health",
+		})
+		if resp == nil || resp.Error != nil {
+			t.Fatalf("system.health response: %+v", resp)
+		}
+		result, ok := resp.Result.(map[string]any)
+		if !ok {
+			t.Fatalf("system.health result type = %T", resp.Result)
+		}
+		return result
+	}
+
+	// Before Run the readiness flag is unset and checks report detail.
+	if ready := call()["ready"]; ready != false {
+		t.Fatalf("pre-run ready = %v", ready)
+	}
+
+	// A failing dependency check keeps the service not ready and surfaces
+	// its detail, mirroring GET /readyz. The auto-registered postgres probe
+	// reports "skipped" because it is disabled in the test config.
+	app.Health().AddCheck("flaky", func(context.Context) error {
+		return errors.New("boom")
+	})
+	result := call()
+	if result["ready"] != false {
+		t.Fatalf("with failing check ready = %v", result["ready"])
+	}
+	checks, ok := result["checks"].(map[string]string)
+	if !ok || checks["flaky"] != "boom" {
+		t.Fatalf("checks = %#v", result["checks"])
+	}
+
+	// A ready flag plus a passing check flips the answer.
+	app.Health().Set(true)
+	app.Health().AddCheck("flaky", func(context.Context) error { return nil })
+	if ready := call()["ready"]; ready != true {
+		t.Fatalf("ready with passing checks = %v", ready)
+	}
+}
