@@ -28,6 +28,12 @@ jobs:
       - name: Test (race)
         run: go test -race ./...
 
+      # examples/kitex is a standalone module so kitex stays out of the
+      # library's go.mod; its tests run separately.
+      - name: Test kitex example (race)
+        working-directory: examples/kitex
+        run: go test -race ./...
+
   lint:
     runs-on: ubuntu-latest
     steps:

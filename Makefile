@@ -20,13 +20,15 @@ build:
 run: build
 	./bin/gosvc -c configs/config.example.toml
 
-## test: run unit tests
+## test: run unit tests (library, example app and the kitex example module)
 test:
 	go test ./...
+	cd examples/kitex && go test ./...
 
 ## race: run unit tests with the race detector
 race:
 	go test -race ./...
+	cd examples/kitex && go test -race ./...
 
 ## vet: run go vet
 vet:
@@ -47,9 +49,11 @@ proto:
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
 		examples/app/api/greeter/v1/greeter.proto
 
-## kitex: regenerate the Kitex example code (requires the kitex CLI)
+## kitex: regenerate the Kitex example code (requires the kitex CLI; runs
+## inside examples/kitex, which is a standalone module so kitex stays out of
+## the library's go.mod)
 kitex:
-	kitex -module $(MODULE) -gen-path examples/kitex/api examples/kitex/idl/echo.thrift
+	cd examples/kitex && kitex -module $(MODULE)/examples/kitex -gen-path api idl/echo.thrift
 
 ## bench: smoke-run the load generator against a local instance
 bench: build

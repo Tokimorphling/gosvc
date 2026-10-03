@@ -25,4 +25,8 @@ done
 
 go mod edit -module "$new"
 echo "renamed module to $new"
+# examples/kitex is a separate module whose path embeds the library path;
+# the sed pass above already rewrote its go.mod, so only its sums need
+# refreshing.
+(cd examples/kitex && go mod tidy) || echo "remember to run: (cd examples/kitex && go mod tidy)"
 echo "remember to update examples/app/api/greeter/v1/greeter.proto and examples/kitex/idl/echo.thrift, then run: make proto kitex"
