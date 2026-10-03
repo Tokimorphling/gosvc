@@ -115,11 +115,11 @@ func main() {
 | 四协议同栈 | REST + JSON-RPC 2.0（HTTP 端口）、gRPC、行分隔 JSON-RPC over TCP（netpoll），JSON-RPC 方法注册一次两种传输都可用 |
 | 类型安全 | `Dispatcher.RegisterTyped[Req, Resp]` 与 `Client.Call[Req, Resp]` 让方法两端都带类型；`config.Source.Load[T]` 编译期校验配置类型 |
 | 统一错误模型 | `apierror.Kind` 一处定义，各协议自动映射（HTTP 状态码 / JSON-RPC code / gRPC code），内部错误不泄漏；客户端把传输层错误映射回 `apierror` |
-| 认证 | API Key（constant-time）+ HS256 JWT，HTTP 中间件与 gRPC 拦截器（unary + streaming）共用；health/reflection 默认放行；TCP 传输不鉴权（见设计取舍） |
+| 认证 | API Key（constant-time）+ HS256 JWT，HTTP 中间件与 gRPC 拦截器（unary + streaming）共用，`auth.JSONRPCMiddleware` 把同一鉴权带到 Dispatcher 层（TCP 无传输层鉴权的自然补齐）；health/reflection 默认放行；TCP 传输默认不鉴权（见设计取舍） |
 | 链路追踪 | OpenTelemetry OTLP/HTTP，W3C TraceContext 传播，Hertz 中间件 + `otelgrpc` StatsHandler |
 | 日志-链路关联 | 请求日志自动带 `trace_id` / `span_id`（HTTP、gRPC、TCP 一致），与导出的 span 对应 |
 | 日志 | 两层：`slogx`（geth 风格 handler，零依赖）+ `logging`（多 sink、轮转、采样、运行期级别；重载关闭旧文件 sink） |
-| 可观测性 | Prometheus 指标、pprof、healthz/readyz（含依赖探针）、日志统计、配置查看、时间序列查询，独立 admin 端口（可选 bearer token） |
+| 可观测性 | Prometheus 指标（HTTP / JSON-RPC / gRPC / TCP 拒绝与连接数 / Go runtime）、pprof、healthz/readyz（含依赖探针）、日志统计、配置查看、时间序列查询，独立 admin 端口（可选 bearer token） |
 | 存储连接器 | Redis（单机 / Cluster / Sentinel，分钟桶 + 内存聚合批量写）与 PostgreSQL（pgx 连接池、池指标、就绪探针） |
 | 访问日志独立 sink | `log.access.*`：请求日志走自己的级别/格式/输出/文件，自动带 `request_id`/`trace_id`/`log_type=access` |
 | 无锁状态 | `state.Snapshot[T]` 提供读无锁、写替换的共享状态 |
@@ -134,8 +134,10 @@ func main() {
 
 ```
 .
-├── app.go                  # package gosvc：运行时门面（New / Register* / Run / Reload）
-├── types.go                # 配置类型别名，方便单 import 使用
+├── app.go                  # package gosvc：运行时门面（New / Register* / Run）
+├── app_storage.go          # 存储连接与热重建（WithStore / WithPostgres lease）
+├── app_reload.go           # 热重载事务（reloadable 字段 / restartRequired）
+├── types.go                # 少量类型别名（Config / Source / Configurable）
 │
 │  # 公开包（应用可以 import）
 ├── config/                 # 配置 + 泛型加载器 Source.Load[T]（TOML）
@@ -165,7 +167,7 @@ func main() {
 
 examples/
 ├── app/                    # 示例应用（greeter）：config / bindings / cmd / e2e 测试
-└── kitex/                  # Kitex 服务间 RPC 示例（不进入库依赖）
+└── kitex/                  # Kitex 服务间 RPC 示例（独立 go module，不进入库依赖）
 ```
 
 ## API 速查
@@ -214,7 +216,7 @@ func (c *Config) SetDefaults() { c.Config.SetDefaults(); /* 应用默认值 */ }
 func (c *Config) Validate() error { /* 应用校验 */ }
 ```
 
-环境变量前缀可配（默认 `GOSVC`）：`MYAPP_HTTP_ADDR`、`MYAPP_AUTH_API_KEYS`、`MYAPP_REDIS_ADDR`、`MYAPP_OTLP_ENDPOINT` 等。
+环境变量前缀可配（默认 `GOSVC`）：`MYAPP_HTTP_ADDR`、`MYAPP_GRPC_ADDR`、`MYAPP_TCP_ADDR`、`MYAPP_AUTH_API_KEYS`、`MYAPP_REDIS_ADDR`、`MYAPP_OTLP_ENDPOINT` 等。
 
 ### JSON-RPC：注册与调用
 
@@ -233,7 +235,26 @@ order, err := client.Call[GetOrderRequest, *Order](ctx, "orders.get", GetOrderRe
 - 批量请求默认最多 **128** 个/次（`Dispatcher.SetMaxBatch(n)` 调整，超出整批拒绝 `-32600`）；
 - `NewTCPClient` 单连接支持 **pipeline**：并发 `Call` 在同一连接上多路复用，按 JSON-RPC id 匹配响应，慢请求不会阻塞后续请求；
 - HTTP 客户端把运行时错误映射（401/429 + `{"error":{"code":"..."}}`）还原成 `*apierror.Error`，调用方按 `apierror.KindOf` 分支即可；
-- 服务端 handler panic 不会丢连接：worker 存活，客户端收到 `internal error` 帧。
+- 服务端 handler panic 不会丢连接：worker 存活，客户端收到 `internal error` 帧；
+- batch 内的请求**顺序执行**（一个慢方法会拖慢同批的后续请求）：这是刻意为之，一个 batch 不能无限占用 worker；需要并发请拆成多个单请求；
+- 内置方法：`system.methods` 列出已注册方法；`system.health` 返回 `{"ready":bool,"checks":{...}}`，
+  聚合与 GET /readyz 相同的依赖探针，纯 JSON-RPC 客户端（如 TCP 上的设备）不用起 HTTP 即可探测就绪。
+
+### Dispatcher 层鉴权：auth.JSONRPCMiddleware
+
+`auth.JSONRPCMiddleware(authenticator, credentials)` 返回一个 `jsonrpc.Middleware`：传输层已鉴权的调用
+（HTTP /rpc 后面的 HTTP 鉴权中间件）直接透传；否则用 `credentials` 从本次调用的 params 里取凭据
+（`auth.CredentialsFromParams("token", "apiKey")`，为无 header 的 TCP 方言准备）交给同一个
+`Authenticator` 校验，并把 identity 注入 ctx（`auth.FromIdentity`）与请求日志（`subject`/`auth_method`）。
+auth 未启用时透传，与「认证需显式开启」一致。TCP 传输不做传输层鉴权，逐方法的 `UseFor` +
+这个 helper 正是补齐点：
+
+```go
+mw := auth.JSONRPCMiddleware(app.Auth(), auth.CredentialsFromParams("", "apiKey"))
+d.UseFor("mining.submit", mw)
+// 或直接给整个方法表：
+d.Use(mw)
+```
 
 ## 推送（push）
 
@@ -472,16 +493,31 @@ writeTimeout = "10s"
 idleTimeout = "60s"
 shutdownTimeout = "10s"
 maxBodyBytes = 1048576
+handlerTimeout = "0s"    # 可选：单请求业务预算（0 关闭）；handler 需响应 ctx 取消
 
 # CORS（浏览器客户端用）。allowOrigins = ["*"] 面向公共 API；也可列具体源。
+# allowCredentials 与 "*" 同用时回显请求源（浏览器拒绝 "*" + credentials）；
+# maxAge 缓存 preflight 响应（0 不发该 header，每个请求都会触发 preflight）。
 [http.cors]
 enabled = true
 allowOrigins = ["*"]
+allowCredentials = false
+maxAge = "10m"
+
+# 可选：HTTP listener 上的 TLS（certFile/keyFile 必须成对出现）。修改需重启。
+# [http.tls]
+# certFile = "certs/server.crt"
+# keyFile = "certs/server.key"
 
 [grpc]
 host = "0.0.0.0"
 port = 9090
 shutdownTimeout = "10s"
+
+# 可选：gRPC listener 上的 TLS。修改需重启。
+# [grpc.tls]
+# certFile = "certs/server.crt"
+# keyFile = "certs/server.key"
 
 [tcp]
 enabled = false
@@ -644,6 +680,15 @@ connMaxLifetime = "1h"
 app.Health().AddCheck("redis", func(ctx context.Context) error { return redisClient.Ping(ctx).Err() })
 ```
 
+JSON-RPC 客户端可以调内置方法 `system.health` 获取同样内容（`{"ready":..."checks":{...}}`）。
+容器健康检查从进程内自拨推荐用 `health.Probe(ctx, url)`（示例 app 的 `-healthcheck` 旗标即基于它）。
+
+### TCP 指标
+
+TCP 传输的拒绝路径在 Prometheus 上有独立序列：`gosvc_tcp_rejects_total{reason}`
+（`not_ready` / `busy` / `too_large` / `internal`），加上 `gosvc_tcp_connections` 连接数 gauge；
+成功派发的方法仍由共享的 `gosvc_jsonrpc_requests_total` 覆盖。
+
 ### 热更新时重建连接
 
 `storage.*` 变化时运行时会**新建连接 → 切换 → 优雅关闭旧连接**（recorder 先 flush 再关闭）：
@@ -659,8 +704,8 @@ app.Health().AddCheck("redis", func(ctx context.Context) error { return redisCli
 
 | 端点 | 说明 |
 |---|---|
-| `GET /healthz` / `GET /readyz` | 存活 / 就绪（含依赖探针明细；k8s 探针可用 `app -healthcheck <url>`） |
-| `GET /metrics` | Prometheus（HTTP / JSON-RPC / gRPC / Go runtime） |
+| `GET /healthz` / `GET /readyz` | 存活 / 就绪（含依赖探针明细；k8s 探针可用 `app -healthcheck <url>`，实现即 `health.Probe`） |
+| `GET /metrics` | Prometheus（HTTP / JSON-RPC / gRPC / TCP 拒绝与连接数 / Go runtime） |
 | `GET /debug/pprof/*` | CPU、heap、goroutine |
 | `GET/PUT /debug/loglevel` | 查看/修改日志级别 |
 | `GET /debug/logstats` | 采样计数 |
@@ -679,7 +724,7 @@ token 在 `/debug/config` 中脱敏。不设 token 时请保持 admin 只绑 loo
 make run          # 启动 examples/app（四协议 + 可观测性）
 make bench        # rest 压测
 go test ./...     # 单元 + 端到端（含热更新、采样、认证、admin token）
-go run ./examples/kitex/cmd -mode server   # Kitex 示例
+(cd examples/kitex && go run ./cmd -mode server)   # Kitex 示例（独立 module，在其目录内运行）
 ```
 
 `examples/app` 演示了推荐的分层：`config.go`（嵌入配置）、`bindings.go`（三协议绑定）、
@@ -693,33 +738,42 @@ docker compose -f deploy/docker-compose.yml up --build
 ```
 
 distroless + 非 root；admin 端口默认只绑 `127.0.0.1`（compose 同样只映射到宿主机 loopback）；
-TCP 传输不做 TLS，请在网关终止。
+TCP 传输不做 TLS（netpoll 需要裸连接），请在网关终止；HTTP / gRPC 监听器可用 `[http.tls]` / `[grpc.tls]`
+直接启用 TLS（修改需重启，证书热轮换见 Roadmap）。
 
 ## 设计取舍
 
 - **框架类型出现在 API 里**（`*server.Hertz`、`*grpc.Server`）：换取零额外抽象和完整的框架能力；
   想换框架时只需替换 transport 包；
 - **一个共享 Dispatcher**：HTTP `/rpc` 与 TCP 方法只注册一次，指标也只记一份；批量默认上限 128
-  防止单个请求无限占用 worker；
+  防止单个请求无限占用 worker；batch 内部顺序执行，一个慢方法会拖慢同批的后续请求；
 - **认证需显式开启**：默认 `auth.enabled = false`，而 HTTP/gRPC 默认监听所有地址；
   对外部署应启用认证或在可信网关完成鉴权。启用后 healthz/readyz 为白名单，
   `WithPublicPaths` 既接受字面路径也接受路由模式（`/api/v1/orders/:id`）；
+  Dispatcher 层可用 `auth.JSONRPCMiddleware` 为 TCP 等无 header 的路径补齐鉴权；
 - **gRPC 同时链 unary 与 stream 拦截器**：recovery / request id / trace / auth / logging / metrics /
   rate limit 对 streaming RPC 同样生效；
 - **限流 key 用直连对端 IP**（HTTP `RemoteAddr`、gRPC `peer`、TCP 去端口），而不是可被
   `X-Forwarded-For` 伪造的 `ClientIP`：直连暴露时无法通过换头绕过；部署在可信代理后面意味着
   共享一个桶（fail-closed），需要按真实客户端限流就在代理层做；
-- **TCP 传输不做认证**：定位是内网高性能通道（网关终止 TLS/做认证）；对外请走 HTTP/gRPC；
+- **TCP 传输不做认证**：定位是内网高性能通道（网关终止 TLS/做认证）；对外请走 HTTP/gRPC，
+  或在 Dispatcher 层用 `auth.JSONRPCMiddleware` 逐方法补齐；
+- **HTTP/gRPC 可选 TLS，TCP 不做**：`[http.tls]` / `[grpc.tls]` 用标准库包装 listener（启动时
+  加载证书，改配置需重启）；TCP 依赖 netpoll 的裸连接，TLS 需要整个握手状态机进事件循环，
+  仍然交给网关终止；
 - **TCP 帧长逐帧限制**：解析累计长度超过 `maxFrameBytes` 后拒绝并断连；netpoll 仍可能先缓冲已到达的字节，因此它不是 socket 级内存配额；
   not-ready / 限流路径回一帧后立即断连，避免 level-triggered 事件循环自旋；
 - **优雅退出 join 到底**：每个传输的 `Serve` 等自己的 drain 结束才返回；业务 handler 若长期阻塞且忽略 `ctx`，仍会阻止 `Run` 返回；
+  `http.handlerTimeout` / `tcp.handlerTimeout` 都只把预算写进 ctx，不强制中断阻塞的 handler；
 - **进程级全局只碰一次**：Hertz 的 `hlog` 与 OpenTelemetry 的全局 TracerProvider 都是进程级的，
   库在首次构造时安装并动态跟随 `slog.SetDefault`；因此一个进程只应跑一个 `gosvc.App`（测试除外）；
 - **热更新只覆盖库拥有的字段**：应用自己的段通过 `WithOnReload` 处理；storage 重建失败时有效配置回滚，
   两处 reload（fsnotify + 手动端点）串行执行；
 - **客户端提供的 `X-Request-ID` 原样使用**：用于日志关联（输出已转义防注入），但意味着调用方可以
   伪造关联 id；不需要时用 `logging.NewRequestID()` 自行生成；
-- **配置加载用泛型方法**：编译期保证 `*T` 可配置，避免运行时类型断言。
+- **配置加载用泛型方法**：编译期保证 `*T` 可配置，避免运行时类型断言；
+- **Kitex 示例是独立 module**（`examples/kitex/go.mod`）：Kitex 工具链与其依赖（thriftgo、
+  dynamicgo 等十几个包）完全不进入库的 `go.mod`；测试经 `make test` / CI 单独运行。
 
 ## Roadmap
 
@@ -736,5 +790,5 @@ TCP 传输不做 TLS，请在网关终止。
 
 ```bash
 scripts/rename-module.sh github.com/Tokimorphling/gosvc
-make proto kitex     # 重新生成示例的 protobuf / Kitex 代码
+make proto kitex     # 重新生成示例的 protobuf / Kitex 代码（kitex 在 examples/kitex 内执行）
 ```
