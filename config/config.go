@@ -42,22 +42,34 @@ type ServiceConfig struct {
 
 // CORSConfig configures the CORS middleware. When Enabled is false no CORS
 // headers are emitted; otherwise AllowOrigins controls which request origins
-// receive them, ["*"] mirroring a public API.
+// receive them, ["*"] mirroring a public API. AllowCredentials adds the
+// corresponding response header and, combined with the wildcard, reflects the
+// request origin instead of emitting "*" (browsers reject "*" together with
+// credentials). MaxAge caches preflight responses in the browser; it only
+// applies to preflight (OPTIONS) responses, and 0 omits the header.
 type CORSConfig struct {
-	Enabled      bool     `json:"enabled" toml:"enabled"`
-	AllowOrigins []string `json:"allowOrigins" toml:"allowOrigins"`
+	Enabled          bool     `json:"enabled" toml:"enabled"`
+	AllowOrigins     []string `json:"allowOrigins" toml:"allowOrigins"`
+	AllowCredentials bool     `json:"allowCredentials" toml:"allowCredentials"`
+	MaxAge           Duration `json:"maxAge" toml:"maxAge"`
 }
 
 // HTTPConfig configures the REST/JSON-RPC server.
 type HTTPConfig struct {
-	Host            string     `json:"host" toml:"host"`
-	Port            int        `json:"port" toml:"port"`
-	ReadTimeout     Duration   `json:"readTimeout" toml:"readTimeout"`
-	WriteTimeout    Duration   `json:"writeTimeout" toml:"writeTimeout"`
-	IdleTimeout     Duration   `json:"idleTimeout" toml:"idleTimeout"`
-	ShutdownTimeout Duration   `json:"shutdownTimeout" toml:"shutdownTimeout"`
-	MaxBodyBytes    int        `json:"maxBodyBytes" toml:"maxBodyBytes"`
-	CORS            CORSConfig `json:"cors" toml:"cors"`
+	Host            string   `json:"host" toml:"host"`
+	Port            int      `json:"port" toml:"port"`
+	ReadTimeout     Duration `json:"readTimeout" toml:"readTimeout"`
+	WriteTimeout    Duration `json:"writeTimeout" toml:"writeTimeout"`
+	IdleTimeout     Duration `json:"idleTimeout" toml:"idleTimeout"`
+	ShutdownTimeout Duration `json:"shutdownTimeout" toml:"shutdownTimeout"`
+	MaxBodyBytes    int      `json:"maxBodyBytes" toml:"maxBodyBytes"`
+	// HandlerTimeout bounds each request's business handling with a deadline
+	// on the request context, mirroring tcp.handlerTimeout. Zero disables it.
+	// Handlers must respect ctx cancellation; one that ignores ctx runs to
+	// completion and its response is served as usual.
+	HandlerTimeout Duration   `json:"handlerTimeout" toml:"handlerTimeout"`
+	CORS           CORSConfig `json:"cors" toml:"cors"`
+	TLS            TLSConfig  `json:"tls" toml:"tls"`
 }
 
 // Addr returns the host:port listen address.
@@ -65,9 +77,29 @@ func (c HTTPConfig) Addr() string { return net.JoinHostPort(c.Host, strconv.Itoa
 
 // GRPCConfig configures the gRPC server.
 type GRPCConfig struct {
-	Host            string   `json:"host" toml:"host"`
-	Port            int      `json:"port" toml:"port"`
-	ShutdownTimeout Duration `json:"shutdownTimeout" toml:"shutdownTimeout"`
+	Host            string    `json:"host" toml:"host"`
+	Port            int       `json:"port" toml:"port"`
+	ShutdownTimeout Duration  `json:"shutdownTimeout" toml:"shutdownTimeout"`
+	TLS             TLSConfig `json:"tls" toml:"tls"`
+}
+
+// TLSConfig enables optional TLS on a listener. CertFile and KeyFile must be
+// set together; both empty keeps the listener plaintext (terminate TLS at a
+// gateway or load balancer instead). Changes require a restart.
+type TLSConfig struct {
+	CertFile string `json:"certFile" toml:"certFile"`
+	KeyFile  string `json:"keyFile" toml:"keyFile"`
+}
+
+// Enabled reports whether TLS is configured.
+func (c TLSConfig) Enabled() bool { return c.CertFile != "" && c.KeyFile != "" }
+
+// Validate checks that the pair is complete.
+func (c TLSConfig) Validate() error {
+	if (c.CertFile == "") != (c.KeyFile == "") {
+		return fmt.Errorf("tls.certFile and tls.keyFile must be set together")
+	}
+	return nil
 }
 
 // Addr returns the host:port listen address.
@@ -254,7 +286,8 @@ func Default() *Config {
 			IdleTimeout:     Duration(60 * time.Second),
 			ShutdownTimeout: Duration(10 * time.Second),
 			MaxBodyBytes:    1 << 20, // 1 MiB
-			CORS:            CORSConfig{Enabled: true, AllowOrigins: []string{"*"}},
+			HandlerTimeout:  0,       // disabled
+			CORS:            CORSConfig{Enabled: true, AllowOrigins: []string{"*"}, MaxAge: Duration(10 * time.Minute)},
 		},
 		GRPC: GRPCConfig{
 			Host:            "0.0.0.0",
@@ -505,6 +538,7 @@ func (c *Config) ApplyEnv(prefix string) error {
 	}{
 		{"HTTP_ADDR", &c.HTTP.Host, &c.HTTP.Port},
 		{"GRPC_ADDR", &c.GRPC.Host, &c.GRPC.Port},
+		{"TCP_ADDR", &c.TCP.Host, &c.TCP.Port},
 		{"ADMIN_ADDR", &c.Admin.Host, &c.Admin.Port},
 	} {
 		v := os.Getenv(env(item.suffix))
@@ -553,11 +587,23 @@ func (c *Config) Validate() error {
 	if c.HTTP.ShutdownTimeout <= 0 || c.GRPC.ShutdownTimeout <= 0 {
 		return fmt.Errorf("shutdown timeouts must be positive")
 	}
+	if err := c.GRPC.TLS.Validate(); err != nil {
+		return fmt.Errorf("grpc: %w", err)
+	}
 	if c.HTTP.MaxBodyBytes <= 0 {
 		return fmt.Errorf("http.maxBodyBytes must be positive")
 	}
+	if c.HTTP.HandlerTimeout < 0 {
+		return fmt.Errorf("http.handlerTimeout must not be negative")
+	}
+	if c.HTTP.CORS.MaxAge < 0 {
+		return fmt.Errorf("http.cors.maxAge must not be negative")
+	}
 	if c.HTTP.CORS.Enabled && len(c.HTTP.CORS.AllowOrigins) == 0 {
 		c.HTTP.CORS.AllowOrigins = []string{"*"}
+	}
+	if err := c.HTTP.TLS.Validate(); err != nil {
+		return fmt.Errorf("http: %w", err)
 	}
 
 	if _, err := slogx.ParseLevel(c.Log.Level); err != nil {

@@ -148,6 +148,48 @@ func TestInvalidEnvAddr(t *testing.T) {
 	}
 }
 
+func TestEnvTCPAddr(t *testing.T) {
+	t.Setenv("GOSVC_TCP_ADDR", "10.0.0.1:7071")
+	cfg, err := (Source{}).Load[Config]()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TCP.Host != "10.0.0.1" || cfg.TCP.Port != 7071 {
+		t.Fatalf("tcp addr = %s, want 10.0.0.1:7071", cfg.TCP.Addr())
+	}
+}
+
+func TestTLSConfigValidation(t *testing.T) {
+	complete := TLSConfig{CertFile: "cert.pem", KeyFile: "key.pem"}
+	if err := complete.Validate(); err != nil {
+		t.Fatalf("complete pair must validate: %v", err)
+	}
+	if !complete.Enabled() {
+		t.Fatal("complete pair must report Enabled")
+	}
+
+	for name, cfg := range map[string]TLSConfig{
+		"missing key":  {CertFile: "cert.pem"},
+		"missing cert": {KeyFile: "key.pem"},
+	} {
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("%s must fail validation", name)
+		}
+	}
+
+	// The pair must be rejected wherever it appears.
+	broken := Default()
+	broken.HTTP.TLS = TLSConfig{CertFile: "cert.pem"}
+	if err := broken.Validate(); err == nil {
+		t.Fatal("http.tls with only a cert must fail validation")
+	}
+	broken = Default()
+	broken.GRPC.TLS = TLSConfig{KeyFile: "key.pem"}
+	if err := broken.Validate(); err == nil {
+		t.Fatal("grpc.tls with only a key must fail validation")
+	}
+}
+
 func TestValidateRejectsBadConfig(t *testing.T) {
 	cases := map[string]func(*Config){
 		"empty name":    func(c *Config) { c.Service.Name = "" },
@@ -165,6 +207,10 @@ func TestValidateRejectsBadConfig(t *testing.T) {
 			c.Log.Sampling.Enabled = true
 			c.Log.Sampling.Tick = 0
 		},
+		"negative handler timeout": func(c *Config) { c.HTTP.HandlerTimeout = Duration(-1) },
+		"negative cors max age":    func(c *Config) { c.HTTP.CORS.MaxAge = Duration(-1) },
+		"incomplete http tls":      func(c *Config) { c.HTTP.TLS = TLSConfig{CertFile: "cert.pem"} },
+		"incomplete grpc tls":      func(c *Config) { c.GRPC.TLS = TLSConfig{KeyFile: "key.pem"} },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {

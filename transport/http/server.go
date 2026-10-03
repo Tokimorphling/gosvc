@@ -15,6 +15,7 @@ import (
 	"github.com/Tokimorphling/gosvc/auth"
 	"github.com/Tokimorphling/gosvc/config"
 	"github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/internal/tlsutil"
 	"github.com/Tokimorphling/gosvc/jsonrpc"
 	"github.com/Tokimorphling/gosvc/observability"
 	"github.com/Tokimorphling/gosvc/ratelimit"
@@ -72,6 +73,11 @@ func New(opts Options) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen http: %w", err)
 	}
+	listener, err = tlsutil.Wrap(listener, opts.Config.HTTP.TLS)
+	if err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("http tls: %w", err)
+	}
 
 	engine := server.New(
 		server.WithListener(listener),
@@ -114,6 +120,7 @@ func New(opts Options) (*Server, error) {
 		CORS(opts.Config.HTTP.CORS),
 		RateLimit(opts.Limiter),
 		Auth(opts.Authenticator, append([]string{"/healthz", "/readyz"}, opts.PublicPaths...)...),
+		RequestTimeout(opts.Config.HTTP.HandlerTimeout.D()),
 	)
 
 	s.registerRoutes(engine)

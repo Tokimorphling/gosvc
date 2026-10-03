@@ -18,6 +18,7 @@ import (
 	"github.com/Tokimorphling/gosvc/auth"
 	"github.com/Tokimorphling/gosvc/config"
 	apphealth "github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/internal/tlsutil"
 	"github.com/Tokimorphling/gosvc/observability"
 	"github.com/Tokimorphling/gosvc/ratelimit"
 	"github.com/Tokimorphling/gosvc/store"
@@ -54,6 +55,11 @@ func New(opts Options) (*Server, error) {
 	listener, err := net.Listen("tcp", opts.Config.GRPC.Addr())
 	if err != nil {
 		return nil, fmt.Errorf("listen grpc: %w", err)
+	}
+	listener, err = tlsutil.Wrap(listener, opts.Config.GRPC.TLS)
+	if err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("grpc tls: %w", err)
 	}
 
 	serverOptions := []ggrpc.ServerOption{

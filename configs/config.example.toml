@@ -15,17 +15,35 @@ writeTimeout = "10s"
 idleTimeout = "60s"
 shutdownTimeout = "10s"
 maxBodyBytes = 1048576
+# Optional per-request business budget on the request context (0 disables).
+# Handlers must respect ctx cancellation; changes require a restart.
+# handlerTimeout = "5s"
 
 # CORS for browser clients. allowOrigins = ["*"] mirrors a public API; list
-# specific origins to restrict, or disable entirely.
+# specific origins to restrict, or disable entirely. allowCredentials reflects
+# the request origin instead of "*" (browsers reject "*" with credentials);
+# maxAge caches preflight responses in the browser.
 [http.cors]
 enabled = true
 allowOrigins = ["*"]
+allowCredentials = false
+maxAge = "10m"
+
+# Optional TLS on the HTTP listener; both files must be set. Changes require
+# a restart; certificate rotation remains on the roadmap.
+# [http.tls]
+# certFile = "certs/server.crt"
+# keyFile = "certs/server.key"
 
 [grpc]
 host = "0.0.0.0"
 port = 9090
 shutdownTimeout = "10s"
+
+# Optional TLS on the gRPC listener.
+# [grpc.tls]
+# certFile = "certs/server.crt"
+# keyFile = "certs/server.key"
 
 [tcp]
 enabled = false

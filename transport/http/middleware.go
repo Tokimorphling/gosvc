@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -148,21 +149,32 @@ func Recovery(logger *slog.Logger) app.HandlerFunc {
 // through [http.cors]: disabled entirely, or restricted to an origin list.
 // When the list is ["*"] any origin is allowed (mirroring a public API); other
 // entries match the request's Origin header exactly and only matched origins
-// receive CORS headers.
+// receive CORS headers. With AllowCredentials the wildcard is reflected back as
+// the request origin (browsers reject "*" plus credentials); preflight
+// responses carry Access-Control-Max-Age so browsers cache them for MaxAge
+// instead of sending one preflight per request.
 func CORS(cfg config.CORSConfig) app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
 		if !cfg.Enabled {
 			c.Next(ctx)
 			return
 		}
-		allowOrigin := matchOrigin(cfg.AllowOrigins, string(c.GetHeader("Origin")))
+		origin := string(c.GetHeader("Origin"))
+		allowOrigin := matchOrigin(cfg.AllowOrigins, origin, cfg.AllowCredentials)
+		preflight := string(c.Method()) == "OPTIONS"
 		if allowOrigin != "" {
 			c.Header("Access-Control-Allow-Origin", allowOrigin)
 			c.Header("Vary", "Origin")
 			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Request-ID")
+			if cfg.AllowCredentials {
+				c.Header("Access-Control-Allow-Credentials", "true")
+			}
+			if preflight && cfg.MaxAge > 0 {
+				c.Header("Access-Control-Max-Age", strconv.Itoa(int(cfg.MaxAge.D().Seconds())))
+			}
 		}
-		if string(c.Method()) == "OPTIONS" {
+		if preflight {
 			c.AbortWithStatus(204)
 			return
 		}
@@ -172,10 +184,15 @@ func CORS(cfg config.CORSConfig) app.HandlerFunc {
 
 // matchOrigin returns the Access-Control-Allow-Origin value for the request
 // origin: "*" when the wildcard is configured, the origin itself when it is
-// listed, and "" (no CORS headers) otherwise.
-func matchOrigin(allow []string, origin string) string {
+// listed, and "" (no CORS headers) otherwise. With credentials the wildcard
+// is reflected as the concrete origin, which is the only form browsers accept
+// together with Access-Control-Allow-Credentials.
+func matchOrigin(allow []string, origin string, credentials bool) string {
 	for _, candidate := range allow {
 		if candidate == "*" {
+			if credentials && origin != "" {
+				return origin
+			}
 			return "*"
 		}
 		if origin != "" && candidate == origin {
@@ -183,6 +200,23 @@ func matchOrigin(allow []string, origin string) string {
 		}
 	}
 	return ""
+}
+
+// RequestTimeout bounds each request with a deadline on the request context,
+// mirroring tcp.handlerTimeout. A handler that respects ctx sees it cancelled
+// once the budget is spent; one that blocks ignores it and still runs to
+// completion (the transport-level read/write timeouts bound the connection).
+// It is a no-op when d <= 0.
+func RequestTimeout(d time.Duration) app.HandlerFunc {
+	return func(ctx context.Context, c *app.RequestContext) {
+		if d <= 0 {
+			c.Next(ctx)
+			return
+		}
+		timeoutCtx, cancel := context.WithTimeout(ctx, d)
+		defer cancel()
+		c.Next(timeoutCtx)
+	}
 }
 
 // RateLimit rejects requests that exceed the per-client budget. The key is
