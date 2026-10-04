@@ -110,8 +110,8 @@ func TestClientHTTPPropagatesRPCError(t *testing.T) {
 	defer client.Close()
 
 	_, err := client.Call[struct{}, any](context.Background(), "fail", struct{}{})
-	var rpcErr *Error
-	if !errors.As(err, &rpcErr) {
+	rpcErr, ok := errors.AsType[*Error](err)
+	if !ok {
 		t.Fatalf("err = %v, want *jsonrpc.Error", err)
 	}
 	if rpcErr.Code != CodeNotFound {

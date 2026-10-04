@@ -37,9 +37,9 @@ func TestSnapshotConcurrentUpdates(t *testing.T) {
 
 	const goroutines, perGoroutine = 8, 200
 	var wg sync.WaitGroup
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		wg.Go(func() {
-			for j := 0; j < perGoroutine; j++ {
+			for range perGoroutine {
 				s.Update(func(current int) int { return current + 1 })
 			}
 		})

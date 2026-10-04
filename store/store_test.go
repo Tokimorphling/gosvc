@@ -17,7 +17,7 @@ func (f *fakeRecorder) Incr(context.Context, string, float64) error {
 func TestNilableConvertsTypedNil(t *testing.T) {
 	var typedNil *fakeRecorder
 
-	if got := Nilable[*fakeRecorder](typedNil); got != nil {
+	if got := Nilable(typedNil); got != nil {
 		t.Fatalf("Nilable(typed nil) = %#v, want nil interface", got)
 	}
 	if got := Nilable[Recorder](nil); got != nil {

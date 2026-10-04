@@ -17,14 +17,16 @@ const namespace = "gosvc"
 type Metrics struct {
 	registry *prometheus.Registry
 
-	httpRequests  *prometheus.CounterVec
-	httpDuration  *prometheus.HistogramVec
-	rpcRequests   *prometheus.CounterVec
-	rpcDuration   *prometheus.HistogramVec
-	grpcRequests  *prometheus.CounterVec
-	grpcDuration  *prometheus.HistogramVec
-	notifySent    *prometheus.CounterVec
-	notifyDropped *prometheus.CounterVec
+	httpRequests   *prometheus.CounterVec
+	httpDuration   *prometheus.HistogramVec
+	rpcRequests    *prometheus.CounterVec
+	rpcDuration    *prometheus.HistogramVec
+	grpcRequests   *prometheus.CounterVec
+	grpcDuration   *prometheus.HistogramVec
+	objectRequests *prometheus.CounterVec
+	objectDuration *prometheus.HistogramVec
+	notifySent     *prometheus.CounterVec
+	notifyDropped  *prometheus.CounterVec
 
 	tcpConnections *prometheus.GaugeVec
 	tcpRejects     *prometheus.CounterVec
@@ -46,6 +48,13 @@ func New(service string) *Metrics {
 
 	m := &Metrics{
 		registry: registry,
+		objectRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "object_requests_total", Help: "Logical object storage operations.", ConstLabels: labels,
+		}, []string{"operation", "outcome"}),
+		objectDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace, Name: "object_request_duration_seconds", Help: "Object storage latency including streamed body lifetime.", ConstLabels: labels,
+			Buckets: prometheus.DefBuckets,
+		}, []string{"operation"}),
 		httpRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "http_requests_total",
 			Help: "Total number of HTTP requests.", ConstLabels: labels,
@@ -104,6 +113,7 @@ func New(service string) *Metrics {
 	}
 
 	registry.MustRegister(
+		m.objectRequests, m.objectDuration,
 		m.httpRequests, m.httpDuration,
 		m.rpcRequests, m.rpcDuration,
 		m.grpcRequests, m.grpcDuration,

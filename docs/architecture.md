@@ -18,7 +18,9 @@
 | `config` | 配置结构、默认值、文件与环境覆盖、验证 | 不创建连接或服务器；格式及日志级别校验使用 `slogx` |
 | `logging` / `slogx` | 日志装配与 handler、采样、sink 切换 | `slogx` 只依赖标准库；`logging` 适配配置与 trace context |
 | `ratelimit` | 每 key 可变 token bucket、过期回收 | 不识别具体传输，传输负责选择 key |
-| `store` / `store/*` | recorder/query 小接口及具体连接器 | 传输依赖接口；具体 Redis/PostgreSQL 连接由组合入口管理 |
+| `store` / `store/*` | recorder/query 小接口及 Redis/PostgreSQL 连接器 | 传输依赖接口，组合入口管理具体连接 |
+| `store/object` / `store/s3` | SDK 无关对象存储接口 / AWS SDK v2 适配 | 业务依赖 Reader/Writer 等小接口；S3 管理传输、重试和分片 |
+| `app_objects.go` / `internal/stream` | 稳定存储门面、流式响应清理与 lease | EOF、Close 或取消后释放；重载等待旧流结束 |
 | `internal/workerpool` | 有界任务执行、按 key 串行调度 | 不引用 TCP 类型；TCP 使用 `Pool[*connState]` |
 | `state` / `apierror` | 泛型不可变快照、统一错误分类 | 基础组件，依赖标准库 |
 

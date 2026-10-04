@@ -77,10 +77,10 @@ func writeInternalError(ctx context.Context, c *app.RequestContext, message stri
 	}})
 }
 
-// logError logs with the request-scoped logger when available.
+// logError preserves the request context for context-aware logging handlers.
 func logError(ctx context.Context, logger *slog.Logger, msg string, args ...any) {
 	if logger == nil {
 		return
 	}
-	logger.Error(msg, args...)
+	logger.ErrorContext(ctx, msg, args...)
 }

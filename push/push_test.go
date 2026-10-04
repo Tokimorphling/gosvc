@@ -171,7 +171,7 @@ func TestBrokerDropPolicy(t *testing.T) {
 	b.Subscribe(block)
 
 	accepted := 0
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		accepted += b.Publish("tick", struct{}{})
 	}
 	if accepted == 10 {
@@ -225,7 +225,7 @@ func TestBrokerDisconnectPolicy(t *testing.T) {
 	b := NewBroker[struct{}]("test", WithQueueSize(1), WithPolicy(Disconnect))
 	sub := b.Subscribe(block)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		b.Publish("tick", struct{}{})
 	}
 	select {
@@ -340,18 +340,16 @@ func TestSetMetricsDuringDelivery(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < events; i++ {
+	wg.Go(func() {
+		for i := range events {
 			if i%2 == 0 {
 				b.SetMetrics(second)
 			} else {
 				b.SetMetrics(first)
 			}
 		}
-	}()
-	for i := 0; i < events; i++ {
+	})
+	for i := range events {
 		if got := b.Publish("tick", i); got != 1 {
 			t.Fatalf("accepted = %d, want 1", got)
 		}
@@ -367,19 +365,22 @@ func TestSetMetricsDuringDelivery(t *testing.T) {
 }
 
 func TestSinkFromContext(t *testing.T) {
-	//nolint:staticcheck // deliberately probing the nil-context path
-	if _, ok := SinkFromContext(nil); ok {
-		t.Fatal("nil context must not carry a sink")
-	}
-	if _, ok := SinkFromContext(context.Background()); ok {
-		t.Fatal("an unannotated context must not carry a sink")
-	}
-
 	sink := newChanSink("s")
-	ctx := WithSink(context.Background(), sink)
-	got, ok := SinkFromContext(ctx)
-	if !ok || got.ID() != "s" {
-		t.Fatalf("got %v, %v", got, ok)
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want Sink
+	}{
+		{name: "nil"},
+		{name: "unannotated", ctx: context.Background()},
+		{name: "annotated", ctx: WithSink(context.Background(), sink), want: sink},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := SinkFromContext(tc.ctx)
+			if got != tc.want || ok != (tc.want != nil) {
+				t.Fatalf("got %v, %v; want %v", got, ok, tc.want)
+			}
+		})
 	}
 }
 

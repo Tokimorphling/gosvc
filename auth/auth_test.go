@@ -40,11 +40,9 @@ func TestAuthenticateAcrossConcurrentReloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 500; j++ {
+	for range 4 {
+		wg.Go(func() {
+			for range 500 {
 				identity, err := a.Authenticate("", "")
 				if err == nil {
 					if identity == nil || identity.Method != MethodAnonymous {
@@ -56,9 +54,9 @@ func TestAuthenticateAcrossConcurrentReloads(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		if err := a.Reload(config.AuthConfig{Enabled: true, APIKeys: []string{"key"}}); err != nil {
 			t.Fatal(err)
 		}

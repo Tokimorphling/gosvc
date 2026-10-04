@@ -1,4 +1,4 @@
-// Storage lifecycle: the optional Redis and PostgreSQL connections, their
+// Storage lifecycle: the optional Redis, PostgreSQL and S3 clients, their
 // generations across hot reloads, and the lease pattern that keeps a
 // generation's connections open until every in-flight callback has returned.
 
@@ -14,15 +14,18 @@ import (
 	"github.com/Tokimorphling/gosvc/store"
 	"github.com/Tokimorphling/gosvc/store/postgres"
 	"github.com/Tokimorphling/gosvc/store/redis"
+	"github.com/Tokimorphling/gosvc/store/s3"
 )
 
 // storageState holds the optional storage connections plus the recorder
 // goroutine that belongs to them.
 type storageState struct {
-	store    *redis.Store
-	recorder *redis.Recorder
-	postgres *postgres.DB
-	cancel   context.CancelFunc
+	store     *redis.Store
+	recorder  *redis.Recorder
+	postgres  *postgres.DB
+	s3        *s3.Store
+	s3Timeout time.Duration
+	cancel    context.CancelFunc
 	// leases and idle are protected by App.storageMu. A retired generation
 	// stays open until every callback that acquired it has returned.
 	leases int
@@ -65,6 +68,14 @@ func (a *App) startStorage(ctx context.Context, cfg config.StorageConfig) (*stor
 		}
 		state.postgres = db
 	}
+	if cfg.S3.Enabled {
+		client, err := s3.New(ctx, cfg.S3, s3.WithObserver(a.metrics), s3.WithTracer(a.telemetry.Tracer))
+		if err != nil {
+			a.stopStorage(state)
+			return nil, err
+		}
+		state.s3, state.s3Timeout = client, cfg.S3.RequestTimeout.D()
+	}
 
 	return state, nil
 }
@@ -83,6 +94,9 @@ func (a *App) stopStorage(state *storageState) {
 	}
 	if state.postgres != nil {
 		_ = state.postgres.Close()
+	}
+	if state.s3 != nil {
+		_ = state.s3.Close()
 	}
 }
 

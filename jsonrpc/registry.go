@@ -40,11 +40,11 @@ func newMethodEntry(base HandlerFunc, global, local []Middleware) *methodEntry {
 	if len(global)+len(local) != 0 {
 		e.resolve = sync.OnceValue(func() HandlerFunc {
 			handler := base
-			for i := len(local) - 1; i >= 0; i-- {
-				handler = local[i](handler)
+			for _, l := range slices.Backward(local) {
+				handler = l(handler)
 			}
-			for i := len(global) - 1; i >= 0; i-- {
-				handler = global[i](handler)
+			for _, g := range slices.Backward(global) {
+				handler = g(handler)
 			}
 			return handler
 		})

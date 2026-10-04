@@ -13,7 +13,7 @@ func TestPoolRunsTasks(t *testing.T) {
 	defer pool.Stop()
 
 	var done atomic.Int64
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		if err := pool.Submit(func() { done.Add(1) }); err != nil {
 			t.Fatalf("Submit: %v", err)
 		}

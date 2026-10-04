@@ -211,6 +211,7 @@ type TelemetryConfig struct {
 type StorageConfig struct {
 	Redis    RedisConfig    `json:"redis" toml:"redis"`
 	Postgres PostgresConfig `json:"postgres" toml:"postgres"`
+	S3       S3Config       `json:"s3" toml:"s3"`
 }
 
 // RedisConfig configures the Redis backed time-series store.
@@ -349,6 +350,7 @@ func Default() *Config {
 			BatchTimeout: Duration(5 * time.Second),
 		},
 		Storage: StorageConfig{
+			S3: defaultS3(),
 			Redis: RedisConfig{
 				Enabled:   false,
 				Mode:      "single",
@@ -463,8 +465,8 @@ func (s Source) LoadWithMetadata[T any, PT interface {
 // new runtime sections automatically receive the same typo protection.
 func runtimeSection(name string) bool {
 	t := reflect.TypeFor[Config]()
-	for i := 0; i < t.NumField(); i++ {
-		if t.Field(i).Tag.Get("toml") == name {
+	for field := range t.Fields() {
+		if field.Tag.Get("toml") == name {
 			return true
 		}
 	}
@@ -510,7 +512,7 @@ func (c *Config) ApplyEnv(prefix string) error {
 	if v := os.Getenv(env("AUTH_API_KEYS")); v != "" {
 		c.Auth.Enabled = true
 		c.Auth.APIKeys = nil
-		for _, key := range strings.Split(v, ",") {
+		for key := range strings.SplitSeq(v, ",") {
 			if key = strings.TrimSpace(key); key != "" {
 				c.Auth.APIKeys = append(c.Auth.APIKeys, key)
 			}
@@ -527,6 +529,29 @@ func (c *Config) ApplyEnv(prefix string) error {
 	if v := os.Getenv(env("POSTGRES_DSN")); v != "" {
 		c.Storage.Postgres.Enabled = true
 		c.Storage.Postgres.DSN = v
+	}
+	if v := os.Getenv(env("S3_BUCKET")); v != "" {
+		c.Storage.S3.Enabled = true
+		c.Storage.S3.Bucket = v
+	}
+	for _, item := range []struct {
+		suffix string
+		target *string
+	}{
+		{"S3_REGION", &c.Storage.S3.Region}, {"S3_ENDPOINT", &c.Storage.S3.Endpoint},
+		{"S3_ACCESS_KEY_ID", &c.Storage.S3.AccessKeyID}, {"S3_SECRET_ACCESS_KEY", &c.Storage.S3.SecretAccessKey},
+		{"S3_SESSION_TOKEN", &c.Storage.S3.SessionToken},
+	} {
+		if v := os.Getenv(env(item.suffix)); v != "" {
+			*item.target = v
+		}
+	}
+	if v := os.Getenv(env("S3_USE_PATH_STYLE")); v != "" {
+		value, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("%s must be a boolean", env("S3_USE_PATH_STYLE"))
+		}
+		c.Storage.S3.UsePathStyle = value
 	}
 	if v := os.Getenv(env("ADMIN_TOKEN")); v != "" {
 		c.Admin.Token = v
@@ -705,6 +730,9 @@ func (c *Config) Validate() error {
 	if err := c.Storage.Postgres.Validate(); err != nil {
 		return err
 	}
+	if err := c.Storage.S3.Validate(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -810,6 +838,15 @@ func (c *Config) Redacted() *Config {
 	}
 	if clone.Storage.Postgres.DSN != "" {
 		clone.Storage.Postgres.DSN = "***"
+	}
+	if clone.Storage.S3.AccessKeyID != "" {
+		clone.Storage.S3.AccessKeyID = "***"
+	}
+	if clone.Storage.S3.SecretAccessKey != "" {
+		clone.Storage.S3.SecretAccessKey = "***"
+	}
+	if clone.Storage.S3.SessionToken != "" {
+		clone.Storage.S3.SessionToken = "***"
 	}
 	if clone.Admin.Token != "" {
 		clone.Admin.Token = "***"

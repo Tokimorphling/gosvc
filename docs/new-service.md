@@ -352,6 +352,10 @@ bucketTtl = "25h"
   app.Health().AddCheck("kafka", func(ctx context.Context) error { return producer.Ping(ctx) })
   ```
 
+对象存储可启用 `[storage.s3]`，通过 `app.Objects()` 使用 SDK 无关的流式 API。
+上传、下载、分页与预签名的配置和代码见 [S3 使用说明](s3.md)，可运行命令见 [examples/s3](../examples/s3/README.md)。
+下载必须关闭 `Body`；运行时会在整个流的生命周期内保留其存储 lease。
+
 ## 6. 可观测性
 
 - **日志**：`log.format = "auto"`（dev 彩色 / 其它 JSON）；高 QPS 打开采样：

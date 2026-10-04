@@ -44,8 +44,8 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: golangci-lint
-        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run
+      - name: Lint (vet, modernization, gopls, golangci-lint)
+        run: make lint
 
   container:
     runs-on: ubuntu-latest

@@ -108,8 +108,7 @@ func TestRESTAndJSONRPCShareTasksAndAuthentication(t *testing.T) {
 	request("DELETE", path, "", true, 200)
 	request("GET", path, "", true, 404)
 	_, err = rpc.Call[IDRequest, Task](t.Context(), "tasks.get", IDRequest{ID: task.ID})
-	var rpcErr *jsonrpc.Error
-	if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeNotFound {
+	if rpcErr, ok := errors.AsType[*jsonrpc.Error](err); !ok || rpcErr.Code != jsonrpc.CodeNotFound {
 		t.Fatalf("get deleted via RPC=%v", err)
 	}
 	unauthenticated := jsonrpc.NewHTTPClient(base, jsonrpc.WithHTTPClient(client))

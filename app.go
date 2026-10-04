@@ -58,7 +58,9 @@ import (
 	"github.com/Tokimorphling/gosvc/ratelimit"
 	"github.com/Tokimorphling/gosvc/state"
 	"github.com/Tokimorphling/gosvc/store"
+	"github.com/Tokimorphling/gosvc/store/object"
 	"github.com/Tokimorphling/gosvc/store/postgres"
+	"github.com/Tokimorphling/gosvc/store/s3"
 	grpctransport "github.com/Tokimorphling/gosvc/transport/grpc"
 	httptransport "github.com/Tokimorphling/gosvc/transport/http"
 	tcptransport "github.com/Tokimorphling/gosvc/transport/tcp"
@@ -96,6 +98,7 @@ type App struct {
 	storageMu sync.RWMutex
 	storage   *storageState
 	recorders *store.Holder
+	objects   *objectStore
 
 	mu        sync.Mutex
 	reloadMu  sync.Mutex
@@ -155,6 +158,7 @@ func New(cfg *config.Config, opts ...Option) (app *App, err error) {
 		}
 	}()
 	a.cfg.Store(cfg)
+	a.objects = &objectStore{app: a}
 
 	authenticator, err := auth.New(cfg.Auth)
 	if err != nil {
@@ -182,6 +186,13 @@ func New(cfg *config.Config, opts ...Option) (app *App, err error) {
 	a.ready.AddCheck("postgres", func(ctx context.Context) error {
 		err := a.WithPostgres(func(db *postgres.DB) error { return db.Ping(ctx) })
 		if errors.Is(err, ErrStorageDisabled) {
+			return health.ErrSkipped
+		}
+		return err
+	})
+	a.ready.AddCheck("s3", func(ctx context.Context) error {
+		_, err := withObjectStore(a, func(client *s3.Store) (struct{}, error) { return struct{}{}, client.Readiness(ctx) })
+		if errors.Is(err, object.ErrDisabled) {
 			return health.ErrSkipped
 		}
 		return err

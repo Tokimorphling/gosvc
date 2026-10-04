@@ -1,0 +1,17 @@
+# Use an existing bucket. Credentials come from GOSVC_S3_* or the AWS chain.
+[storage.s3]
+enabled = true
+bucket = "gosvc-dev"
+region = "us-east-1"
+
+# Example for an existing local S3-compatible endpoint; omit for AWS S3.
+endpoint = "http://127.0.0.1:9000"
+usePathStyle = true
+checkBucket = true
+requestTimeout = "2m"
+healthTimeout = "3s"
+partSizeBytes = 8388608
+uploadConcurrency = 2
+maxConcurrentUploads = 4
+presignExpiry = "15m"
+maxAttempts = 3

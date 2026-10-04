@@ -24,7 +24,7 @@ func TestSamplingHandlerInitialAndThereafter(t *testing.T) {
 	})
 
 	// n=1,2 are emitted by Initial; n=5 and n=8 satisfy (n-2)%3 == 0.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		logger.Info("repeated")
 	}
 
@@ -48,7 +48,7 @@ func TestSamplingHandlerExemptsWarnings(t *testing.T) {
 		Tick:       time.Hour,
 	})
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		logger.Warn("repeated warning")
 	}
 

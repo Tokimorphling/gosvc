@@ -34,7 +34,7 @@ func TestStoreIncrAndRange(t *testing.T) {
 	store, _ := newTestStore(t)
 	ctx := context.Background()
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if err := store.Incr(ctx, "http.requests", 1); err != nil {
 			t.Fatalf("Incr: %v", err)
 		}
@@ -84,7 +84,7 @@ func TestRecorderAggregatesAndFlushes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go recorder.Run(ctx)
 
-	for i := 0; i < 7; i++ {
+	for range 7 {
 		if err := recorder.Incr(ctx, "grpc.requests", 1); err != nil {
 			t.Fatalf("Incr: %v", err)
 		}

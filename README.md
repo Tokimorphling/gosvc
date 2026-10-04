@@ -9,6 +9,10 @@ HTTP / JSON-RPC / gRPC / TCP 四种传输和优雅退出都装好，业务代码
 
 组件边界、并发约束和泛型使用见 [架构说明](docs/architecture.md)，局部基准数据与复现命令见 [性能记录](docs/performance.md)。
 
+`make lint` 同时检查格式、vet、Go 现代化建议、gopls 默认诊断和 golangci-lint，覆盖主模块与 Kitex 示例；工具分工和修复方式见 [Lint 说明](docs/lint.md)。
+
+S3 对象存储通过 `app.Objects()` 使用，支持自动分片与流式下载；配置及生命周期见 [S3 使用说明](docs/s3.md)，文件操作示例见 [examples/s3](examples/s3/README.md)。
+
 ```bash
 go get github.com/Tokimorphling/gosvc        # 或先把本仓库改名为你的模块（见文末）
 ```
@@ -126,7 +130,7 @@ func main() {
 | 日志-链路关联 | 请求日志自动带 `trace_id` / `span_id`（HTTP、gRPC、TCP 一致），与导出的 span 对应 |
 | 日志 | 两层：`slogx`（geth 风格 handler，零依赖）+ `logging`（多 sink、轮转、采样、运行期级别；重载关闭旧文件 sink） |
 | 可观测性 | Prometheus 指标（HTTP / JSON-RPC / gRPC / TCP 拒绝与连接数 / Go runtime）、pprof、healthz/readyz（含依赖探针）、日志统计、配置查看、时间序列查询，独立 admin 端口（可选 bearer token） |
-| 存储连接器 | Redis（单机 / Cluster / Sentinel，分钟桶 + 内存聚合批量写）与 PostgreSQL（pgx 连接池、池指标、就绪探针） |
+| 存储连接器 | Redis（单机 / Cluster / Sentinel）、PostgreSQL（pgx 连接池）与 S3 对象存储（流式读写、自动分片、分页、预签名、依赖探针及热切换） |
 | 访问日志独立 sink | `log.access.*`：请求日志走自己的级别/格式/输出/文件，自动带 `request_id`/`trace_id`/`log_type=access` |
 | 无锁状态 | `state.Snapshot[T]` 提供读无锁、写替换的共享状态 |
 | 热更新 | fsnotify 监听配置文件：`log.*` / `auth.*` / `limiter.*` 热生效，`storage.*` **重建连接**（新连接就绪后切换，失败保留旧连接且有效配置回滚），其余字段提示 `restartRequired` |
@@ -145,6 +149,7 @@ func main() {
 ├── app_registration.go     # 类型化协议注册与统一生命周期校验
 ├── app_shutdown.go         # 退出 hook、共享预算与资源释放
 ├── app_storage.go          # 存储连接与热重建（WithStore / WithPostgres lease）
+├── app_objects.go          # 稳定对象存储门面与下载流 lease
 ├── app_reload.go           # 热重载事务（reloadable 字段 / restartRequired）
 ├── types.go                # 少量类型别名（Config / Source / Configurable）
 │
@@ -160,6 +165,8 @@ func main() {
 ├── state/                  # 泛型无锁快照 Snapshot[T]
 ├── jsonrpc/                # JSON-RPC 2.0：Dispatcher（RegisterTyped）+ Client（Call）
 ├── store/                  # 存储接口（Recorder / TimeSeries）
+│   ├── object/             #   与 SDK 无关的流式对象存储接口
+│   ├── s3/                 #   AWS SDK v2 / S3 兼容服务适配
 │   ├── redis/              #   Redis：单机 / Cluster / Sentinel + 分钟桶
 │   └── postgres/           #   PostgreSQL：pgx 连接池 + 健康探针
 ├── transport/http/         # Hertz：/rpc、中间件链（认证/限流/追踪/日志）
@@ -176,6 +183,7 @@ func main() {
 
 examples/
 ├── tasks/                  # 入门业务 sample：待办事项 CRUD，内存存储，REST + JSON-RPC
+├── s3/                     # 对象存储 CLI sample：流式文件读写与预签名
 ├── app/                    # 完整能力示例（greeter）：config / bindings / cmd / e2e 测试
 └── kitex/                  # Kitex 服务间 RPC 示例（独立 go module，不进入库依赖）
 ```
@@ -204,6 +212,7 @@ app.Recorder()          // 当前 recorder 快照（未启用 Redis 时为 nil�
 app.StableRecorder()    // 可长期持有，随 Redis 重载自动切换
 app.Store()             // 当前 *redis.Store 快照（未启用时为 nil）
 app.Postgres()          // 当前 *postgres.DB 快照（未启用时为 nil）
+app.Objects()           // 稳定 object.Store，自动跟随 S3 重载；未启用时操作返回 object.ErrDisabled
 app.WithStore(fn)       // 在 fn 执行期间保持当前 Redis 连接可用
 app.WithPostgres(fn)    // 在 fn 执行期间保持当前 PostgreSQL 连接池可用
 app.Health()            // *health.Ready，可注册自己的依赖探针

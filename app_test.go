@@ -131,7 +131,7 @@ func TestCloseFromRegistrationCallbackDoesNotDeadlock(t *testing.T) {
 }
 
 func TestConcurrentCloseAndRunStartup(t *testing.T) {
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		app, err := New(testConfig())
 		if err != nil {
 			t.Fatal(err)

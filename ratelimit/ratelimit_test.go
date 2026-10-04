@@ -7,7 +7,7 @@ import (
 
 func TestDisabledAllowsEverything(t *testing.T) {
 	limiter := New(0, 0)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if !limiter.Allow("client") {
 			t.Fatal("disabled limiter must allow every request")
 		}

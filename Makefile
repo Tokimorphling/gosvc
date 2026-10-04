@@ -1,4 +1,6 @@
 MODULE     := github.com/Tokimorphling/gosvc
+GOLANGCI_LINT_VERSION ?= v2.14.0
+GOPLS_VERSION ?= v0.23.0
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -7,7 +9,7 @@ LDFLAGS    := -s -w \
 	-X $(MODULE)/examples/app.Commit=$(COMMIT) \
 	-X $(MODULE)/examples/app.BuildTime=$(BUILD_TIME)
 
-.PHONY: all build run test race vet fmt lint proto clean docker help bench-core
+.PHONY: all build run test race vet fmt lint lint-editor modernize modernize-check proto clean docker help bench-core
 
 all: build
 
@@ -30,17 +32,35 @@ race:
 	go test -race ./...
 	cd examples/kitex && go test -race ./...
 
-## vet: run go vet
+## vet: run go vet in both modules
 vet:
 	go vet ./...
+	cd examples/kitex && go vet ./...
 
 ## fmt: format all Go sources
 fmt:
 	gofmt -w .
 
-## lint: fail when sources are not formatted or vet reports problems
-lint: vet
+## modernize-check: report Go toolchain modernization fixes without editing files
+modernize-check:
+	go fix -diff ./...
+	cd examples/kitex && go fix -diff ./...
+
+## modernize: apply Go toolchain modernization fixes, then check for remaining fixes
+modernize:
+	go fix ./...
+	cd examples/kitex && go fix ./...
+	$(MAKE) modernize-check
+
+## lint-editor: check handwritten sources with the pinned gopls default analyzers
+lint-editor:
+	GOPLS_VERSION="$(GOPLS_VERSION)" bash scripts/check-gopls.sh
+
+## lint: check formatting, vet, modernization, gopls and golangci-lint in both modules
+lint: vet modernize-check lint-editor
 	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
+	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run
+	cd examples/kitex && go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run
 
 ## proto: regenerate protobuf/gRPC code for the example app
 proto:

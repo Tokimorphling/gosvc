@@ -184,7 +184,7 @@ func TestServeBatchInvalidElementsAndNotifications(t *testing.T) {
 	if len(responses) != 6 {
 		t.Fatalf("got %d responses, want 6: %s", len(responses), raw)
 	}
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		if responses[i].Error == nil || responses[i].Error.Code != CodeInvalidRequest || string(responses[i].ID) != "null" {
 			t.Fatalf("response %d = %+v, want Invalid Request with null id", i, responses[i])
 		}
@@ -308,7 +308,7 @@ func TestBatchIsCapped(t *testing.T) {
 
 	// The default cap rejects a batch that is one item larger.
 	over := make([]string, 0, defaultMaxBatch+1)
-	for i := 0; i < defaultMaxBatch+1; i++ {
+	for i := range defaultMaxBatch + 1 {
 		over = append(over, request(i))
 	}
 	raw, _ := d.Serve(context.Background(), []byte("["+strings.Join(over, ",")+"]"))
@@ -318,7 +318,7 @@ func TestBatchIsCapped(t *testing.T) {
 
 	// A batch at the cap still works.
 	at := make([]string, 0, defaultMaxBatch)
-	for i := 0; i < defaultMaxBatch; i++ {
+	for i := range defaultMaxBatch {
 		at = append(at, request(i))
 	}
 	raw, _ = d.Serve(context.Background(), []byte("["+strings.Join(at, ",")+"]"))
@@ -425,7 +425,6 @@ func TestMiddlewareOrderAndContext(t *testing.T) {
 		return "ok", nil
 	})
 	for _, name := range []string{"first", "second", "third"} {
-		name := name
 		d.Use(func(next HandlerFunc) HandlerFunc {
 			return func(ctx context.Context, params json.RawMessage) (any, error) {
 				order = append(order, name)

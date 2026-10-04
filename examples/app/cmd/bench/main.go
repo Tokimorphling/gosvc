@@ -16,7 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -61,9 +61,7 @@ func main() {
 
 	start := time.Now()
 	for i := 0; i < *concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			switch *mode {
 			case "rest":
 				results <- runREST(ctx, *httpAddr, *name)
@@ -72,7 +70,7 @@ func main() {
 			case "grpc":
 				results <- runGRPC(ctx, *grpcAddr, *name)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(results)
@@ -202,9 +200,7 @@ func runGRPC(ctx context.Context, addr, name string) workerResult {
 }
 
 func report(mode string, result workerResult, elapsed time.Duration) {
-	sort.Slice(result.latencies, func(i, j int) bool {
-		return result.latencies[i] < result.latencies[j]
-	})
+	slices.Sort(result.latencies)
 
 	fmt.Printf("mode=%s duration=%s requests=%d errors=%d qps=%.1f\n",
 		mode, elapsed.Round(time.Millisecond), result.requests, result.errors,
@@ -225,10 +221,7 @@ func percentile(sorted []time.Duration, p int) time.Duration {
 	if len(sorted) == 0 {
 		return 0
 	}
-	index := int(math.Ceil(float64(p)/100.0*float64(len(sorted)))) - 1
-	if index < 0 {
-		index = 0
-	}
+	index := max(int(math.Ceil(float64(p)/100.0*float64(len(sorted))))-1, 0)
 	if index >= len(sorted) {
 		index = len(sorted) - 1
 	}

@@ -144,6 +144,22 @@ connMaxLifetime = "1h"
 connMaxIdleTime = "10m"
 pingTimeout = "3s"
 
+[storage.s3]
+enabled = false
+bucket = ""
+region = ""
+endpoint = ""          # empty for AWS S3; custom http(s) origin for compatible servers
+usePathStyle = false   # commonly true for a local S3-compatible endpoint
+# Credentials omitted: use the AWS credential chain or GOSVC_S3_* variables.
+checkBucket = true
+requestTimeout = "2m"
+healthTimeout = "3s"
+presignExpiry = "15m"
+partSizeBytes = 8388608
+uploadConcurrency = 2
+maxConcurrentUploads = 4
+maxAttempts = 3
+
 # Application-specific section (used by the example app only).
 [greeting]
 prefix = "hello"

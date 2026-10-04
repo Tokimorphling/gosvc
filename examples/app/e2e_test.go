@@ -137,8 +137,7 @@ func TestEndToEnd(t *testing.T) {
 
 		_, err = client.Call[greeter.GetGreetingRequest, *greeter.Greeting](
 			context.Background(), "greeter.getGreeting", greeter.GetGreetingRequest{ID: 999})
-		var rpcErr *jsonrpc.Error
-		if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeNotFound {
+		if rpcErr, ok := errors.AsType[*jsonrpc.Error](err); !ok || rpcErr.Code != jsonrpc.CodeNotFound {
 			t.Fatalf("err = %v, want not-found JSON-RPC error", err)
 		}
 	})
@@ -354,6 +353,9 @@ func TestEndToEnd(t *testing.T) {
 				data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 				break
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			t.Fatalf("read event stream: %v", err)
 		}
 		if !strings.Contains(data, "hello from the event stream") {
 			t.Fatalf("first event data = %q", data)
@@ -620,7 +622,7 @@ func TestLogSampling(t *testing.T) {
 	httpBase := "http://" + application.HTTPAddr()
 	waitReady(t, httpBase+"/readyz")
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		getBody(t, httpBase+"/api/v1/hello?name=sample")
 	}
 
@@ -815,7 +817,7 @@ func logRecordHas(t *testing.T, path, msg, field string) bool {
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
+	for line := range strings.SplitSeq(string(raw), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}

@@ -72,13 +72,13 @@ func (textCodec) Encode(call Call, result any, callErr error) ([]byte, error) {
 		if kind == apierror.KindUnknown {
 			kind = "unknown"
 		}
-		return []byte(fmt.Sprintf("ERROR %s %s", kind, apierror.ClientMessage(callErr))), nil
+		return fmt.Appendf(nil, "ERROR %s %s", kind, apierror.ClientMessage(callErr)), nil
 	}
 	raw, err := json.Marshal(result)
 	if err != nil {
 		return nil, err
 	}
-	return []byte(fmt.Sprintf("RESULT %s %s", call.ID, raw)), nil
+	return fmt.Appendf(nil, "RESULT %s %s", call.ID, raw), nil
 }
 
 func (textCodec) EncodeNotification(method string, params any) ([]byte, error) {
@@ -86,7 +86,7 @@ func (textCodec) EncodeNotification(method string, params any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []byte(fmt.Sprintf("PUSH %s %s", method, raw)), nil
+	return fmt.Appendf(nil, "PUSH %s %s", method, raw), nil
 }
 
 // serialTextCodec is the text dialect with per-connection serial dispatch
