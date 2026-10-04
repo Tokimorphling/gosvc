@@ -183,6 +183,7 @@ func main() {
 
 examples/
 ├── tasks/                  # 入门业务 sample：待办事项 CRUD，内存存储，REST + JSON-RPC
+├── deploydemo/             # 独立 go get 模块：持久化任务板、网页及临时生产验收
 ├── s3/                     # 对象存储 CLI sample：流式文件读写与预签名
 ├── app/                    # 完整能力示例（greeter）：config / bindings / cmd / e2e 测试
 └── kitex/                  # Kitex 服务间 RPC 示例（独立 go module，不进入库依赖）

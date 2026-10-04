@@ -1,0 +1,36 @@
+[Unit]
+Description=Temporary gosvc production verification demo
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=gosvc-demo
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/gosvc-demo
+EnvironmentFile=/etc/gosvc-demo/demo.env
+Environment=GOMEMLIMIT=80MiB
+Environment=GOMAXPROCS=2
+ExecStart=/opt/gosvc-demo/gosvc-demo -c /etc/gosvc-demo/config.toml
+TimeoutStopSec=15s
+RuntimeMaxSec=15min
+Restart=no
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+IPAddressDeny=any
+IPAddressAllow=localhost
+MemoryHigh=96M
+MemoryMax=128M
+CPUQuota=50%
+TasksMax=128
+LimitNOFILE=4096

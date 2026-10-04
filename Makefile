@@ -13,29 +13,33 @@ LDFLAGS    := -s -w \
 
 all: build
 
-## build: compile the service and the load generator into ./bin
+## build: compile the example services and the load generator into ./bin
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/gosvc ./examples/app/cmd/gosvc
 	go build -trimpath -o bin/bench ./examples/app/cmd/bench
+	cd examples/deploydemo && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o ../../bin/deploydemo ./cmd/deploydemo
 
 ## run: build and start the service with the example config
 run: build
 	./bin/gosvc -c configs/config.example.toml
 
-## test: run unit tests (library, example app and the kitex example module)
+## test: run unit tests in the library and both standalone example modules
 test:
 	go test ./...
 	cd examples/kitex && go test ./...
+	cd examples/deploydemo && go test ./...
 
 ## race: run unit tests with the race detector
 race:
 	go test -race ./...
 	cd examples/kitex && go test -race ./...
+	cd examples/deploydemo && go test -race ./...
 
-## vet: run go vet in both modules
+## vet: run go vet in all three modules
 vet:
 	go vet ./...
 	cd examples/kitex && go vet ./...
+	cd examples/deploydemo && go vet ./...
 
 ## fmt: format all Go sources
 fmt:
@@ -45,22 +49,25 @@ fmt:
 modernize-check:
 	go fix -diff ./...
 	cd examples/kitex && go fix -diff ./...
+	cd examples/deploydemo && go fix -diff ./...
 
 ## modernize: apply Go toolchain modernization fixes, then check for remaining fixes
 modernize:
 	go fix ./...
 	cd examples/kitex && go fix ./...
+	cd examples/deploydemo && go fix ./...
 	$(MAKE) modernize-check
 
 ## lint-editor: check handwritten sources with the pinned gopls default analyzers
 lint-editor:
 	GOPLS_VERSION="$(GOPLS_VERSION)" bash scripts/check-gopls.sh
 
-## lint: check formatting, vet, modernization, gopls and golangci-lint in both modules
+## lint: check formatting, vet, modernization, gopls and golangci-lint in all modules
 lint: vet modernize-check lint-editor
 	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
 	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run
 	cd examples/kitex && go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run
+	cd examples/deploydemo && go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run
 
 ## proto: regenerate protobuf/gRPC code for the example app
 proto:

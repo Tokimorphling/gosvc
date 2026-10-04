@@ -8,15 +8,24 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [., examples/kitex, examples/deploydemo]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: ${{ matrix.module }}/go.mod
           cache: true
+          cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: Format check
+        if: matrix.module == '.'
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
       - name: Build
@@ -28,12 +37,6 @@ jobs:
       - name: Test (race)
         run: go test -race ./...
 
-      # examples/kitex is a standalone module so kitex stays out of the
-      # library's go.mod; its tests run separately.
-      - name: Test kitex example (race)
-        working-directory: examples/kitex
-        run: go test -race ./...
-
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -43,6 +46,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: "**/go.sum"
 
       - name: Lint (vet, modernization, gopls, golangci-lint)
         run: make lint

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Scan handwritten Go sources in both modules with the pinned editor analyzer.
+# Scan handwritten Go sources in all modules with the pinned editor analyzer.
 # gopls check prints diagnostics but can still exit 0, so inspect its output too.
 set -euo pipefail
 
@@ -10,6 +10,7 @@ trap 'rm -f "$report"' EXIT
 
 root_files=()
 kitex_files=()
+deploydemo_files=()
 while IFS= read -r -d '' relative; do
   source_file="$repo_root/$relative"
   # A tracked file may have been deleted without being staged yet.
@@ -25,6 +26,7 @@ while IFS= read -r -d '' relative; do
   fi
   case "$relative" in
     examples/kitex/*) kitex_files+=("$source_file") ;;
+    examples/deploydemo/*) deploydemo_files+=("$source_file") ;;
     *) root_files+=("$source_file") ;;
   esac
 done < <(git -C "$repo_root" ls-files --cached --others --exclude-standard -z -- '*.go')
@@ -46,3 +48,4 @@ check_module() {
 
 check_module "$repo_root" "${root_files[@]}"
 check_module "$repo_root/examples/kitex" "${kitex_files[@]}"
+check_module "$repo_root/examples/deploydemo" "${deploydemo_files[@]}"

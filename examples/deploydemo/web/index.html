@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f5f7f3" />
+    <title>gosvc · 线上验证</title>
+    <link rel="stylesheet" href="./style.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <a class="brand" href="./" aria-label="gosvc 首页">
+          <span class="brand-mark" aria-hidden="true">g<span>·</span></span>
+          <span>gosvc <span class="brand-divider">/</span> <span class="brand-section">线上验证</span></span>
+        </a>
+        <span class="health-pill" id="health-pill"><span class="status-dot"></span><span id="health-label">正在连接服务</span></span>
+      </header>
+
+      <main>
+        <section class="intro" aria-labelledby="page-title">
+          <div>
+            <p class="eyebrow"><span></span> A SMALL SERVICE, RUNNING LIVE</p>
+            <h1 id="page-title">把想法，变成已完成。</h1>
+            <p class="intro-copy">一个运行在真实服务器上的小小任务板。<br class="mobile-break" />记下一件事，完成它，让改变留下来。</p>
+          </div>
+          <div class="intro-art" aria-hidden="true">
+            <div class="art-card back"></div>
+            <div class="art-card front"><span class="art-check">✓</span><span class="art-line"></span><span class="art-line short"></span><span class="art-caption">ONE THING AT A TIME</span></div>
+          </div>
+        </section>
+
+        <section class="overview" aria-label="服务概览">
+          <div class="overview-item"><span class="overview-label">运行状态</span><strong id="overview-health">检查中<span class="muted-dot">·</span></strong><span class="overview-detail" id="health-detail">等待服务响应</span></div>
+          <div class="overview-item"><span class="overview-label">持续运行</span><strong id="uptime">—</strong><span class="overview-detail">从本次启动开始</span></div>
+          <div class="overview-item"><span class="overview-label">当前版本</span><strong class="version-value" id="version">—</strong><span class="overview-detail">连接后查看部署版本</span></div>
+          <div class="overview-item"><span class="overview-label">任务存储</span><strong id="storage">持久化</strong><span class="overview-detail">任务会保留在服务器上</span></div>
+        </section>
+
+        <div class="workspace">
+          <section class="task-panel panel" aria-labelledby="tasks-heading">
+            <div class="panel-heading"><div><p class="eyebrow small">YOUR WORKSPACE</p><h2 id="tasks-heading">任务清单 <span class="task-count" id="task-count">—</span></h2></div><button class="icon-button" type="button" id="refresh" aria-label="刷新任务" title="刷新任务" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"/></svg></button></div>
+            <form id="task-form" class="task-form">
+              <label class="sr-only" for="task-title">新任务</label>
+              <span class="input-plus" aria-hidden="true">+</span>
+              <input id="task-title" name="title" type="text" maxlength="160" placeholder="接下来，你想完成什么？" autocomplete="off" required disabled />
+              <button class="primary-button" id="add-task" type="submit" disabled>添加任务 <span aria-hidden="true">↗</span></button>
+            </form>
+            <div class="task-toolbar"><div class="filters" role="group" aria-label="筛选任务"><button type="button" class="filter active" data-filter="all" aria-pressed="true">全部 <span id="count-all">0</span></button><button type="button" class="filter" data-filter="pending" aria-pressed="false">待完成 <span id="count-pending">0</span></button><button type="button" class="filter" data-filter="done" aria-pressed="false">已完成 <span id="count-done">0</span></button></div><span class="list-caption" id="list-caption">先连接，再开始</span></div>
+            <div class="empty-state" id="empty-state"><div class="empty-icon" aria-hidden="true">⌁</div><h3 id="empty-title">你的工作区，准备好了</h3><p id="empty-copy">输入访问密钥，查看和管理服务器上的任务。</p></div>
+            <ul class="task-list" id="task-list" aria-label="任务列表"></ul>
+            <div class="task-footer"><span><span class="tiny-dot"></span><span id="sync-label">等待连接</span></span><span>一步一步，完成更多。</span></div>
+          </section>
+
+          <aside class="sidebar">
+            <section class="connection-panel panel" aria-labelledby="connection-heading">
+              <div class="connection-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg></div>
+              <h2 id="connection-heading">连接你的工作区</h2>
+              <p class="sidebar-copy" id="connection-copy">首页公开可见。任务操作需要访问密钥，请向服务器管理员获取。</p>
+              <form id="connect-form">
+                <label for="api-key">访问密钥 <span>API KEY</span></label>
+                <input id="api-key" name="api-key" type="password" placeholder="输入访问密钥" autocomplete="off" autocapitalize="off" spellcheck="false" required />
+                <button type="submit" class="primary-button connect-button" id="connect-button">连接工作区 <span aria-hidden="true">→</span></button>
+              </form>
+              <div class="connected-state" id="connected-state" hidden><div class="connected-badge"><span class="status-dot"></span> 已安全连接</div><button type="button" class="secondary-button" id="disconnect">断开连接</button></div>
+              <p class="privacy-note">密钥仅保存在当前浏览器会话中，关闭会话后需要重新输入。</p>
+            </section>
+            <section class="about-panel" aria-labelledby="about-heading"><p class="eyebrow small">BUILT WITH GOSVC</p><h2 id="about-heading">小服务，也认真运行。</h2><p>从请求到存储，这个示例完整走过一遍线上服务的日常。</p><ul><li><span aria-hidden="true">✓</span> 服务健康状态，实时可见</li><li><span aria-hidden="true">✓</span> 密钥保护每一次任务操作</li><li><span aria-hidden="true">✓</span> 重启之后，任务依然保留</li></ul><div class="about-caption">SIMPLE BY DESIGN.</div></section>
+          </aside>
+        </div>
+      </main>
+      <footer class="page-footer"><span>gosvc <span class="footer-dot">·</span> 从框架到线上</span><span>今天，也完成一件小事。</span></footer>
+    </div>
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

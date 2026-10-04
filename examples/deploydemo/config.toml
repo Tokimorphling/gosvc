@@ -1,0 +1,31 @@
+[service]
+name = "gosvc-demo"
+env = "dev"
+
+[http]
+host = "127.0.0.1"
+port = 18080
+handlerTimeout = "5s"
+maxBodyBytes = 16384
+
+[http.cors]
+enabled = false
+
+[grpc]
+host = "127.0.0.1"
+port = 19090
+
+[admin]
+host = "127.0.0.1"
+port = 16060
+
+[log]
+format = "json"
+
+[auth]
+enabled = false # Set true in production; supply DEMO_AUTH_API_KEYS separately.
+
+[tasks]
+dataFile = "data/tasks.json"
+maxTitleLen = 160
+maxTasks = 1000

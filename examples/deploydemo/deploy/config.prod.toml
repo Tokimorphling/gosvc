@@ -1,0 +1,35 @@
+[service]
+name = "gosvc-demo"
+env = "prod"
+
+[http]
+host = "127.0.0.1"
+port = 18080
+handlerTimeout = "5s"
+shutdownTimeout = "3s"
+maxBodyBytes = 16384
+
+[http.cors]
+enabled = false
+
+[grpc]
+host = "127.0.0.1"
+port = 19090
+shutdownTimeout = "3s"
+
+[admin]
+host = "127.0.0.1"
+port = 16060
+
+[log]
+format = "json"
+output = "stdout"
+
+[auth]
+enabled = true
+# DEMO_AUTH_API_KEYS is loaded from a root-owned EnvironmentFile.
+
+[tasks]
+dataFile = "/var/lib/gosvc-demo/tasks.json"
+maxTitleLen = 160
+maxTasks = 1000

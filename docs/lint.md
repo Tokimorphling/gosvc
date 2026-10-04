@@ -12,11 +12,12 @@ Go 1.26 起，`go fix` 已内置现代化分析器；本项目要求 Go 1.27。�
 | `make modernize-check` | 用 `go fix -diff` 报告建议，存在改动时失败，不写文件 |
 | `make modernize` | 应用 `go fix` 默认修复，再检查是否还有剩余建议 |
 | `make lint-editor` | gopls hint 及更高等级的完整文件扫描 |
-| `make vet` | 两个模块的 `go vet` |
-| `make race` | 两个模块的 race 测试 |
+| `make vet` | 三个模块的 `go vet` |
+| `make race` | 三个模块的 race 测试 |
 
-所有目标覆盖根模块与独立的 `examples/kitex` 模块。`./...` 本身不会跨越嵌套的 go.mod 边界。
-CI 使用同一个 `make lint` 入口。
+所有检查目标覆盖根模块与独立的 `examples/kitex`、`examples/deploydemo` 模块。`./...` 本身不会跨越嵌套的 go.mod 边界。
+CI 使用同一个 `make lint` 入口，并按模块分别运行构建、vet 和 race 测试。
+`examples/deploydemo` 使用已发布的 gosvc 版本且没有本地 `replace`，同时验证独立应用的实际依赖方式。
 
 现代化修复可以先预览再应用：
 
