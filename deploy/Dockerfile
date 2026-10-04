@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
       -X github.com/Tokimorphling/gosvc/examples/app.Version=${VERSION} \
       -X github.com/Tokimorphling/gosvc/examples/app.Commit=${COMMIT} \
       -X github.com/Tokimorphling/gosvc/examples/app.BuildTime=${BUILD_TIME}" \
-    -o /out/gosvc ./cmd/gosvc
+    -o /out/gosvc ./examples/app/cmd/gosvc
 
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app

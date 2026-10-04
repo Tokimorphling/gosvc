@@ -228,7 +228,9 @@ func RequestTimeout(d time.Duration) app.HandlerFunc {
 // re-enable header trust consciously.
 func RateLimit(limiter *ratelimit.Limiter) app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
-		if limiter != nil && !limiter.Allow(peerIP(c)) {
+		path := string(c.Path())
+		probe := path == "/healthz" || path == "/readyz"
+		if !probe && limiter != nil && !limiter.Allow(peerIP(c)) {
 			c.Abort()
 			WriteError(ctx, c, apierror.New(apierror.KindRateLimited, "rate limit exceeded"))
 			return

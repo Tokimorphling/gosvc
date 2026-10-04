@@ -1,0 +1,78 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/Tokimorphling/gosvc/jsonrpc
+cpu: Apple M4
+BenchmarkDispatcher/Unobserved/Invoke-8  	 9373798	        41.63 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Unobserved/Invoke-8  	 8753329	        38.25 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Unobserved/Invoke-8  	10082809	        36.44 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Unobserved/Invoke-8  	 9841509	        36.62 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Unobserved/Invoke-8  	 9740995	        37.06 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Unobserved/Parallel-8         	 1918316	       187.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Unobserved/Parallel-8         	 1919660	       187.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Unobserved/Parallel-8         	 1917441	       187.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Unobserved/Parallel-8         	 1922013	       187.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Unobserved/Parallel-8         	 1923594	       187.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Unobserved/Serve-8            	  297372	      1116 ns/op	    1561 B/op	      25 allocs/op
+BenchmarkDispatcher/Unobserved/Serve-8            	  326412	      1115 ns/op	    1511 B/op	      25 allocs/op
+BenchmarkDispatcher/Unobserved/Serve-8            	  323564	      1118 ns/op	    1536 B/op	      25 allocs/op
+BenchmarkDispatcher/Unobserved/Serve-8            	  312063	      1127 ns/op	    1531 B/op	      25 allocs/op
+BenchmarkDispatcher/Unobserved/Serve-8            	  309102	      1129 ns/op	    1556 B/op	      25 allocs/op
+BenchmarkDispatcher/Observed/Invoke-8             	 6609526	        54.66 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Observed/Invoke-8             	 6711616	        54.37 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Observed/Invoke-8             	 6685970	        54.46 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Observed/Invoke-8             	 6641815	        54.50 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Observed/Invoke-8             	 6629416	        54.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Observed/Parallel-8           	 1928875	       186.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Observed/Parallel-8           	 1934564	       186.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Observed/Parallel-8           	 1933717	       186.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Observed/Parallel-8           	 1927844	       186.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Observed/Parallel-8           	 1929135	       186.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDispatcher/Observed/Serve-8              	  304460	      1149 ns/op	    1544 B/op	      25 allocs/op
+BenchmarkDispatcher/Observed/Serve-8              	  318760	      1153 ns/op	    1530 B/op	      25 allocs/op
+BenchmarkDispatcher/Observed/Serve-8              	  311182	      1160 ns/op	    1553 B/op	      25 allocs/op
+BenchmarkDispatcher/Observed/Serve-8              	  302773	      1155 ns/op	    1547 B/op	      25 allocs/op
+BenchmarkDispatcher/Observed/Serve-8              	  314872	      1151 ns/op	    1537 B/op	      25 allocs/op
+PASS
+ok  	github.com/Tokimorphling/gosvc/jsonrpc	13.263s
+goos: darwin
+goarch: arm64
+pkg: github.com/Tokimorphling/gosvc/health
+cpu: Apple M4
+BenchmarkReadiness/Checks0-8         	 2079483	       162.8 ns/op	     272 B/op	       4 allocs/op
+BenchmarkReadiness/Checks0-8         	 2327008	       154.5 ns/op	     272 B/op	       4 allocs/op
+BenchmarkReadiness/Checks0-8         	 2331018	       154.9 ns/op	     272 B/op	       4 allocs/op
+BenchmarkReadiness/Checks0-8         	 2306532	       155.6 ns/op	     272 B/op	       4 allocs/op
+BenchmarkReadiness/Checks0-8         	 2326417	       154.8 ns/op	     272 B/op	       4 allocs/op
+BenchmarkReadiness/Checks8-8         	  987088	       373.0 ns/op	     608 B/op	       6 allocs/op
+BenchmarkReadiness/Checks8-8         	  976723	       376.0 ns/op	     608 B/op	       6 allocs/op
+BenchmarkReadiness/Checks8-8         	  954358	       375.2 ns/op	     608 B/op	       6 allocs/op
+BenchmarkReadiness/Checks8-8         	  986739	       375.5 ns/op	     608 B/op	       6 allocs/op
+BenchmarkReadiness/Checks8-8         	  976988	       377.4 ns/op	     608 B/op	       6 allocs/op
+PASS
+ok  	github.com/Tokimorphling/gosvc/health	4.054s
+goos: darwin
+goarch: arm64
+pkg: github.com/Tokimorphling/gosvc/internal/workerpool
+cpu: Apple M4
+BenchmarkPoolBacklog/Size64/Serialfalse-8         	  126488	      2755 ns/op	        43.04 ns/task	     264 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size64/Serialfalse-8         	  140415	      2620 ns/op	        40.93 ns/task	     264 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size64/Serialfalse-8         	  136118	      2620 ns/op	        40.94 ns/task	     264 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size64/Serialfalse-8         	  138260	      2625 ns/op	        41.01 ns/task	     264 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size64/Serialfalse-8         	  137950	      2619 ns/op	        40.92 ns/task	     264 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size64/Serialtrue-8          	   69451	      4980 ns/op	        77.81 ns/task	     264 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size64/Serialtrue-8          	   71547	      4975 ns/op	        77.73 ns/task	     264 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size64/Serialtrue-8          	   71577	      5049 ns/op	        78.89 ns/task	     264 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size64/Serialtrue-8          	   70336	      5060 ns/op	        79.07 ns/task	     264 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size64/Serialtrue-8          	   71926	      5005 ns/op	        78.20 ns/task	     264 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size1024/Serialfalse-8       	    2830	    127357 ns/op	       124.4 ns/task	     284 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size1024/Serialfalse-8       	    2842	    127239 ns/op	       124.3 ns/task	     284 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size1024/Serialfalse-8       	    2938	    122703 ns/op	       119.8 ns/task	     284 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size1024/Serialfalse-8       	    2942	    122686 ns/op	       119.8 ns/task	     284 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size1024/Serialfalse-8       	    2852	    127295 ns/op	       124.3 ns/task	     284 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size1024/Serialtrue-8        	    2380	    151872 ns/op	       148.3 ns/task	     289 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size1024/Serialtrue-8        	    2306	    155981 ns/op	       152.3 ns/task	     289 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size1024/Serialtrue-8        	    2376	    152164 ns/op	       148.6 ns/task	     289 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size1024/Serialtrue-8        	    2306	    155854 ns/op	       152.2 ns/task	     289 B/op	       5 allocs/op
+BenchmarkPoolBacklog/Size1024/Serialtrue-8        	    2376	    151870 ns/op	       148.3 ns/task	     289 B/op	       5 allocs/op
+PASS
+ok  	github.com/Tokimorphling/gosvc/internal/workerpool	7.621s

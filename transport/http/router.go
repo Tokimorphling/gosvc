@@ -29,8 +29,9 @@ func (s *Server) handleHealthz(_ context.Context, c *app.RequestContext) {
 	writeJSON(c, 200, map[string]string{"status": "ok", "version": s.version})
 }
 
-func (s *Server) handleReadyz(_ context.Context, c *app.RequestContext) {
-	if s.ready != nil && !s.ready.IsReady() {
+func (s *Server) handleReadyz(ctx context.Context, c *app.RequestContext) {
+	// Keep public output terse; dependency details stay on the admin port.
+	if !s.ready.Healthy(ctx) {
 		writeJSON(c, 503, map[string]string{"status": "not_ready"})
 		return
 	}

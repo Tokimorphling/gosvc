@@ -78,6 +78,45 @@ func (s *countingSink) Close() error {
 }
 func (s *countingSink) ID() string { return "counting" }
 
+type testObserver struct {
+	subscribers atomic.Int64
+	delivered   atomic.Int64
+	dropped     atomic.Int64
+}
+
+func (o *testObserver) SetBrokerSubscribers(_ string, n int) { o.subscribers.Store(int64(n)) }
+func (o *testObserver) ObserveBrokerDelivered(string)        { o.delivered.Add(1) }
+func (o *testObserver) ObserveBrokerDropped(string, string)  { o.dropped.Add(1) }
+
+func TestBrokerAcceptsIndependentObserverAndCanDisableIt(t *testing.T) {
+	observer := &testObserver{}
+	broker := NewBroker[int]("custom", WithMetrics(observer))
+	sink := newChanSink("custom")
+	deliver := func() {
+		t.Helper()
+		sub := broker.Subscribe(sink)
+		if broker.Publish("event", 42) != 1 {
+			t.Fatal("event not accepted")
+		}
+		sub.Unsubscribe()
+		select {
+		case <-sub.Done():
+		case <-time.After(time.Second):
+			t.Fatal("delivery did not drain")
+		}
+	}
+	deliver()
+	if observer.delivered.Load() != 1 || observer.subscribers.Load() != 0 {
+		t.Fatal("independent observer missed lifecycle events")
+	}
+	broker.SetMetrics(nil)
+	deliver()
+	if observer.delivered.Load() != 1 {
+		t.Fatal("disabled observer still received events")
+	}
+	broker.Shutdown()
+}
+
 // blockingSink parks in Send until released; used to force queue overflow.
 type blockingSink struct {
 	id      string

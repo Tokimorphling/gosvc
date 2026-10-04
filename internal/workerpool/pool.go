@@ -18,25 +18,18 @@ var (
 )
 
 // Pool runs submitted tasks on a fixed number of workers.
-type Pool struct {
-	mu       sync.Mutex
-	ready    *sync.Cond
-	tasks    []queuedTask
-	active   map[any]struct{}
-	capacity int
-	wg       sync.WaitGroup
-	done     chan struct{}
-	closed   bool
-	onPanic  func(recovered any)
-}
-
-type queuedTask struct {
-	run func()
-	key any
+type Pool[K comparable] struct {
+	mu      sync.Mutex
+	ready   *sync.Cond
+	tasks   scheduler[K]
+	wg      sync.WaitGroup
+	done    chan struct{}
+	closed  bool
+	onPanic func(recovered any)
 }
 
 // New starts workers goroutines consuming a queue of queueSize tasks.
-func New(workers, queueSize int) *Pool {
+func New[K comparable](workers, queueSize int) *Pool[K] {
 	if workers < 1 {
 		workers = 1
 	}
@@ -44,7 +37,7 @@ func New(workers, queueSize int) *Pool {
 		queueSize = 1
 	}
 
-	p := &Pool{capacity: queueSize, active: make(map[any]struct{}), done: make(chan struct{})}
+	p := &Pool[K]{tasks: newScheduler[K](queueSize), done: make(chan struct{})}
 	p.ready = sync.NewCond(&p.mu)
 	for range workers {
 		p.wg.Go(p.work)
@@ -54,13 +47,13 @@ func New(workers, queueSize int) *Pool {
 
 // SetPanicHandler installs a callback invoked when a task panics. The worker
 // survives panics either way; the default is to swallow them.
-func (p *Pool) SetPanicHandler(fn func(recovered any)) {
+func (p *Pool[K]) SetPanicHandler(fn func(recovered any)) {
 	p.mu.Lock()
 	p.onPanic = fn
 	p.mu.Unlock()
 }
 
-func (p *Pool) run(task func()) {
+func (p *Pool[K]) run(task func()) {
 	defer func() {
 		if r := recover(); r != nil {
 			p.mu.Lock()
@@ -74,65 +67,49 @@ func (p *Pool) run(task func()) {
 	task()
 }
 
-func (p *Pool) work() {
+func (p *Pool[K]) work() {
 	for {
 		p.mu.Lock()
-		var task queuedTask
-		for {
-			if p.closed && len(p.tasks) == 0 {
+		task, ok := p.tasks.pop()
+		for !ok {
+			if p.closed && p.tasks.pending == 0 {
 				p.mu.Unlock()
 				return
 			}
-			index := -1
-			for i, candidate := range p.tasks {
-				if candidate.key == nil {
-					index = i
-					break
-				}
-				if _, busy := p.active[candidate.key]; !busy {
-					index = i
-					break
-				}
-			}
-			if index >= 0 {
-				task = p.tasks[index]
-				copy(p.tasks[index:], p.tasks[index+1:])
-				p.tasks[len(p.tasks)-1] = queuedTask{}
-				p.tasks = p.tasks[:len(p.tasks)-1]
-				if task.key != nil {
-					p.active[task.key] = struct{}{}
-				}
-				break
-			}
 			p.ready.Wait()
+			task, ok = p.tasks.pop()
 		}
 		p.mu.Unlock()
 
 		p.run(task.run)
-		if task.key != nil {
-			p.mu.Lock()
-			delete(p.active, task.key)
-			p.ready.Broadcast()
-			p.mu.Unlock()
+		p.mu.Lock()
+		if p.tasks.complete(task) {
+			p.ready.Signal()
 		}
+		if p.closed && p.tasks.pending == 0 {
+			p.ready.Broadcast()
+		}
+		p.mu.Unlock()
 	}
 }
 
 // Submit enqueues a task, returning ErrFull when the queue is saturated or
 // ErrClosed after Stop.
-func (p *Pool) Submit(task func()) error {
-	return p.submit(nil, task)
+func (p *Pool[K]) Submit(task func()) error {
+	var key K
+	return p.submit(key, false, task)
 }
 
 // SubmitSerial queues task in arrival order for key. While a task with that
 // key runs, workers skip its successors and can execute other connections'
-// tasks. key must be comparable and non-nil. Pending tasks share the pool's
+// tasks. Keys are checked by the type system; their zero value is valid.
+// Pending tasks share the pool's
 // normal queue capacity.
-func (p *Pool) SubmitSerial(key any, task func()) error {
-	return p.submit(key, task)
+func (p *Pool[K]) SubmitSerial(key K, task func()) error {
+	return p.submit(key, true, task)
 }
 
-func (p *Pool) submit(key any, task func()) error {
+func (p *Pool[K]) submit(key K, serial bool, task func()) error {
 	if task == nil {
 		return nil
 	}
@@ -141,16 +118,17 @@ func (p *Pool) submit(key any, task func()) error {
 	if p.closed {
 		return ErrClosed
 	}
-	if len(p.tasks) >= p.capacity {
+	if !p.tasks.push(task, key, serial) {
 		return ErrFull
 	}
-	p.tasks = append(p.tasks, queuedTask{run: task, key: key})
-	p.ready.Signal()
+	if p.tasks.ready.head != 0 {
+		p.ready.Signal()
+	}
 	return nil
 }
 
 // Stop closes the queue, drains pending tasks and waits for the workers.
-func (p *Pool) Stop() {
+func (p *Pool[K]) Stop() {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()

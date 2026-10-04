@@ -7,4 +7,4 @@ coverage.*
 .idea/
 .vscode/
 configs/config.json
-tasks
+/tasks

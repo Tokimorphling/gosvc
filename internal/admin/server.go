@@ -19,6 +19,7 @@ import (
 
 	"github.com/Tokimorphling/gosvc/config"
 	"github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/internal/shutdown"
 	"github.com/Tokimorphling/gosvc/logging"
 	"github.com/Tokimorphling/gosvc/observability"
 	"github.com/Tokimorphling/gosvc/store"
@@ -296,10 +297,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	go func() {
 		defer close(done)
 		<-serveCtx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := shutdown.Context(ctx, 5*time.Second)
 		defer cancel()
 		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
 			s.logger.Warn("admin graceful shutdown returned error", "error", err)
+			_ = s.httpServer.Close()
 		}
 	}()
 

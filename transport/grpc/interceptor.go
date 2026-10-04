@@ -23,6 +23,25 @@ import (
 
 const requestIDKey = "x-request-id"
 
+type accessIdentityKey struct{}
+
+// Authentication runs inside the access logger so rejected calls are logged.
+// This request-local holder carries the resolved identity back to that logger.
+type accessIdentity struct{ identity *auth.Identity }
+
+func recordAccessIdentity(ctx context.Context, identity *auth.Identity) {
+	if state, ok := ctx.Value(accessIdentityKey{}).(*accessIdentity); ok {
+		state.identity = identity
+	}
+}
+
+func (a *accessIdentity) attrs() []any {
+	if a.identity == nil {
+		return nil
+	}
+	return []any{"subject", a.identity.Subject, "auth_method", string(a.identity.Method)}
+}
+
 func recoveryInterceptor(logger *slog.Logger) ggrpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *ggrpc.UnaryServerInfo, handler ggrpc.UnaryHandler) (resp any, err error) {
 		defer func() {
@@ -79,6 +98,7 @@ func authInterceptor(authenticator *auth.Authenticator) ggrpc.UnaryServerInterce
 		}
 
 		ctx = auth.WithIdentity(ctx, identity)
+		recordAccessIdentity(ctx, identity)
 		ctx = logging.WithLogger(ctx, logging.FromContext(ctx).With(
 			"subject", identity.Subject,
 			"auth_method", string(identity.Method),
@@ -89,6 +109,8 @@ func authInterceptor(authenticator *auth.Authenticator) ggrpc.UnaryServerInterce
 
 func loggingInterceptor(recorder store.Recorder, accessLogger *slog.Logger) ggrpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *ggrpc.UnaryServerInfo, handler ggrpc.UnaryHandler) (any, error) {
+		identity := &accessIdentity{}
+		ctx = context.WithValue(ctx, accessIdentityKey{}, identity)
 		start := time.Now()
 		resp, err := handler(ctx, req)
 
@@ -98,6 +120,7 @@ func loggingInterceptor(recorder store.Recorder, accessLogger *slog.Logger) ggrp
 			"latency_ms", float64(time.Since(start).Microseconds()) / 1000.0,
 			"peer", peerAddr(ctx),
 		}
+		fields = append(fields, identity.attrs()...)
 		if accessLogger != nil {
 			accessLogger.Info("grpc request", append(logging.RequestAttrs(ctx), fields...)...)
 		} else {
@@ -124,7 +147,7 @@ func metricsInterceptor(metrics *observability.Metrics) ggrpc.UnaryServerInterce
 
 func rateLimitInterceptor(limiter *ratelimit.Limiter) ggrpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *ggrpc.UnaryServerInfo, handler ggrpc.UnaryHandler) (any, error) {
-		if limiter != nil && !limiter.Allow(peerKey(ctx)) {
+		if !isHealthMethod(info.FullMethod) && limiter != nil && !limiter.Allow(peerKey(ctx)) {
 			return nil, status.Error(codes.ResourceExhausted, "rate limit exceeded")
 		}
 		return handler(ctx, req)
@@ -147,8 +170,12 @@ func credentialsFromMetadata(ctx context.Context) (bearer, apiKey string) {
 
 // isPublicMethod keeps health checks and reflection usable without credentials.
 func isPublicMethod(method string) bool {
-	return strings.HasPrefix(method, "/grpc.health.v1.Health/") ||
+	return isHealthMethod(method) ||
 		strings.HasPrefix(method, "/grpc.reflection.")
+}
+
+func isHealthMethod(method string) bool {
+	return strings.HasPrefix(method, "/grpc.health.v1.Health/")
 }
 
 func peerAddr(ctx context.Context) string {
@@ -238,6 +265,7 @@ func authStreamInterceptor(authenticator *auth.Authenticator) ggrpc.StreamServer
 		}
 
 		ctx := auth.WithIdentity(ss.Context(), identity)
+		recordAccessIdentity(ctx, identity)
 		ctx = logging.WithLogger(ctx, logging.FromContext(ctx).With(
 			"subject", identity.Subject,
 			"auth_method", string(identity.Method),
@@ -248,6 +276,8 @@ func authStreamInterceptor(authenticator *auth.Authenticator) ggrpc.StreamServer
 
 func loggingStreamInterceptor(recorder store.Recorder, accessLogger *slog.Logger) ggrpc.StreamServerInterceptor {
 	return func(srv any, ss ggrpc.ServerStream, info *ggrpc.StreamServerInfo, handler ggrpc.StreamHandler) error {
+		identity := &accessIdentity{}
+		ss = &serverStream{ServerStream: ss, ctx: context.WithValue(ss.Context(), accessIdentityKey{}, identity)}
 		start := time.Now()
 		err := handler(srv, ss)
 
@@ -258,6 +288,7 @@ func loggingStreamInterceptor(recorder store.Recorder, accessLogger *slog.Logger
 			"peer", peerAddr(ss.Context()),
 			"stream", true,
 		}
+		fields = append(fields, identity.attrs()...)
 		if accessLogger != nil {
 			accessLogger.Info("grpc request", append(logging.RequestAttrs(ss.Context()), fields...)...)
 		} else {
@@ -284,7 +315,7 @@ func metricsStreamInterceptor(metrics *observability.Metrics) ggrpc.StreamServer
 
 func rateLimitStreamInterceptor(limiter *ratelimit.Limiter) ggrpc.StreamServerInterceptor {
 	return func(srv any, ss ggrpc.ServerStream, info *ggrpc.StreamServerInfo, handler ggrpc.StreamHandler) error {
-		if limiter != nil && !limiter.Allow(peerKey(ss.Context())) {
+		if !isHealthMethod(info.FullMethod) && limiter != nil && !limiter.Allow(peerKey(ss.Context())) {
 			return status.Error(codes.ResourceExhausted, "rate limit exceeded")
 		}
 		return handler(srv, ss)

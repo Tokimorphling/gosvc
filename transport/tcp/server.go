@@ -38,6 +38,7 @@ import (
 	"github.com/Tokimorphling/gosvc/apierror"
 	"github.com/Tokimorphling/gosvc/config"
 	"github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/internal/shutdown"
 	"github.com/Tokimorphling/gosvc/internal/workerpool"
 	"github.com/Tokimorphling/gosvc/jsonrpc"
 	"github.com/Tokimorphling/gosvc/logging"
@@ -81,7 +82,7 @@ type Options struct {
 type Server struct {
 	eventLoop  netpoll.EventLoop
 	listener   net.Listener
-	pool       *workerpool.Pool
+	pool       *workerpool.Pool[*connState]
 	dispatcher *jsonrpc.Dispatcher
 	cfg        config.TCPConfig
 	logger     *slog.Logger
@@ -165,7 +166,7 @@ func New(opts Options) (*Server, error) {
 
 	s := &Server{
 		listener:   listener,
-		pool:       workerpool.New(opts.Config.TCP.Workers, opts.Config.TCP.QueueSize),
+		pool:       workerpool.New[*connState](opts.Config.TCP.Workers, opts.Config.TCP.QueueSize),
 		dispatcher: dispatcher,
 		cfg:        opts.Config.TCP,
 		logger:     opts.Logger,
@@ -238,6 +239,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	go func() {
 		defer close(done)
 		<-shutdownSignal.Done()
+		shutdownCtx, cancel := shutdown.Context(ctx, s.cfg.ShutdownTimeout.D())
+		defer cancel()
 		s.draining.Store(true)
 		s.notifyShutdown()
 		if ctx.Err() != nil {
@@ -246,6 +249,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			select {
 			case <-time.After(shutdownGrace):
 			case <-serveDone:
+			case <-shutdownCtx.Done():
 			}
 		}
 		// Closing the original listener makes a cancellation that beats
@@ -255,9 +259,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
 		for {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.D())
 			err := s.eventLoop.Shutdown(shutdownCtx)
-			cancel()
 			if err != nil {
 				s.logger.Warn("tcp shutdown returned error", "error", err)
 			}

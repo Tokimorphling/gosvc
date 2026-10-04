@@ -4,8 +4,8 @@
 //
 // Typical usage:
 //
-//	cfg := &config.Config{}
-//	if err := config.Load("config.json", cfg); err != nil {
+//	cfg, err := (config.Source{Path: "config.toml"}).Load[config.Config]()
+//	if err != nil {
 //		log.Fatal(err)
 //	}
 //	logHandle, err := logging.New(cfg.Log, cfg.Service.Name, cfg.Service.Env, "v1.0.0")
@@ -14,7 +14,7 @@
 //	}
 //	slog.SetDefault(logHandle.Logger())
 //
-//	app, err := gosvc.New(cfg, gosvc.WithLogger(logHandle), gosvc.WithHotReload("config.json", "MYAPP"))
+//	app, err := gosvc.New(cfg, gosvc.WithLogger(logHandle), gosvc.WithHotReload("config.toml", "MYAPP"))
 //	if err != nil {
 //		log.Fatal(err)
 //	}
@@ -37,10 +37,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/cloudwego/hertz/pkg/app/server"
 	"golang.org/x/sync/errgroup"
@@ -51,6 +49,7 @@ import (
 	"github.com/Tokimorphling/gosvc/health"
 	"github.com/Tokimorphling/gosvc/internal/admin"
 	"github.com/Tokimorphling/gosvc/internal/reload"
+	"github.com/Tokimorphling/gosvc/internal/shutdown"
 	"github.com/Tokimorphling/gosvc/internal/telemetry"
 	"github.com/Tokimorphling/gosvc/internal/version"
 	"github.com/Tokimorphling/gosvc/jsonrpc"
@@ -74,115 +73,6 @@ var ErrClosed = errors.New("gosvc: application closed")
 // ErrStorageDisabled is returned by WithStore and WithPostgres when their
 // respective connection is not currently enabled.
 var ErrStorageDisabled = errors.New("gosvc: storage is disabled")
-
-// Option customises the runtime.
-type Option func(*options)
-
-type options struct {
-	logger      *logging.Handle
-	version     string
-	hotReload   bool
-	source      config.Source
-	publicPaths []string
-	onReload    func(*config.Config) error
-
-	tcpCodec          tcptransport.Codec
-	tcpCallbacks      tcptransport.Callbacks
-	tcpDispatcher     *jsonrpc.Dispatcher
-	jsonrpcMiddleware []jsonrpc.Middleware
-
-	onShutdown []func()
-}
-
-// WithLogger supplies the logging handle. When omitted, the runtime builds one
-// from cfg.Log.
-func WithLogger(handle *logging.Handle) Option {
-	return func(o *options) { o.logger = handle }
-}
-
-// WithVersion overrides the build version reported by telemetry and the admin
-// /version endpoint.
-func WithVersion(v string) Option {
-	return func(o *options) { o.version = v }
-}
-
-// WithHotReload watches path and applies reloadable settings (log, auth,
-// limiter) at runtime. envPrefix selects the environment variable prefix used
-// when re-reading the file; empty means "GOSVC".
-func WithHotReload(path, envPrefix string) Option {
-	return func(o *options) {
-		o.hotReload = true
-		o.source = config.Source{Path: path, EnvPrefix: envPrefix, StrictRuntime: true}
-	}
-}
-
-// WithPublicPaths lets the listed HTTP paths bypass authentication, in
-// addition to /healthz and /readyz.
-func WithPublicPaths(paths ...string) Option {
-	return func(o *options) { o.publicPaths = append(o.publicPaths, paths...) }
-}
-
-// WithOnReload registers an application hook invoked after the runtime applied
-// its own reloadable sections. Use it to reload application-specific settings.
-// The hook runs inside the reload transaction and must not call Reload; before
-// Run, it must not call Close either, as both wait for that transaction.
-func WithOnReload(fn func(*config.Config) error) Option {
-	return func(o *options) { o.onReload = fn }
-}
-
-// WithTCPCodec installs a custom frame dialect on the TCP transport (see
-// transport/tcp.Codec). Nil keeps the strict JSON-RPC 2.0 behaviour.
-func WithTCPCodec(codec tcptransport.Codec) Option {
-	return func(o *options) { o.tcpCodec = codec }
-}
-
-// WithTCPCallbacks installs connection lifecycle callbacks on the TCP
-// transport: OnConnect runs when a connection is established (and eagerly
-// creates its push Session), OnDisconnect exactly once when it ends. Use it
-// for reliable connection-keyed registry cleanup.
-func WithTCPCallbacks(cb tcptransport.Callbacks) Option {
-	return func(o *options) { o.tcpCallbacks = cb }
-}
-
-// WithJSONRPCMiddleware appends middlewares to the shared JSON-RPC
-// dispatcher. They apply to every method on every transport that dispatches
-// through it (HTTP /rpc, TCP default path and custom codecs), which makes
-// them the natural place for per-method authorisation, validation or
-// feature switches. Equivalent to calling Dispatcher.Use inside
-// RegisterJSONRPC.
-func WithJSONRPCMiddleware(mw ...jsonrpc.Middleware) Option {
-	return func(o *options) { o.jsonrpcMiddleware = append(o.jsonrpcMiddleware, mw...) }
-}
-
-// WithTCPDispatcher gives the TCP transport a dedicated method table. The
-// shared dispatcher stays with the HTTP /rpc endpoint; the TCP transport
-// dispatches only on the given dispatcher, which the application builds and
-// populates before gosvc.New. Use it to keep a wire-specific protocol (for
-// example stratum mining.*) off HTTP /rpc or to apply different middleware.
-// The runtime installs its default metrics observer unless the dispatcher
-// already has one, so per-method RPC metrics are recorded without wiring;
-// call SetObserver first to substitute a different observer. RegisterJSONRPC
-// still registers on the shared dispatcher.
-func WithTCPDispatcher(d *jsonrpc.Dispatcher) Option {
-	return func(o *options) { o.tcpDispatcher = d }
-}
-
-// WithOnShutdown registers hooks that run when a started application shuts
-// down, after serving has been asked to stop and before the transports close
-// their connections: queues can still be drained to live clients there, which
-// is the right phase for push.Broker.Shutdown, flushing producers or closing
-// registries. The hooks run once, in the order given, and must return
-// promptly — a blocked hook delays the shutdown of every transport until its
-// own timeout. They do not run when the application is closed before Run.
-func WithOnShutdown(fn ...func()) Option {
-	return func(o *options) {
-		for _, hook := range fn {
-			if hook != nil {
-				o.onShutdown = append(o.onShutdown, hook)
-			}
-		}
-	}
-}
 
 // App owns every transport, the shared dependencies and the lifecycle.
 type App struct {
@@ -236,6 +126,9 @@ func New(cfg *config.Config, opts ...Option) (app *App, err error) {
 			return nil, errors.New("gosvc: nil option")
 		}
 		opt(&o)
+	}
+	if o.shutdownTimeout < 0 {
+		return nil, errors.New("gosvc: shutdown timeout must not be negative")
 	}
 
 	logHandle := o.logger
@@ -408,76 +301,6 @@ func New(cfg *config.Config, opts ...Option) (app *App, err error) {
 	return a, nil
 }
 
-// RegisterHTTP adds routes to the Hertz engine. It must be called before Run.
-func (a *App) RegisterHTTP(fn func(*server.Hertz)) error {
-	if fn == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.closed {
-		return ErrClosed
-	}
-	if a.started {
-		return ErrStarted
-	}
-	a.httpRegs = append(a.httpRegs, fn)
-	return nil
-}
-
-// RegisterGRPC registers gRPC services. It must be called before Run.
-func (a *App) RegisterGRPC(fn func(*ggrpc.Server)) error {
-	if fn == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.closed {
-		return ErrClosed
-	}
-	if a.started {
-		return ErrStarted
-	}
-	a.grpcRegs = append(a.grpcRegs, fn)
-	return nil
-}
-
-// RegisterJSONRPC registers JSON-RPC methods on the shared dispatcher used by
-// both the HTTP /rpc endpoint and the TCP transport. It must be called before
-// Run.
-func (a *App) RegisterJSONRPC(fn func(*jsonrpc.Dispatcher)) error {
-	if fn == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.closed {
-		return ErrClosed
-	}
-	if a.started {
-		return ErrStarted
-	}
-	a.rpcRegs = append(a.rpcRegs, fn)
-	return nil
-}
-
-// RegisterAdmin adds routes to the admin mux. It must be called before Run.
-func (a *App) RegisterAdmin(fn func(*http.ServeMux)) error {
-	if fn == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.closed {
-		return ErrClosed
-	}
-	if a.started {
-		return ErrStarted
-	}
-	a.adminRegs = append(a.adminRegs, fn)
-	return nil
-}
-
 // Run applies pending registrations, serves until ctx is cancelled or a server
 // fails, then shuts down gracefully. It returns nil on a clean shutdown.
 func (a *App) Run(ctx context.Context) error {
@@ -545,13 +368,21 @@ func (a *App) Run(ctx context.Context) error {
 	// transports still serve, so a drain (push.Broker.Shutdown) still
 	// reaches live clients; only afterwards do the transports stop.
 	group, groupCtx := errgroup.WithContext(runCtx)
-	serveCtx, stopServing := context.WithCancel(context.WithoutCancel(groupCtx))
+	budgetCtx, budget := shutdown.WithBudget(context.WithoutCancel(groupCtx))
+	serveCtx, stopServing := context.WithCancel(budgetCtx)
+	defer stopServing()
+	shutdownDone := make(chan error, 1)
 	go func() {
 		<-groupCtx.Done()
-		for _, hook := range a.opts.onShutdown {
-			hook()
-		}
+		a.ready.Set(false)
+		a.grpc.BeginShutdown()
+		timeout := a.shutdownTimeout(cfg)
+		budget.Start(timeout)
+		shutdownCtx, cancel := shutdown.Context(serveCtx, timeout)
+		defer cancel()
+		err := a.runShutdownHooks(shutdownCtx)
 		stopServing()
+		shutdownDone <- err
 	}()
 	group.Go(func() error { return a.http.Serve(serveCtx) })
 	group.Go(func() error { return a.grpc.Serve(serveCtx) })
@@ -570,9 +401,10 @@ func (a *App) Run(ctx context.Context) error {
 	})
 
 	err := group.Wait()
+	shutdownErr := <-shutdownDone
 
 	logger.Info("service stopped")
-	return errors.Join(err, a.closeResources())
+	return errors.Join(err, shutdownErr, a.closeResources())
 }
 
 // Close releases resources allocated by New. Before Run it closes the bound
@@ -595,63 +427,6 @@ func (a *App) Close() error {
 	}
 	return a.closeResources()
 }
-
-func (a *App) closeResources() error {
-	a.closeOnce.Do(func() {
-		a.mu.Lock()
-		a.closed = true
-		a.mu.Unlock()
-		a.reloadMu.Lock()
-		defer a.reloadMu.Unlock()
-		if a.ready != nil {
-			a.ready.Set(false)
-		}
-		var errs []error
-		closeListener := func(err error) {
-			if err != nil && !errors.Is(err, net.ErrClosed) {
-				errs = append(errs, err)
-			}
-		}
-		if a.admin != nil {
-			closeListener(a.admin.Close())
-		}
-		if a.tcp != nil {
-			closeListener(a.tcp.Close())
-		}
-		if a.grpc != nil {
-			closeListener(a.grpc.Close())
-		}
-		if a.http != nil {
-			closeListener(a.http.Close())
-		}
-		if a.telemetry != nil && a.telemetry.Enabled() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			errs = append(errs, a.telemetry.Shutdown(shutdownCtx))
-			cancel()
-		}
-		a.storageMu.Lock()
-		state := a.storage
-		a.storage = nil
-		if a.recorders != nil {
-			a.recorders.Set(nil)
-		}
-		idle := retireStorage(state)
-		a.storageMu.Unlock()
-		if idle != nil {
-			<-idle
-		}
-		a.stopStorage(state)
-		if a.ownsLog {
-			errs = append(errs, a.log.Close())
-		}
-		a.closeErr = errors.Join(errs...)
-	})
-	return a.closeErr
-}
-
-// Reload re-reads the configuration file and applies the reloadable sections
-// (log, auth, limiter), then calls the WithOnReload hook. It backs the admin
-// POST /debug/reload endpoint.
 
 // CurrentConfig returns a redacted snapshot for the admin API.
 func (a *App) CurrentConfig() *config.Config {

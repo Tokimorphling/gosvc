@@ -34,7 +34,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/Tokimorphling/gosvc/observability"
+	"github.com/Tokimorphling/gosvc/state"
 )
 
 // Sink is one pushable destination.
@@ -52,6 +52,15 @@ type Sink interface {
 	Close() error
 	// ID identifies the sink for logs and error messages.
 	ID() string
+}
+
+// Observer receives broker metrics without coupling fan-out to a monitoring
+// backend. observability.Metrics implements it. Methods must be concurrency
+// safe, non-blocking, and must not reenter the broker. Nil disables metrics.
+type Observer interface {
+	SetBrokerSubscribers(name string, count int)
+	ObserveBrokerDelivered(name string)
+	ObserveBrokerDropped(name, reason string)
 }
 
 // ErrDropped tells the broker that a sink discarded one event but remains
@@ -86,7 +95,7 @@ type Broker[T any] struct {
 
 	queueSize int
 	policy    Policy
-	metrics   atomic.Pointer[observability.Metrics]
+	metrics   state.Snapshot[Observer]
 }
 
 // The option plumbing is declared once and accepted by every Broker[T]
@@ -95,7 +104,7 @@ type brokerConfig struct {
 	name      string
 	queueSize int
 	policy    Policy
-	metrics   *observability.Metrics
+	metrics   Observer
 }
 
 func newBrokerConfig(name string, opts ...BrokerOption) brokerConfig {
@@ -125,7 +134,7 @@ func WithPolicy(p Policy) BrokerOption {
 }
 
 // WithMetrics wires the delivery/drop counters.
-func WithMetrics(m *observability.Metrics) BrokerOption {
+func WithMetrics(m Observer) BrokerOption {
 	return func(c *brokerConfig) { c.metrics = m }
 }
 
@@ -146,10 +155,12 @@ func NewBroker[T any](name string, opts ...BrokerOption) *Broker[T] {
 // metrics bundle only becomes available later in startup. It is safe to call
 // while events are being delivered and initializes the new subscriber gauge
 // to the current count.
-func (b *Broker[T]) SetMetrics(m *observability.Metrics) {
+func (b *Broker[T]) SetMetrics(m Observer) {
 	b.mu.Lock()
 	b.metrics.Store(m)
-	m.SetBrokerSubscribers(b.name, b.count)
+	if m != nil {
+		m.SetBrokerSubscribers(b.name, b.count)
+	}
 	b.mu.Unlock()
 }
 
@@ -250,12 +261,20 @@ func (b *Broker[T]) remove(sub *Subscription[T]) {
 }
 
 func (b *Broker[T]) reportSubscribers() {
-	b.metrics.Load().SetBrokerSubscribers(b.name, b.count)
+	if m := b.metrics.Load(); m != nil {
+		m.SetBrokerSubscribers(b.name, b.count)
+	}
 }
 
-func (b *Broker[T]) observeDelivered() { b.metrics.Load().ObserveBrokerDelivered(b.name) }
+func (b *Broker[T]) observeDelivered() {
+	if m := b.metrics.Load(); m != nil {
+		m.ObserveBrokerDelivered(b.name)
+	}
+}
 func (b *Broker[T]) observeDropped(reason string) {
-	b.metrics.Load().ObserveBrokerDropped(b.name, reason)
+	if m := b.metrics.Load(); m != nil {
+		m.ObserveBrokerDropped(b.name, reason)
+	}
 }
 
 // Subscription is the handle of one subscriber. Unsubscribe is idempotent;

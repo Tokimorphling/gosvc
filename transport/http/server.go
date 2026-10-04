@@ -9,12 +9,14 @@ import (
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app/server"
+	hconfig "github.com/cloudwego/hertz/pkg/common/config"
 	"github.com/cloudwego/hertz/pkg/common/hlog"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Tokimorphling/gosvc/auth"
 	"github.com/Tokimorphling/gosvc/config"
 	"github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/internal/shutdown"
 	"github.com/Tokimorphling/gosvc/internal/tlsutil"
 	"github.com/Tokimorphling/gosvc/jsonrpc"
 	"github.com/Tokimorphling/gosvc/observability"
@@ -73,13 +75,13 @@ func New(opts Options) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen http: %w", err)
 	}
-	listener, err = tlsutil.Wrap(listener, opts.Config.HTTP.TLS)
+	tlsConfig, err := tlsutil.Load(opts.Config.HTTP.TLS)
 	if err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("http tls: %w", err)
 	}
 
-	engine := server.New(
+	engineOptions := []hconfig.Option{
 		server.WithListener(listener),
 		server.WithReadTimeout(opts.Config.HTTP.ReadTimeout.D()),
 		server.WithWriteTimeout(opts.Config.HTTP.WriteTimeout.D()),
@@ -90,7 +92,13 @@ func New(opts Options) (*Server, error) {
 		// Sense client disconnects so long-lived handlers (SSE streams) see
 		// ctx.Done when the client goes away.
 		server.WithSenseClientDisconnection(true),
-	)
+	}
+	if tlsConfig != nil {
+		// WithTLS selects Hertz's standard transport; netpoll cannot accept
+		// a tls.Listener. Keep the raw listener and let Hertz do the handshake.
+		engineOptions = append(engineOptions, server.WithTLS(tlsConfig))
+	}
+	engine := server.New(engineOptions...)
 
 	dispatcher := opts.Dispatcher
 	if dispatcher == nil {
@@ -167,7 +175,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			case <-ticker.C:
 			}
 		}
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.D())
+		shutdownCtx, cancel := shutdown.Context(ctx, s.cfg.ShutdownTimeout.D())
 		defer cancel()
 		if err := s.engine.Shutdown(shutdownCtx); err != nil {
 			s.logger.Warn("http graceful shutdown returned error", "error", err)

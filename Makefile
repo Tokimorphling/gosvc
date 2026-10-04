@@ -7,7 +7,7 @@ LDFLAGS    := -s -w \
 	-X $(MODULE)/examples/app.Commit=$(COMMIT) \
 	-X $(MODULE)/examples/app.BuildTime=$(BUILD_TIME)
 
-.PHONY: all build run test race vet fmt lint proto clean docker help
+.PHONY: all build run test race vet fmt lint proto clean docker help bench-core
 
 all: build
 
@@ -58,6 +58,10 @@ kitex:
 ## bench: smoke-run the load generator against a local instance
 bench: build
 	./bin/bench -mode rest -http-addr 127.0.0.1:8080 -c 20 -d 5s
+
+## bench-core: measure dispatch, readiness and bounded scheduling without IO
+bench-core:
+	go test ./jsonrpc ./health ./internal/workerpool -run '^$$' -bench 'BenchmarkDispatcher|BenchmarkReadiness|BenchmarkPoolBacklog' -benchmem -benchtime=300ms -count=5 -cpu=8
 
 ## clean: remove build artifacts
 clean:

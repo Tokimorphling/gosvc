@@ -1,0 +1,27 @@
+[service]
+name = "tasks"
+env = "dev"
+
+[http]
+host = "127.0.0.1"
+port = 8080
+handlerTimeout = "3s"
+
+[http.cors]
+enabled = false
+
+# No business gRPC methods in this small sample; health/reflection remain available.
+[grpc]
+host = "127.0.0.1"
+port = 9090
+
+[admin]
+host = "127.0.0.1"
+port = 6060
+
+[log]
+format = "json"
+
+[tasks]
+maxTitleLen = 128
+maxTasks = 1000

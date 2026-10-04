@@ -119,6 +119,70 @@ func TestClientHTTPPropagatesRPCError(t *testing.T) {
 	}
 }
 
+func TestHTTPNotificationsReportTransportFailures(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+		kind   apierror.Kind
+	}{
+		{200, "", ""}, {202, "", ""}, {204, "", ""},
+		{401, `{"error":{"code":"unauthenticated","message":"missing API key"}}`, apierror.KindUnauthenticated},
+		{429, `{"error":{"code":"rate_limited","message":"busy"}}`, apierror.KindRateLimited},
+		{500, `{"error":{"code":"internal","message":"internal server error"}}`, apierror.KindInternal},
+		{503, "proxy unavailable", apierror.KindUnknown},
+	} {
+		t.Run(fmt.Sprint(tc.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			client := NewHTTPClient(server.URL)
+			defer client.Close()
+			err := client.Notify(t.Context(), "event", struct{}{})
+			if tc.status < 300 {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || apierror.KindOf(err) != tc.kind {
+				t.Fatalf("Notify = %v, want kind %q", err, tc.kind)
+			}
+		})
+	}
+}
+
+func TestHTTPClientBoundsUnresponsiveServer(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		opts   []ClientOption
+		budget time.Duration
+	}{
+		{"default", nil, defaultTimeout},
+		{"configured", []ClientOption{WithTimeout(30 * time.Millisecond)}, 30 * time.Millisecond},
+		{"custom-client", []ClientOption{WithHTTPClient(&http.Client{Timeout: 30 * time.Millisecond})}, 30 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				<-r.Context().Done()
+			}))
+			defer server.Close()
+			client := NewHTTPClient(server.URL, tc.opts...)
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(t.Context(), tc.budget+2*time.Second)
+			defer cancel()
+			_, err := client.Call[struct{}, any](ctx, "slow", struct{}{})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Call = %v", err)
+			}
+			if ctx.Err() != nil {
+				t.Fatal("client waited for caller deadline instead of its own budget")
+			}
+		})
+	}
+}
+
 func TestClientTCP(t *testing.T) {
 	d := newEchoDispatcher()
 

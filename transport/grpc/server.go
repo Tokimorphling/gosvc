@@ -6,18 +6,18 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel/trace"
 	ggrpc "google.golang.org/grpc"
-	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/credentials"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
 	"github.com/Tokimorphling/gosvc/auth"
 	"github.com/Tokimorphling/gosvc/config"
 	apphealth "github.com/Tokimorphling/gosvc/health"
+	"github.com/Tokimorphling/gosvc/internal/shutdown"
 	"github.com/Tokimorphling/gosvc/internal/tlsutil"
 	"github.com/Tokimorphling/gosvc/observability"
 	"github.com/Tokimorphling/gosvc/ratelimit"
@@ -44,7 +44,7 @@ type Options struct {
 type Server struct {
 	server   *ggrpc.Server
 	listener net.Listener
-	health   *health.Server
+	health   *readinessHealth
 	cfg      config.GRPCConfig
 	logger   *slog.Logger
 	ready    *apphealth.Ready
@@ -56,7 +56,7 @@ func New(opts Options) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen grpc: %w", err)
 	}
-	listener, err = tlsutil.Wrap(listener, opts.Config.GRPC.TLS)
+	tlsConfig, err := tlsutil.Load(opts.Config.GRPC.TLS)
 	if err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("grpc tls: %w", err)
@@ -64,23 +64,27 @@ func New(opts Options) (*Server, error) {
 
 	serverOptions := []ggrpc.ServerOption{
 		ggrpc.ChainUnaryInterceptor(
-			recoveryInterceptor(opts.Logger),
 			requestIDInterceptor(),
 			traceInterceptor(),
-			authInterceptor(opts.Authenticator),
 			loggingInterceptor(opts.Recorder, opts.AccessLogger),
 			metricsInterceptor(opts.Metrics),
+			recoveryInterceptor(opts.Logger),
+			authInterceptor(opts.Authenticator),
 			rateLimitInterceptor(opts.Limiter),
 		),
 		ggrpc.ChainStreamInterceptor(
-			recoveryStreamInterceptor(opts.Logger),
 			requestIDStreamInterceptor(),
 			traceStreamInterceptor(),
-			authStreamInterceptor(opts.Authenticator),
 			loggingStreamInterceptor(opts.Recorder, opts.AccessLogger),
 			metricsStreamInterceptor(opts.Metrics),
+			recoveryStreamInterceptor(opts.Logger),
+			authStreamInterceptor(opts.Authenticator),
 			rateLimitStreamInterceptor(opts.Limiter),
 		),
+	}
+	if tlsConfig != nil {
+		// gRPC credentials configure ALPN h2 and populate peer.AuthInfo.
+		serverOptions = append(serverOptions, ggrpc.Creds(credentials.NewTLS(tlsConfig)))
 	}
 	if opts.Tracer != nil {
 		serverOptions = append(serverOptions, ggrpc.StatsHandler(otelgrpc.NewServerHandler()))
@@ -88,7 +92,7 @@ func New(opts Options) (*Server, error) {
 
 	server := ggrpc.NewServer(serverOptions...)
 
-	healthServer := health.NewServer()
+	healthServer := newReadinessHealth(opts.Ready, server.GetServiceInfo)
 	healthpb.RegisterHealthServer(server, healthServer)
 	reflection.Register(server)
 
@@ -119,24 +123,29 @@ func (s *Server) Close() error { return s.listener.Close() }
 func (s *Server) Serve(ctx context.Context) error {
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	s.health.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	s.health.refresh(serveCtx)
+	healthDone := make(chan struct{})
+	go func() {
+		defer close(healthDone)
+		s.health.monitor(serveCtx)
+	}()
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		<-serveCtx.Done()
-		s.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
+		s.health.Shutdown()
 
 		drainDone := make(chan struct{})
 		go func() {
 			defer close(drainDone)
 			s.server.GracefulStop()
 		}()
-		timeout := time.NewTimer(s.cfg.ShutdownTimeout.D())
-		defer timeout.Stop()
+		shutdownCtx, cancel := shutdown.Context(ctx, s.cfg.ShutdownTimeout.D())
+		defer cancel()
 		select {
 		case <-drainDone:
-		case <-timeout.C:
+		case <-shutdownCtx.Done():
 			s.logger.Warn("grpc graceful stop timed out, forcing stop")
 			s.server.Stop()
 			<-drainDone
@@ -148,6 +157,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	err := s.server.Serve(s.listener)
 	cancel()
 	<-done
+	<-healthDone
 	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("grpc serve: %w", err)
 	}

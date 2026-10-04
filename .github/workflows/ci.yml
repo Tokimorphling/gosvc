@@ -46,3 +46,28 @@ jobs:
 
       - name: golangci-lint
         run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -f deploy/Dockerfile -t gosvc:ci .
+
+      - name: Start and probe the container
+        run: |
+          set -eu
+          container=$(docker run -d gosvc:ci)
+          trap 'docker logs "$container"; docker rm -f "$container"' EXIT
+          ready=false
+          for attempt in $(seq 1 30); do
+            if docker exec "$container" /app/gosvc -healthcheck http://127.0.0.1:6060/readyz; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker stop --time 15 "$container"
+          test "$(docker inspect -f '{{.State.ExitCode}}' "$container")" = 0

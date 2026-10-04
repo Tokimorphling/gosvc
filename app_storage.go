@@ -149,18 +149,17 @@ func (a *App) WithPostgres(fn func(*postgres.DB) error) error {
 // holding that generation's lease for the duration of the callback so a reload
 // cannot close the connection mid-flight. pick must return a pointer type, so
 // its zero value identifies "not enabled".
-func leaseStorage[T any](a *App, pick func(*storageState) T, fn func(T) error) error {
+func leaseStorage[T any](a *App, pick func(*storageState) *T, fn func(*T) error) error {
 	if fn == nil {
 		return errors.New("gosvc: nil storage callback")
 	}
 	a.storageMu.Lock()
 	state := a.storage
-	var conn T
+	var conn *T
 	if state != nil {
 		conn = pick(state)
 	}
-	var zero T
-	if state == nil || any(conn) == any(zero) {
+	if conn == nil {
 		a.storageMu.Unlock()
 		return ErrStorageDisabled
 	}

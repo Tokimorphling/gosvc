@@ -22,7 +22,7 @@ const (
 )
 
 func main() {
-	configPath := flag.String("c", defaultConfigFile, "path to the JSON config file")
+	configPath := flag.String("c", defaultConfigFile, "path to the TOML config file")
 	healthcheck := flag.String("healthcheck", "", "GET the given URL and exit 0 when it returns 200 (for container health checks)")
 	flag.Parse()
 
@@ -46,6 +46,7 @@ func run(configPath string) error {
 	if err != nil {
 		return err
 	}
+	defer logHandle.Close()
 	slog.SetDefault(logHandle.Logger())
 
 	application, err := app.Build(app.Options{

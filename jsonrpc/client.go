@@ -179,7 +179,7 @@ func WithNotificationHandler(fn NotificationHandler) ClientOption {
 // NewHTTPClient posts to baseURL + "/rpc", the endpoint served by
 // transport/http.
 func NewHTTPClient(baseURL string, opts ...ClientOption) *Client {
-	o := clientOptions{}
+	o := clientOptions{timeout: defaultTimeout}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -232,15 +232,16 @@ func (t *HTTPTransport) RoundTrip(ctx context.Context, request []byte) ([]byte, 
 	case http.StatusNoContent:
 		return nil, fmt.Errorf("jsonrpc: server returned no content for a request that expects a response")
 	default:
-		// The gosvc error mapping answers non-200 statuses with
-		// {"error":{"code":"<kind>","message":...}}; surface it as an
-		// *apierror.Error so callers can branch on the kind (for example
-		// unauthenticated) instead of string matching.
-		if kind, message := decodeErrorBody(body); kind != "" {
-			return nil, &apierror.Error{Kind: apierror.Kind(kind), Message: message, Op: fmt.Sprintf("http %d", resp.StatusCode)}
-		}
-		return nil, fmt.Errorf("jsonrpc: http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, httpResponseError(resp.StatusCode, body)
 	}
+}
+
+// httpResponseError preserves the same mapped errors for calls and notifications.
+func httpResponseError(status int, body []byte) error {
+	if kind, message := decodeErrorBody(body); kind != "" {
+		return &apierror.Error{Kind: apierror.Kind(kind), Message: message, Op: fmt.Sprintf("http %d", status)}
+	}
+	return fmt.Errorf("jsonrpc: http %d: %s", status, strings.TrimSpace(string(body)))
 }
 
 // decodeErrorBody extracts the transport error mapping from an HTTP error
@@ -267,8 +268,15 @@ func (t *HTTPTransport) Send(ctx context.Context, request []byte) error {
 	if err != nil {
 		return err
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.Body.Close()
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return fmt.Errorf("jsonrpc: read notification response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return httpResponseError(resp.StatusCode, body)
+	}
+	return nil
 }
 
 // Close implements Transport.

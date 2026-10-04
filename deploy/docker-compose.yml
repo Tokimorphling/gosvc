@@ -4,6 +4,9 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     image: gosvc:local
+    environment:
+      # Listen on the container interface; the published host port remains private.
+      GOSVC_ADMIN_ADDR: "0.0.0.0:6060"
     ports:
       - "8080:8080"   # REST + JSON-RPC
       - "9090:9090"   # gRPC

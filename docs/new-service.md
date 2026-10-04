@@ -3,7 +3,8 @@
 这份指南带你从零创建一个基于 `gosvc` 的服务：四协议（REST / JSON-RPC 2.0 / gRPC / TCP）、
 日志、指标、追踪、认证、限流、存储连接与热更新全部由库提供，你只写业务。
 
-> 完整可运行参考：`examples/app/`（greeter 示例，含端到端测试）。
+> 入门业务 sample：[examples/tasks](../examples/tasks/README.md)（待办事项、REST / JSON-RPC、内存存储）。
+> 完整能力参考：`examples/app/`（greeter 示例，含端到端测试）。
 
 ## 0. 前置
 

@@ -4,8 +4,12 @@ package health
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/Tokimorphling/gosvc/state"
 )
 
 // Check probes one dependency. It must respect ctx and return quickly.
@@ -15,14 +19,18 @@ type Check func(ctx context.Context) error
 // the dependency is disabled by configuration.
 var ErrSkipped = errors.New("check skipped")
 
-// Ready tracks the readiness flag plus named dependency checks. Transports use
-// IsReady for their fast path; the admin /readyz endpoint uses Check to report
-// per-dependency detail.
+// Ready tracks the readiness flag plus named dependency checks. Health
+// endpoints use Check; IsReady is the lifecycle flag for fast admission checks.
 type Ready struct {
 	ready atomic.Bool
 
-	mu     sync.RWMutex
-	checks map[string]Check
+	mu     sync.Mutex // registration only
+	checks state.Snapshot[[]namedCheck]
+}
+
+type namedCheck struct {
+	name  string
+	probe Check
 }
 
 // Set updates the readiness flag.
@@ -39,10 +47,15 @@ func (r *Ready) AddCheck(name string, check Check) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.checks == nil {
-		r.checks = make(map[string]Check)
+	checks := slices.Clone(r.checks.Load())
+	for i := range checks {
+		if checks[i].name == name {
+			checks[i].probe = check
+			r.checks.Store(checks)
+			return
+		}
 	}
-	r.checks[name] = check
+	r.checks.Store(append(checks, namedCheck{name: name, probe: check}))
 }
 
 // Check evaluates the readiness flag and every dependency probe. It returns
@@ -52,32 +65,54 @@ func (r *Ready) Check(ctx context.Context) (bool, map[string]string) {
 	if r == nil {
 		return true, nil
 	}
+	checks := r.checks.Load()
+	var details map[string]string
+	if len(checks) > 0 {
+		details = make(map[string]string, len(checks))
+	}
+	return r.evaluate(ctx, checks, details), details
+}
 
+// Healthy evaluates the same probes as Check without allocating a diagnostic
+// map. Use it for boolean/status-only readiness responses. IsReady only reads
+// the lifecycle flag and never probes dependencies.
+func (r *Ready) Healthy(ctx context.Context) bool {
+	if r == nil {
+		return true
+	}
+	return r.evaluate(ctx, r.checks.Load(), nil)
+}
+
+func (r *Ready) evaluate(ctx context.Context, checks []namedCheck, details map[string]string) bool {
 	ready := r.IsReady()
-
-	r.mu.RLock()
-	if len(r.checks) == 0 {
-		r.mu.RUnlock()
-		return ready, nil
+	if len(checks) == 0 {
+		return ready && ctx.Err() == nil
 	}
-	checks := make(map[string]Check, len(r.checks))
-	for name, check := range r.checks {
-		checks[name] = check
+	// Preserve an already tighter caller budget without another timer/context.
+	const timeout = 3 * time.Second
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > timeout {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
-	r.mu.RUnlock()
-
-	details := make(map[string]string, len(checks))
-	for name, check := range checks {
-		err := check(ctx)
+	for _, check := range checks {
+		err := check.probe(ctx)
+		var detail string
 		switch {
 		case err == nil:
-			details[name] = "ok"
+			detail = "ok"
 		case errors.Is(err, ErrSkipped):
-			details[name] = "skipped"
+			detail = "skipped"
 		default:
 			ready = false
-			details[name] = err.Error()
+			if details != nil {
+				detail = err.Error()
+			}
+		}
+		if details != nil {
+			details[check.name] = detail
 		}
 	}
-	return ready, details
+	// Shutdown may have started while a dependency probe was running.
+	return ready && r.IsReady() && ctx.Err() == nil
 }

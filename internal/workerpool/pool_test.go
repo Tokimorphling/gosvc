@@ -9,7 +9,7 @@ import (
 )
 
 func TestPoolRunsTasks(t *testing.T) {
-	pool := New(2, 32)
+	pool := New[*int](2, 32)
 	defer pool.Stop()
 
 	var done atomic.Int64
@@ -29,7 +29,7 @@ func TestPoolRunsTasks(t *testing.T) {
 }
 
 func TestPoolBackpressureAndClose(t *testing.T) {
-	pool := New(1, 1)
+	pool := New[*int](1, 1)
 	block := make(chan struct{})
 	started := make(chan struct{})
 
@@ -54,7 +54,7 @@ func TestPoolBackpressureAndClose(t *testing.T) {
 }
 
 func TestPoolRecoversPanics(t *testing.T) {
-	pool := New(1, 1)
+	pool := New[*int](1, 1)
 	defer pool.Stop()
 
 	panicked := make(chan any, 1)
@@ -75,7 +75,7 @@ func TestPoolRecoversPanics(t *testing.T) {
 }
 
 func TestSerialTasksDoNotOccupyWorkers(t *testing.T) {
-	pool := New(2, 8)
+	pool := New[*int](2, 8)
 	defer pool.Stop()
 
 	key := new(int)
@@ -116,7 +116,7 @@ func TestSerialTasksDoNotOccupyWorkers(t *testing.T) {
 }
 
 func TestSerialBackpressureAndStopDrains(t *testing.T) {
-	pool := New(2, 1)
+	pool := New[*int](2, 1)
 	key := new(int)
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -146,7 +146,7 @@ func TestSerialBackpressureAndStopDrains(t *testing.T) {
 }
 
 func TestConcurrentStopWaitsForDrain(t *testing.T) {
-	pool := New(1, 1)
+	pool := New[*int](1, 1)
 	defer pool.Stop()
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -187,5 +187,58 @@ func TestConcurrentStopWaitsForDrain(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("Stop did not return after the worker drained")
 		}
+	}
+}
+
+func TestTypedSerialKeysPreserveOrderIncludingZero(t *testing.T) {
+	const keys, perKey = 8, 100
+	pool := New[int](4, keys*perKey)
+	var sequence [keys]atomic.Int32
+	var wg sync.WaitGroup
+	for n := range perKey {
+		for key := range keys {
+			wg.Add(1)
+			if err := pool.SubmitSerial(key, func() {
+				defer wg.Done()
+				if got := sequence[key].Add(1); got != int32(n+1) {
+					t.Errorf("key %d: got %d, want %d", key, got, n+1)
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	wg.Wait()
+	pool.Stop()
+	for key := range keys {
+		if sequence[key].Load() != perKey {
+			t.Fatalf("key %d lost tasks", key)
+		}
+	}
+}
+
+func TestPendingSlotsAreReusedAcrossDrains(t *testing.T) {
+	pool := New[string](2, 2)
+	defer pool.Stop()
+	for range 100 {
+		started, release := make(chan struct{}), make(chan struct{})
+		if err := pool.SubmitSerial("key", func() { close(started); <-release }); err != nil {
+			t.Fatal(err)
+		}
+		<-started
+		var wg sync.WaitGroup
+		wg.Add(2)
+		for range 2 {
+			if err := pool.SubmitSerial("key", wg.Done); err != nil {
+				close(release)
+				t.Fatal(err)
+			}
+		}
+		if err := pool.Submit(func() {}); !errors.Is(err, ErrFull) {
+			close(release)
+			t.Fatalf("queue cap: %v", err)
+		}
+		close(release)
+		wg.Wait()
 	}
 }
